@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "cody-ai-shared-lib"
+version = "0.1.0"
+description = "Shared utilities for Cody AI projects: Gemini embeddings and Supabase client"
+requires-python = ">=3.11"
+dependencies = [
+    "google-genai>=1.0.0",
+    "supabase>=2.0.0",
+    "python-dotenv>=1.0.0",
+]
