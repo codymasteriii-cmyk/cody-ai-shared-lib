@@ -9,9 +9,12 @@ silent NoneType crashes during request handling.
 import os
 import logging
 from supabase import create_client, Client
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+# find_dotenv(usecwd=True) searches upward from the process's working directory,
+# not from this file's location in site-packages. Required when the package is
+# installed via pip from GitHub rather than run from the project directory.
+load_dotenv(find_dotenv(usecwd=True, raise_error_if_not_found=False))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SECRET_API_KEY")
