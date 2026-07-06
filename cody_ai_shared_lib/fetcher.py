@@ -62,11 +62,28 @@ _PDF_HEADERS = {
     "Accept": "application/pdf,*/*",
 }
 
+# Substrings that Jina embeds in the response body when the target URL errors.
+# Checked case-insensitively. Callers use this to detect content failures
+# before attempting to classify or store the returned text.
+JINA_ERROR_SIGNALS: tuple[str, ...] = (
+    "target url returned error",
+    "403: forbidden",
+    "404: not found",
+    "403 forbidden",
+    "404 not found",
+    "502 bad gateway",
+    "503 service unavailable",
+)
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _is_pdf_url(url: str) -> bool:
-    """Return True if the URL path ends with .pdf (case-insensitive)."""
+def is_pdf_url(url: str) -> bool:
+    """Return True if the URL path ends with .pdf (case-insensitive).
+
+    Uses urlparse so query-string tokens (e.g. S3 pre-signed URLs) are stripped
+    before the check — 'download.ssrn.com/paper.pdf?X-Amz-Signature=...' → True.
+    """
     return urlparse(url).path.lower().endswith(".pdf")
 
 
@@ -173,7 +190,7 @@ def fetch_article(
     # SSRF guard applied once here — covers both Jina and direct download paths.
     validate_public_url(url)
 
-    if _is_pdf_url(url):
+    if is_pdf_url(url):
         return _fetch_pdf(url, timeout)
 
     logger.info(f"[Fetcher] Fetching via Jina: {url}")
