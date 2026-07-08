@@ -35,12 +35,22 @@ _DEFAULT_TIMEOUT = 30
 # Boilerplate removed at HTML level before Jina converts to markdown.
 # Covers cookie consent walls, navigation bars, footers, and GDPR dialogs
 # across the majority of modern news and blog sites.
+#
+# CMP-specific patterns (consent management platforms that don't use 'cookie'
+# or 'consent' in their class/id names):
+#   CookieYes  — cky-* prefix (cky-modal, cky-btn-revisit, cky-notice, ...)
+#   OneTrust   — onetrust-* (most IDs contain 'consent', but some use onetrust-
+#                only, and the ot-sdk-* class prefix isn't caught otherwise)
+#   Cookiebot  — CybotCookiebot* (CamelCase, not caught by lowercase matchers)
 _DEFAULT_REMOVE_SELECTOR = (
     "nav, header, footer, aside, "
     "[class*='cookie'], [id*='cookie'], "
     "[class*='consent'], [id*='consent'], "
     "[class*='banner'], [id*='banner'], "
     "[class*='gdpr'], [id*='gdpr'], "
+    "[class*='cky'], [id*='cky'], "
+    "[class*='onetrust'], [id*='onetrust'], "
+    "[id*='CybotCookiebot'], [class*='CybotCookiebot'], "
     "script, style"
 )
 
@@ -79,12 +89,19 @@ JINA_ERROR_SIGNALS: tuple[str, ...] = (
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def is_pdf_url(url: str) -> bool:
-    """Return True if the URL path ends with .pdf (case-insensitive).
+    """Return True if the URL refers to a PDF document.
 
-    Uses urlparse so query-string tokens (e.g. S3 pre-signed URLs) are stripped
-    before the check — 'download.ssrn.com/paper.pdf?X-Amz-Signature=...' → True.
+    Handles two cases:
+    - Path ends with .pdf (query-string-safe: 'paper.pdf?X-Amz-Signature=...' → True)
+    - arXiv PDF URLs: arxiv.org/pdf/<id> serves PDFs without a .pdf extension
     """
-    return urlparse(url).path.lower().endswith(".pdf")
+    parsed = urlparse(url)
+    if parsed.path.lower().endswith(".pdf"):
+        return True
+    # arXiv /pdf/<id> URLs serve PDF binaries without a .pdf extension
+    if "arxiv.org" in parsed.netloc and parsed.path.lower().startswith("/pdf/"):
+        return True
+    return False
 
 
 def _has_empty_jina_content(text: str) -> bool:
@@ -140,6 +157,7 @@ def _fetch_via_jina(
     timeout: int,
     remove_selector: str | None,
     target_selector: str | None,
+    retain_images: bool = False,
 ) -> str:
     jina_url = f"{_JINA_BASE}{url}"
     headers = {"Accept": "text/plain"}
@@ -149,6 +167,10 @@ def _fetch_via_jina(
         headers["X-Remove-Selector"] = remove_selector
     if target_selector:
         headers["X-Target-Selector"] = target_selector
+    if not retain_images:
+        # Tells Jina not to emit ![alt](url) markdown for <img> tags.
+        # Image URLs are never useful for text-based LLM classification.
+        headers["X-Retain-Images"] = "none"
 
     response = requests.get(jina_url, headers=headers, timeout=timeout)
     response.raise_for_status()
@@ -162,6 +184,7 @@ def fetch_article(
     timeout: int = _DEFAULT_TIMEOUT,
     remove_selector: str | None = _DEFAULT_REMOVE_SELECTOR,
     target_selector: str | None = _DEFAULT_TARGET_SELECTOR,
+    retain_images: bool = False,
 ) -> str:
     """Fetch article text, routing to the appropriate extractor.
 
@@ -177,6 +200,10 @@ def fetch_article(
                          Pass None to skip (Jina default behaviour).
         target_selector: CSS selectors for Jina content targeting.
                          Pass None to use the full page.
+        retain_images:   If False (default), Jina strips all ![alt](url) image
+                         markdown — image URLs are never useful for LLM text
+                         classification. Pass True to keep them (e.g. for visual
+                         content audits).
 
     Returns:
         Article text. Format matches Jina Reader output in all cases so callers
@@ -194,7 +221,7 @@ def fetch_article(
         return _fetch_pdf(url, timeout)
 
     logger.info(f"[Fetcher] Fetching via Jina: {url}")
-    result = _fetch_via_jina(url, timeout, remove_selector, target_selector)
+    result = _fetch_via_jina(url, timeout, remove_selector, target_selector, retain_images)
 
     # A 200 OK with empty Markdown Content is a content failure, not an HTTP
     # failure — raise_for_status() won't catch it. Surface it explicitly so
