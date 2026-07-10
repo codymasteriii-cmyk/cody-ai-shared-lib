@@ -155,10 +155,6 @@ class LLMClient:
         stop_sequences: list[str] | None = None,
         # Sequences that halt generation early. Supported by Claude.
         # Gemini ignores this parameter in the current implementation.
-        thinking_budget_tokens: int | None = None,
-        # Enables extended thinking on compatible Claude models
-        # (claude-3-7-sonnet and later). The required betas header is added
-        # automatically when this is set. Ignored for gemini-* models.
     ) -> str:
         """Call the LLM and return raw response text.
 
@@ -191,7 +187,6 @@ class LLMClient:
             disable_auto_func_calling=disable_auto_func_calling,
             temperature=temperature,
             stop_sequences=stop_sequences,
-            thinking_budget_tokens=thinking_budget_tokens,
         ).text
 
     def generate_with_usage(
@@ -205,7 +200,6 @@ class LLMClient:
         disable_auto_func_calling: bool = False,
         temperature: float | None = None,
         stop_sequences: list[str] | None = None,
-        thinking_budget_tokens: int | None = None,
     ) -> LLMResult:
         """Same call as generate(), but returns real token usage alongside the text.
 
@@ -228,7 +222,7 @@ class LLMClient:
         if model.startswith("claude"):
             return self._claude_generate(
                 system_prompt, user_message, model, max_tokens,
-                temperature, stop_sequences, thinking_budget_tokens,
+                temperature, stop_sequences,
             )
         raise ValueError(
             f"Unknown model provider for: {model!r}. "
@@ -315,7 +309,6 @@ class LLMClient:
         max_tokens: int | None,
         temperature: float | None,
         stop_sequences: list[str] | None,
-        thinking_budget_tokens: int | None,
     ) -> LLMResult:
         client = self._get_anthropic_client()
 
@@ -331,16 +324,6 @@ class LLMClient:
             create_kwargs["temperature"] = temperature
         if stop_sequences:
             create_kwargs["stop_sequences"] = stop_sequences
-
-        betas: list[str] = []
-        if thinking_budget_tokens is not None:
-            create_kwargs["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": thinking_budget_tokens,
-            }
-            betas.append("interleaved-thinking-2025-05-14")
-        if betas:
-            create_kwargs["betas"] = betas
 
         last_exc = None
 
