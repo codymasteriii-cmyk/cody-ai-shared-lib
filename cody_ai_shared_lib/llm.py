@@ -15,12 +15,47 @@ Design principles:
     rate-limit (429) and transient server errors (5xx).
   - No config file dependency. All parameters are passed at instantiation time
     with sensible defaults, or overridden per-call via generate().
+
+Usage tracking: generate_with_usage() returns real token counts from the
+provider response instead of a char-count estimate. output_tokens means the
+same thing for both providers (total generation cost) — see LLMUsage
+docstring for how each provider's raw response maps onto it. generate() is
+unchanged (still returns a bare str) so existing callers across all projects
+are unaffected.
 """
 import logging
 import os
 import time
+from dataclasses import dataclass
 
 logger = logging.getLogger("shared-llm")
+
+
+# ── Usage tracking types ────────────────────────────────────────────────────────
+
+@dataclass
+class LLMUsage:
+    """Token usage for one generate_with_usage() call.
+
+    input_tokens:  Prompt tokens (system + user message), both providers.
+    output_tokens: Total generation spend, both providers — the number that
+                    matters for cost. Claude reports this as a single combined
+                    count already (thinking included when thinking was used).
+                    Gemini reports visible-text and thinking tokens separately
+                    (`candidates_token_count` + `thoughts_token_count`); this
+                    field is their sum, folded in at the call site in
+                    _gemini_generate() so callers never need to know the two
+                    providers report differently.
+    """
+    input_tokens: int
+    output_tokens: int
+
+
+@dataclass
+class LLMResult:
+    """Return value of generate_with_usage(): text plus real token counts."""
+    text: str
+    usage: LLMUsage
 
 # ── Error classification ───────────────────────────────────────────────────────
 
@@ -149,6 +184,41 @@ class LLMClient:
             ValueError: Unknown model prefix.
             RuntimeError: All retry attempts exhausted.
         """
+        return self.generate_with_usage(
+            system_prompt, user_message, model, max_tokens,
+            response_mime_type=response_mime_type,
+            response_schema=response_schema,
+            disable_auto_func_calling=disable_auto_func_calling,
+            temperature=temperature,
+            stop_sequences=stop_sequences,
+            thinking_budget_tokens=thinking_budget_tokens,
+        ).text
+
+    def generate_with_usage(
+        self,
+        system_prompt: str,
+        user_message: str,
+        model: str,
+        max_tokens: int | None = None,
+        response_mime_type: str | None = None,
+        response_schema: type | None = None,
+        disable_auto_func_calling: bool = False,
+        temperature: float | None = None,
+        stop_sequences: list[str] | None = None,
+        thinking_budget_tokens: int | None = None,
+    ) -> LLMResult:
+        """Same call as generate(), but returns real token usage alongside the text.
+
+        See LLMUsage for what output_tokens means per provider — Gemini's
+        thinking-token spend is folded in at the call site (_gemini_generate),
+        so both providers' output_tokens mean the same thing: total generation
+        cost, ready to multiply by a per-token price with no provider-specific
+        math at the call site.
+
+        Raises:
+            ValueError: Unknown model prefix.
+            RuntimeError: All retry attempts exhausted.
+        """
         if model.startswith("gemini"):
             return self._gemini_generate(
                 system_prompt, user_message, model, max_tokens,
@@ -177,7 +247,7 @@ class LLMClient:
         response_schema: type | None,
         disable_auto_func_calling: bool,
         temperature: float | None,
-    ) -> str:
+    ) -> LLMResult:
         from google.genai import types
 
         # Build config kwargs; only include optional fields when explicitly set
@@ -209,7 +279,16 @@ class LLMClient:
                     config=types.GenerateContentConfig(**config_kwargs),
                 )
                 logger.debug(f"[LLM] Gemini {model} succeeded (attempt {attempt + 1}).")
-                return response.text
+                meta = response.usage_metadata
+                # Fold thinking into output_tokens here — the one place that needs
+                # to know Gemini reports them separately (see LLMUsage docstring).
+                visible_tokens = (meta.candidates_token_count if meta else 0) or 0
+                thinking_tokens = (meta.thoughts_token_count if meta else 0) or 0
+                usage = LLMUsage(
+                    input_tokens=(meta.prompt_token_count if meta else 0) or 0,
+                    output_tokens=visible_tokens + thinking_tokens,
+                )
+                return LLMResult(text=response.text, usage=usage)
 
             except Exception as exc:
                 last_exc = exc
@@ -237,7 +316,7 @@ class LLMClient:
         temperature: float | None,
         stop_sequences: list[str] | None,
         thinking_budget_tokens: int | None,
-    ) -> str:
+    ) -> LLMResult:
         client = self._get_anthropic_client()
 
         create_kwargs: dict = {
@@ -269,7 +348,14 @@ class LLMClient:
             try:
                 response = client.messages.create(**create_kwargs)
                 logger.debug(f"[LLM] Claude {model} succeeded (attempt {attempt + 1}).")
-                return response.content[0].text
+                # Claude's usage.output_tokens is a single combined count — it
+                # already includes thinking tokens when thinking was used, and
+                # the API does not report them separately (unlike Gemini).
+                usage = LLMUsage(
+                    input_tokens=response.usage.input_tokens,
+                    output_tokens=response.usage.output_tokens,
+                )
+                return LLMResult(text=response.content[0].text, usage=usage)
 
             except Exception as exc:
                 last_exc = exc
