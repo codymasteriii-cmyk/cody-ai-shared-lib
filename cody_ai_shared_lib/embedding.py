@@ -25,7 +25,7 @@ from typing import List, Union
 
 logger = logging.getLogger("service-embedding")
 
-EMBEDDING_MODEL = "gemini-embedding-2-preview"
+EMBEDDING_MODEL = "gemini-embedding-2"
 EMBEDDING_DIMENSIONS = 768
 
 # Hard character ceiling for individual-fallback embedding calls.
@@ -42,7 +42,7 @@ def generate_embedding(
     text: Union[str, List[str]],
     task_type: str = "RETRIEVAL_DOCUMENT",
 ) -> Union[List[float], List[List[float]]]:
-    """Generates 768-dimensional embeddings using Gemini gemini-embedding-2-preview.
+    """Generates 768-dimensional embeddings using Gemini gemini-embedding-2.
 
     Supports both single strings and batches (List[str]).
     Preserves input length: returns zero-vectors for empty/whitespace-only
