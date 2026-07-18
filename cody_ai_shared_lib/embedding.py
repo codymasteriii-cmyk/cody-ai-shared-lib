@@ -37,6 +37,22 @@ _MAX_INDIVIDUAL_CHARS = 8_000
 # Sized to stay safely under the ~20,000 total-token ceiling.
 _CHUNK_SIZE = 8
 
+# Module-level lazy singleton for the Gemini SDK client.
+# Created once on the first call to generate_embedding() and reused across
+# all subsequent calls within the same process lifetime, avoiding repeated
+# authentication overhead and HTTP connection pool setup.
+_gemini_client = None
+
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        _gemini_client = genai.Client(
+            api_key=os.getenv("GOOGLE_API_KEY"),
+            http_options={"timeout": 60000},
+        )
+    return _gemini_client
+
 
 def generate_embedding(
     text: Union[str, List[str]],
@@ -83,7 +99,7 @@ def generate_embedding(
             logger.warning(f"[Embedding] Pre-filtered index {i} ({preview}): empty/whitespace.")
 
     valid_texts = [input_list[i] for i in valid_indices]
-    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"), http_options={"timeout": 60000})
+    client = _get_gemini_client()
 
     def _embed_chunk(chunk_texts: List[str], chunk_indices: List[int]) -> bool:
         """Issues one batch call with a length-check guard and one retry.

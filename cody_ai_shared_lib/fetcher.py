@@ -5,9 +5,10 @@ navigation, consent dialogs, footers) at HTML level using Jina's content-
 targeting headers before the page is converted to markdown.
 
 PDF handling: Jina is an HTML→Markdown converter and cannot render PDF binary.
-Direct .pdf URLs bypass Jina entirely and are extracted with pypdf. If Jina
-returns an empty Markdown Content section for any other URL, a ValueError is
-raised so the caller knows the fetch failed — no silent empty-text storage.
+Direct .pdf URLs bypass Jina entirely and are extracted with pymupdf4llm. This
+preserves tables, multi-column layouts, and outputs native Markdown matching the
+Jina HTML response. If an empty Markdown Content section is returned for any URL,
+a ValueError is raised so the caller knows the fetch failed — no silent empty-text storage.
 
 Security: validate_public_url() is called once at the fetch_article() entry
 point, blocking SSRF attempts via private IP literals, localhost, and non-HTTP
@@ -18,7 +19,6 @@ Service layer: projects should not call requests.get() or r.jina.ai directly.
 Import fetch_article from cody_ai_shared_lib.fetcher so all fetch behaviour
 stays in one place.
 """
-import io
 import logging
 import os
 from urllib.parse import urlparse
@@ -120,30 +120,35 @@ def _has_empty_jina_content(text: str) -> bool:
 
 
 def _fetch_pdf(url: str, timeout: int) -> str:
-    """Download a PDF and extract page text using pypdf.
+    """Download a PDF and extract structural Markdown using pymupdf4llm.
 
     Output is formatted to match the Jina Reader response structure so callers
-    handle both fetch paths identically.
+    handle both fetch paths identically. pymupdf4llm natively produces Markdown
+    that perfectly preserves tables and multi-column layouts, matching Jina's
+    style.
 
     Raises:
-        requests.HTTPError: On non-2xx response (e.g. 403 for auth-gated PDFs
-                            such as SSRN — no fix possible without credentials).
-        pypdf.errors.PdfReadError: If the downloaded content is not a valid PDF.
+        requests.HTTPError:  On non-2xx response (e.g. 403 for auth-gated PDFs
+                             such as SSRN — no fix possible without credentials).
+        fitz.FileDataError:  If the downloaded content is not a valid PDF.
     """
-    import pypdf  # lazy import — not needed for HTML-only callers
+    import fitz          # lazy import — provided by pymupdf
+    import pymupdf4llm   # lazy import — not needed for HTML-only callers
 
     logger.info(f"[Fetcher] Downloading PDF directly: {url}")
     response = requests.get(url, headers=_PDF_HEADERS, timeout=timeout)
     response.raise_for_status()
 
-    reader = pypdf.PdfReader(io.BytesIO(response.content))
-    page_texts = [
-        page.extract_text() or ""
-        for page in reader.pages
-    ]
-    # Drop blank pages; join remaining with paragraph spacing
-    full_text = "\n\n".join(t for t in page_texts if t.strip())
-    n_pages = len(reader.pages)
+    # Open PDF from memory stream. Explicit close() — fitz.Document wraps
+    # native MuPDF memory that Python's GC doesn't account for, and this path
+    # runs inside batch loops (backfill/regenerate scripts processing many PDFs).
+    doc = fitz.open(stream=response.content, filetype="pdf")
+    try:
+        n_pages = len(doc)
+        # Convert entire document directly to Markdown (preserves tables & layouts)
+        full_text = pymupdf4llm.to_markdown(doc)
+    finally:
+        doc.close()
 
     return (
         f"URL Source: {url}\n\n"
@@ -188,7 +193,7 @@ def fetch_article(
 ) -> str:
     """Fetch article text, routing to the appropriate extractor.
 
-    - Direct .pdf URLs bypass Jina and extract text with pypdf.
+    - Direct .pdf URLs bypass Jina and extract structural Markdown with pymupdf4llm.
     - All other URLs use Jina Reader. If Jina returns a 200 OK but with empty
       Markdown Content (paywall, bot detection, auth gate), a ValueError is
       raised — callers must not silently store empty article text.
