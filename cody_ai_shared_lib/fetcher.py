@@ -127,6 +127,14 @@ def _fetch_pdf(url: str, timeout: int) -> str:
     that perfectly preserves tables and multi-column layouts, matching Jina's
     style.
 
+    Memory strategy: pages are converted one at a time via the pages=[i] argument
+    rather than converting the whole document in a single call. pymupdf4llm renders
+    each page through the C-level MuPDF engine, which allocates a large working buffer
+    per page. Processing the full document at once holds all page buffers simultaneously;
+    page-by-page processing keeps peak RAM bounded to roughly one page at a time,
+    preventing OOM crashes on low-memory hosts (e.g. Render hobby plan, 512 MB RAM)
+    when processing large academic or quantitative research PDFs (50+ pages).
+
     Raises:
         requests.HTTPError:  On non-2xx response (e.g. 403 for auth-gated PDFs
                              such as SSRN — no fix possible without credentials).
@@ -145,8 +153,14 @@ def _fetch_pdf(url: str, timeout: int) -> str:
     doc = fitz.open(stream=response.content, filetype="pdf")
     try:
         n_pages = len(doc)
-        # Convert entire document directly to Markdown (preserves tables & layouts)
-        full_text = pymupdf4llm.to_markdown(doc)
+        # Convert one page at a time to bound peak RAM usage. Each page's MuPDF
+        # render buffer is freed before the next page begins. Results are joined
+        # with double-newlines to preserve paragraph separation across page breaks.
+        page_markdowns = [
+            pymupdf4llm.to_markdown(doc, pages=[i])
+            for i in range(n_pages)
+        ]
+        full_text = "\n\n".join(page_markdowns)
     finally:
         doc.close()
 
