@@ -155,6 +155,11 @@ class LLMClient:
         stop_sequences: list[str] | None = None,
         # Sequences that halt generation early. Supported by Claude.
         # Gemini ignores this parameter in the current implementation.
+        stream: bool = False,
+        # When True, uses the provider's streaming API internally. The return
+        # value is identical — the full assembled response — but the HTTP
+        # timeout applies per-chunk rather than to the total call, so long
+        # generations do not 504.
     ) -> str:
         """Call the LLM and return raw response text.
 
@@ -187,6 +192,7 @@ class LLMClient:
             disable_auto_func_calling=disable_auto_func_calling,
             temperature=temperature,
             stop_sequences=stop_sequences,
+            stream=stream,
         ).text
 
     def generate_with_usage(
@@ -200,6 +206,7 @@ class LLMClient:
         disable_auto_func_calling: bool = False,
         temperature: float | None = None,
         stop_sequences: list[str] | None = None,
+        stream: bool = False,
     ) -> LLMResult:
         """Same call as generate(), but returns real token usage alongside the text.
 
@@ -218,11 +225,13 @@ class LLMClient:
                 system_prompt, user_message, model, max_tokens,
                 response_mime_type, response_schema,
                 disable_auto_func_calling, temperature,
+                stream=stream,
             )
         if model.startswith("claude"):
             return self._claude_generate(
                 system_prompt, user_message, model, max_tokens,
                 temperature, stop_sequences,
+                stream=stream,
             )
         raise ValueError(
             f"Unknown model provider for: {model!r}. "
@@ -241,6 +250,7 @@ class LLMClient:
         response_schema: type | None,
         disable_auto_func_calling: bool,
         temperature: float | None,
+        stream: bool = False,
     ) -> LLMResult:
         from google.genai import types
 
@@ -267,13 +277,28 @@ class LLMClient:
 
         for attempt in range(self.retry_max):
             try:
-                response = client.models.generate_content(
-                    model=model,
-                    contents=user_message,
-                    config=types.GenerateContentConfig(**config_kwargs),
-                )
+                if stream:
+                    chunks = []
+                    last_chunk = None
+                    for chunk in client.models.generate_content_stream(
+                        model=model,
+                        contents=user_message,
+                        config=types.GenerateContentConfig(**config_kwargs),
+                    ):
+                        if chunk.text:
+                            chunks.append(chunk.text)
+                        last_chunk = chunk  # usage_metadata is None on all but the final chunk
+                    response_text = "".join(chunks)
+                    meta = last_chunk.usage_metadata if last_chunk else None
+                else:
+                    response = client.models.generate_content(
+                        model=model,
+                        contents=user_message,
+                        config=types.GenerateContentConfig(**config_kwargs),
+                    )
+                    response_text = response.text
+                    meta = response.usage_metadata
                 logger.debug(f"[LLM] Gemini {model} succeeded (attempt {attempt + 1}).")
-                meta = response.usage_metadata
                 # Fold thinking into output_tokens here — the one place that needs
                 # to know Gemini reports them separately (see LLMUsage docstring).
                 visible_tokens = (meta.candidates_token_count if meta else 0) or 0
@@ -282,7 +307,7 @@ class LLMClient:
                     input_tokens=(meta.prompt_token_count if meta else 0) or 0,
                     output_tokens=visible_tokens + thinking_tokens,
                 )
-                return LLMResult(text=response.text, usage=usage)
+                return LLMResult(text=response_text, usage=usage)
 
             except Exception as exc:
                 last_exc = exc
@@ -309,6 +334,7 @@ class LLMClient:
         max_tokens: int | None,
         temperature: float | None,
         stop_sequences: list[str] | None,
+        stream: bool = False,
     ) -> LLMResult:
         client = self._get_anthropic_client()
 
@@ -329,16 +355,24 @@ class LLMClient:
 
         for attempt in range(self.retry_max):
             try:
-                response = client.messages.create(**create_kwargs)
+                if stream:
+                    with client.messages.stream(**create_kwargs) as s:
+                        response_text = s.get_final_text()
+                        final_msg = s.get_final_message()
+                    usage_obj = final_msg.usage
+                else:
+                    response = client.messages.create(**create_kwargs)
+                    response_text = response.content[0].text
+                    usage_obj = response.usage
                 logger.debug(f"[LLM] Claude {model} succeeded (attempt {attempt + 1}).")
                 # Claude's usage.output_tokens is a single combined count — it
                 # already includes thinking tokens when thinking was used, and
                 # the API does not report them separately (unlike Gemini).
                 usage = LLMUsage(
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens,
+                    input_tokens=usage_obj.input_tokens,
+                    output_tokens=usage_obj.output_tokens,
                 )
-                return LLMResult(text=response.content[0].text, usage=usage)
+                return LLMResult(text=response_text, usage=usage)
 
             except Exception as exc:
                 last_exc = exc
