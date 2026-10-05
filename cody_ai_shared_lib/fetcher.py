@@ -11,9 +11,10 @@ Jina HTML response. If an empty Markdown Content section is returned for any URL
 a ValueError is raised so the caller knows the fetch failed — no silent empty-text storage.
 
 Security: validate_public_url() is called once at the fetch_article() entry
-point, blocking SSRF attempts via private IP literals, localhost, and non-HTTP
-schemes. Both the Jina path and the direct PDF download path use the validated
-URL, so the guard is applied regardless of which path is taken.
+point, blocking non-HTTP schemes and any host that resolves to a non-public
+address. The direct PDF download additionally goes through safe_get(), which
+re-validates every redirect hop, so a public URL cannot bounce the server to an
+internal address.
 
 Service layer: projects should not call requests.get() or r.jina.ai directly.
 Import fetch_article from cody_ai_shared_lib.fetcher so all fetch behaviour
@@ -25,12 +26,20 @@ from urllib.parse import urlparse
 
 import requests
 
-from .url_validator import validate_public_url
+from .url_validator import safe_get, validate_public_url
 
 logger = logging.getLogger("shared-fetcher")
 
 _JINA_BASE = "https://r.jina.ai/"
 _DEFAULT_TIMEOUT = 30
+
+# Direct PDF downloads are held in memory (and parsed from that buffer), so both the
+# download size and the number of converted pages are capped. Defaults suit a 512 MB
+# host; callers with more headroom can override them via fetch_article().
+#   - An oversized PDF is SKIPPED (ValueError): a truncated download cannot be parsed.
+#   - A PDF with too many pages keeps its first _MAX_PDF_PAGES pages.
+_MAX_PDF_BYTES = 30 * 1024 * 1024
+_MAX_PDF_PAGES = 150
 
 # Boilerplate removed at HTML level before Jina converts to markdown.
 # Covers cookie consent walls, navigation bars, footers, and GDPR dialogs
@@ -119,7 +128,12 @@ def _has_empty_jina_content(text: str) -> bool:
     return len(text[idx + len(marker):].strip()) < 50
 
 
-def _fetch_pdf(url: str, timeout: int) -> str:
+def _fetch_pdf(
+    url: str,
+    timeout: int,
+    max_bytes: int = _MAX_PDF_BYTES,
+    max_pages: int = _MAX_PDF_PAGES,
+) -> str:
     """Download a PDF and extract structural Markdown using pymupdf4llm.
 
     Output is formatted to match the Jina Reader response structure so callers
@@ -135,7 +149,13 @@ def _fetch_pdf(url: str, timeout: int) -> str:
     preventing OOM crashes on low-memory hosts (e.g. Render hobby plan, 512 MB RAM)
     when processing large academic or quantitative research PDFs (50+ pages).
 
+    Download strategy: the body is streamed and counted as it arrives. A declared
+    Content-Length over max_bytes is rejected before any body is read; the running
+    count also stops responses with no (or a false) Content-Length. Counting happens
+    after decompression, so a compressed response cannot slip past the cap.
+
     Raises:
+        ValueError:          If the PDF is larger than max_bytes.
         requests.HTTPError:  On non-2xx response (e.g. 403 for auth-gated PDFs
                              such as SSRN — no fix possible without credentials).
         fitz.FileDataError:  If the downloaded content is not a valid PDF.
@@ -144,29 +164,57 @@ def _fetch_pdf(url: str, timeout: int) -> str:
     import pymupdf4llm   # lazy import — not needed for HTML-only callers
 
     logger.info(f"[Fetcher] Downloading PDF directly: {url}")
-    response = requests.get(url, headers=_PDF_HEADERS, timeout=timeout)
-    response.raise_for_status()
+    # This is the one path where the SERVER itself fetches an article URL (the Jina
+    # path is fetched by Jina). safe_get() validates the URL and every redirect hop.
+    response = safe_get(url, headers=_PDF_HEADERS, timeout=timeout, stream=True)
+    try:
+        response.raise_for_status()
+
+        declared = response.headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > max_bytes:
+            raise ValueError(
+                f"PDF is {int(declared) / 1_048_576:.1f} MB, over the "
+                f"{max_bytes / 1_048_576:g} MB limit: {url}"
+            )
+        pdf_bytes = bytearray()
+        for chunk in response.iter_content(chunk_size=65536):
+            pdf_bytes.extend(chunk)
+            if len(pdf_bytes) > max_bytes:
+                raise ValueError(
+                    f"PDF exceeds the {max_bytes / 1_048_576:g} MB limit while downloading: {url}"
+                )
+    finally:
+        response.close()
 
     # Open PDF from memory stream. Explicit close() — fitz.Document wraps
     # native MuPDF memory that Python's GC doesn't account for, and this path
     # runs inside batch loops (backfill/regenerate scripts processing many PDFs).
-    doc = fitz.open(stream=response.content, filetype="pdf")
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         n_pages = len(doc)
+        converted = min(n_pages, max_pages)
+        if converted < n_pages:
+            logger.warning(
+                f"[Fetcher] PDF has {n_pages} pages; converting the first {converted} only: {url}"
+            )
         # Convert one page at a time to bound peak RAM usage. Each page's MuPDF
         # render buffer is freed before the next page begins. Results are joined
         # with double-newlines to preserve paragraph separation across page breaks.
         page_markdowns = [
             pymupdf4llm.to_markdown(doc, pages=[i])
-            for i in range(n_pages)
+            for i in range(converted)
         ]
         full_text = "\n\n".join(page_markdowns)
     finally:
         doc.close()
 
+    truncation_note = (
+        f"Pages Converted: {converted} of {n_pages} (page limit)\n\n" if converted < n_pages else ""
+    )
     return (
         f"URL Source: {url}\n\n"
         f"Number of Pages: {n_pages}\n\n"
+        f"{truncation_note}"
         f"Markdown Content:\n{full_text}"
     )
 
@@ -204,6 +252,8 @@ def fetch_article(
     remove_selector: str | None = _DEFAULT_REMOVE_SELECTOR,
     target_selector: str | None = _DEFAULT_TARGET_SELECTOR,
     retain_images: bool = False,
+    max_pdf_bytes: int = _MAX_PDF_BYTES,
+    max_pdf_pages: int = _MAX_PDF_PAGES,
 ) -> str:
     """Fetch article text, routing to the appropriate extractor.
 
@@ -223,13 +273,17 @@ def fetch_article(
                          markdown — image URLs are never useful for LLM text
                          classification. Pass True to keep them (e.g. for visual
                          content audits).
+        max_pdf_bytes:   Largest direct-download PDF accepted (default 30 MB).
+                         Larger files raise ValueError.
+        max_pdf_pages:   Pages converted per PDF (default 150); extra pages dropped.
 
     Returns:
         Article text. Format matches Jina Reader output in all cases so callers
         need no special handling for the PDF path.
 
     Raises:
-        ValueError:         If url fails the SSRF safety check.
+        ValueError:         If url fails the SSRF safety check, or a PDF exceeds
+                            max_pdf_bytes.
         requests.HTTPError: On non-2xx response (e.g. 403 for auth-gated PDFs).
         requests.Timeout:   If the request exceeds timeout seconds.
     """
@@ -237,7 +291,7 @@ def fetch_article(
     validate_public_url(url)
 
     if is_pdf_url(url):
-        return _fetch_pdf(url, timeout)
+        return _fetch_pdf(url, timeout, max_pdf_bytes, max_pdf_pages)
 
     logger.info(f"[Fetcher] Fetching via Jina: {url}")
     result = _fetch_via_jina(url, timeout, remove_selector, target_selector, retain_images)
