@@ -148,10 +148,14 @@ class LLMClient:
         # Prevents Gemini from auto-invoking function tools. Set True when
         # the pipeline does not use tools, to avoid SDK deadlocks.
         # Ignored for claude-* models.
+        thinking_level: str | None = None,
+        # Categorical thinking level for Gemini 3 ("minimal", "low", "medium", "high").
+        # If None (default), omitted so model uses its default thinking setting.
+        # Ignored for claude-* models.
         # ── Claude-specific ───────────────────────────────────────────────────
         temperature: float | None = None,
-        # Sampling temperature (0.0–1.0). Provider default if None.
-        # Accepted by both Gemini and Claude; applied to whichever is routed.
+        # Sampling temperature for Claude (0.0–1.0). Provider default if None.
+        # Deprecated and ignored for Gemini (models use optimal built-in sampling).
         stop_sequences: list[str] | None = None,
         # Sequences that halt generation early. Supported by Claude.
         # Gemini ignores this parameter in the current implementation.
@@ -190,6 +194,7 @@ class LLMClient:
             response_mime_type=response_mime_type,
             response_schema=response_schema,
             disable_auto_func_calling=disable_auto_func_calling,
+            thinking_level=thinking_level,
             temperature=temperature,
             stop_sequences=stop_sequences,
             stream=stream,
@@ -204,6 +209,7 @@ class LLMClient:
         response_mime_type: str | None = None,
         response_schema: type | None = None,
         disable_auto_func_calling: bool = False,
+        thinking_level: str | None = None,
         temperature: float | None = None,
         stop_sequences: list[str] | None = None,
         stream: bool = False,
@@ -224,7 +230,7 @@ class LLMClient:
             return self._gemini_generate(
                 system_prompt, user_message, model, max_tokens,
                 response_mime_type, response_schema,
-                disable_auto_func_calling, temperature,
+                disable_auto_func_calling, thinking_level,
                 stream=stream,
             )
         if model.startswith("claude"):
@@ -249,7 +255,7 @@ class LLMClient:
         response_mime_type: str | None,
         response_schema: type | None,
         disable_auto_func_calling: bool,
-        temperature: float | None,
+        thinking_level: str | None = None,
         stream: bool = False,
     ) -> LLMResult:
         from google.genai import types
@@ -269,8 +275,14 @@ class LLMClient:
                     disable=True, maximum_remote_calls=0
                 )
             )
-        if temperature is not None:
-            config_kwargs["temperature"] = temperature
+        # Thinking level for Gemini 3 ("minimal", "low", "medium", "high").
+        # If None, omitted so the model uses its default thinking behavior.
+        if thinking_level is not None:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_level=thinking_level
+            )
+        # Note: sampling parameters (temperature, top_p, top_k) are deprecated
+        # since Gemini 3.6 Flash and omitted to prevent 400 errors in future models.
 
         client = self._get_gemini_client()
         last_exc = None
