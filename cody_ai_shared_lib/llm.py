@@ -314,7 +314,15 @@ class LLMClient:
                 # Fold thinking into output_tokens here — the one place that needs
                 # to know Gemini reports them separately (see LLMUsage docstring).
                 visible_tokens = (meta.candidates_token_count if meta else 0) or 0
-                thinking_tokens = (meta.thoughts_token_count if meta else 0) or 0
+                # getattr, not a direct attribute read: thoughts_token_count was added to
+                # GenerateContentResponseUsageMetadata in a later google-genai release.
+                # On an older installed SDK (e.g. 1.2.0, the floor this project pins in
+                # requirements.txt with no upper bound) the field does not exist on the
+                # Pydantic model at all, and a direct `meta.thoughts_token_count` read
+                # raises AttributeError — crashing every real call, structured or text,
+                # the moment a thinking-capable model is used. getattr(..., 0) is correct
+                # on both old (field absent) and new (field present, 0 when unused) SDKs.
+                thinking_tokens = (getattr(meta, "thoughts_token_count", 0) if meta else 0) or 0
                 usage = LLMUsage(
                     input_tokens=(meta.prompt_token_count if meta else 0) or 0,
                     output_tokens=visible_tokens + thinking_tokens,
