@@ -22,7 +22,8 @@ stays in one place.
 """
 import logging
 import os
-from urllib.parse import urlparse
+import re
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import requests
 
@@ -97,6 +98,105 @@ JINA_ERROR_SIGNALS: tuple[str, ...] = (
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+def normalize_url(url: str) -> str:
+    """Return canonical form of a URL for deduplication and Jina fetching.
+
+    - Strips whitespace.
+    - Lowercases scheme and host (RFC 3986).
+    - Collapses accidental consecutive slashes in the path (e.g. '//writing/x' -> '/writing/x').
+    - Strips trailing slash on non-root paths while leaving root '/' and query/fragment intact.
+    """
+    url = (url or "").strip()
+    if not url:
+        return url
+    parts = urlsplit(url)
+    path = re.sub(r"/+", "/", parts.path)
+    if len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/")
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, parts.query, parts.fragment))
+
+
+def extract_title_and_markdown(raw_fetched: str, fallback_url: str = "") -> tuple[str, str]:
+    """Extract human-readable (title, markdown_body) from Jina Reader or _fetch_pdf output.
+
+    1. Looks for 'Title: <title>' in the Jina header block.
+    2. Splits body after 'Markdown Content:'.
+    3. Falls back to the first '# ' H1 heading in the Markdown body, or the URL path slug.
+    """
+    title = ""
+    for line in raw_fetched.splitlines()[:10]:
+        if line.lower().startswith("title:"):
+            title = line.split(":", 1)[1].strip()
+            break
+
+    marker = "Markdown Content:"
+    idx = raw_fetched.find(marker)
+    if idx != -1:
+        body = raw_fetched[idx + len(marker):].strip()
+    else:
+        body = raw_fetched.strip()
+
+    if not title:
+        for line in body.splitlines():
+            if line.startswith("# "):
+                title = line[2:].strip()
+                break
+
+    if not title and fallback_url:
+        parsed = urlparse(fallback_url)
+        clean_path = parsed.path.strip("/").split("/")[-1]
+        if clean_path.lower().endswith(".pdf"):
+            clean_path = clean_path[:-4]
+        title = (
+            re.sub(r"[-_]+", " ", clean_path).strip().title()
+            if clean_path
+            else parsed.netloc
+        )
+
+    return (title or "Untitled Article"), body
+
+
+def extract_pdf_bytes(
+    pdf_bytes: bytes | bytearray,
+    max_pages: int = _MAX_PDF_PAGES,
+    source_label: str = "document.pdf",
+) -> tuple[str, int, int]:
+    """Extract structural Markdown from an in-memory PDF byte buffer via pymupdf4llm.
+
+    Processes one page at a time to bound peak MuPDF C-buffer RAM usage on 512 MB hosts,
+    and guarantees deterministic native memory cleanup via try/finally doc.close().
+
+    Returns:
+        Tuple of (markdown_text, total_pages, converted_pages).
+
+    Raises:
+        ValueError: If the PDF contains 0 pages.
+        Exception:  On corrupt/unreadable PDF streams (fitz.FileDataError).
+    """
+    import fitz          # lazy import — provided by pymupdf
+    import pymupdf4llm   # lazy import — not needed for HTML-only callers
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        n_pages = len(doc)
+        if n_pages == 0:
+            raise ValueError(f"PDF document contains no pages: {source_label}")
+        converted = min(n_pages, max_pages)
+        if converted < n_pages:
+            logger.warning(
+                f"[Fetcher] PDF has {n_pages} pages; converting the first {converted} only: {source_label}"
+            )
+        page_markdowns = [
+            pymupdf4llm.to_markdown(doc, pages=[i])
+            for i in range(converted)
+        ]
+        full_text = "\n\n".join(page_markdowns).strip()
+    finally:
+        doc.close()
+
+    return full_text, n_pages, converted
+
+
 def is_pdf_url(url: str) -> bool:
     """Return True if the URL refers to a PDF document.
 
@@ -160,9 +260,6 @@ def _fetch_pdf(
                              such as SSRN — no fix possible without credentials).
         fitz.FileDataError:  If the downloaded content is not a valid PDF.
     """
-    import fitz          # lazy import — provided by pymupdf
-    import pymupdf4llm   # lazy import — not needed for HTML-only callers
-
     logger.info(f"[Fetcher] Downloading PDF directly: {url}")
     # This is the one path where the SERVER itself fetches an article URL (the Jina
     # path is fetched by Jina). safe_get() validates the URL and every redirect hop.
@@ -186,27 +283,9 @@ def _fetch_pdf(
     finally:
         response.close()
 
-    # Open PDF from memory stream. Explicit close() — fitz.Document wraps
-    # native MuPDF memory that Python's GC doesn't account for, and this path
-    # runs inside batch loops (backfill/regenerate scripts processing many PDFs).
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        n_pages = len(doc)
-        converted = min(n_pages, max_pages)
-        if converted < n_pages:
-            logger.warning(
-                f"[Fetcher] PDF has {n_pages} pages; converting the first {converted} only: {url}"
-            )
-        # Convert one page at a time to bound peak RAM usage. Each page's MuPDF
-        # render buffer is freed before the next page begins. Results are joined
-        # with double-newlines to preserve paragraph separation across page breaks.
-        page_markdowns = [
-            pymupdf4llm.to_markdown(doc, pages=[i])
-            for i in range(converted)
-        ]
-        full_text = "\n\n".join(page_markdowns)
-    finally:
-        doc.close()
+    full_text, n_pages, converted = extract_pdf_bytes(
+        pdf_bytes, max_pages=max_pages, source_label=url
+    )
 
     truncation_note = (
         f"Pages Converted: {converted} of {n_pages} (page limit)\n\n" if converted < n_pages else ""
@@ -240,6 +319,14 @@ def _fetch_via_jina(
         headers["X-Retain-Images"] = "none"
 
     response = requests.get(jina_url, headers=headers, timeout=timeout)
+    if response.status_code == 422 and target_selector:
+        # Jina returns 422 AssertionFailureError if target selector doesn't match the page.
+        # Fall back to full page extraction without X-Target-Selector.
+        logger.warning(
+            f"[Fetcher] Target selector '{target_selector}' failed on {url} (422). Retrying without target selector."
+        )
+        headers.pop("X-Target-Selector", None)
+        response = requests.get(jina_url, headers=headers, timeout=timeout)
     response.raise_for_status()
     return response.text
 
@@ -287,6 +374,7 @@ def fetch_article(
         requests.HTTPError: On non-2xx response (e.g. 403 for auth-gated PDFs).
         requests.Timeout:   If the request exceeds timeout seconds.
     """
+    url = normalize_url(url)
     # SSRF guard applied once here — covers both Jina and direct download paths.
     validate_public_url(url)
 
