@@ -36,10 +36,28 @@ import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 import edge_tts
 
+# Public API of this module. The package __init__ re-exports exactly these names, so it never leaks
+# helper imports (asyncio, os, re, ...) into the package namespace.
+__all__ = [
+    "DEFAULT_CACHE_DIR",
+    "SynthResult",
+    "TTSCache",
+    "TTSError",
+    "UnknownVoiceError",
+    "VOICES",
+    "VOICE_MAP",
+    "align_cues",
+    "clean_text_for_tts",
+    "default_voice",
+    "detect_language",
+    "is_mostly_english",
+    "synthesize",
+    "verify_voices_available",
+]
+
 logger = logging.getLogger("cody-ai-shared-tts")
 
 DEFAULT_CACHE_DIR = os.path.join("data", "tts_cache")
-DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -55,10 +73,6 @@ class UnknownVoiceError(TTSError):
     """Raised when an unrecognized voice ID is requested."""
     pass
 
-
-class VoiceUnavailableError(TTSError):
-    """Raised when upstream Edge-TTS service cannot provide the requested voice."""
-    pass
 
 
 # ---------------------------------------------------------------------------
@@ -84,119 +98,70 @@ VOICES: List[Dict[str, Any]] = [
         "lang": "en-US",
         "gender": "male",
         "label": "Guy",
-        "fallbacks": ["en-US-ChristopherNeural", "en-US-AndrewNeural"],
     },
     {
         "id": "en-US-JennyNeural",
         "lang": "en-US",
         "gender": "female",
         "label": "Jenny",
-        "fallbacks": ["en-US-AriaNeural", "en-US-AvaNeural"],
     },
     {
         "id": "zh-CN-XiaoxiaoNeural",
         "lang": "zh-CN",
         "gender": "female",
         "label": "晓晓 (Xiaoxiao)",
-        "fallbacks": ["zh-CN-XiaoyiNeural"],
     },
     {
         "id": "zh-CN-YunxiNeural",
         "lang": "zh-CN",
         "gender": "male",
         "label": "云希 (Yunxi)",
-        "fallbacks": ["zh-CN-YunjianNeural", "zh-CN-YunyangNeural"],
     },
     {
         "id": "zh-CN-XiaoyiNeural",
         "lang": "zh-CN",
         "gender": "female",
         "label": "晓伊 (Xiaoyi)",
-        "fallbacks": [],
     },
     {
         "id": "zh-CN-YunjianNeural",
         "lang": "zh-CN",
         "gender": "male",
         "label": "云健 (Yunjian)",
-        "fallbacks": ["zh-CN-YunyangNeural"],
     },
     {
         "id": "zh-CN-YunyangNeural",
         "lang": "zh-CN",
         "gender": "male",
         "label": "云扬 (Yunyang)",
-        "fallbacks": [],
     },
     {
         "id": "en-US-ChristopherNeural",
         "lang": "en-US",
         "gender": "male",
         "label": "Christopher",
-        "fallbacks": [],
     },
     {
         "id": "en-US-AndrewNeural",
         "lang": "en-US",
         "gender": "male",
         "label": "Andrew",
-        "fallbacks": [],
     },
     {
         "id": "en-US-AriaNeural",
         "lang": "en-US",
         "gender": "female",
         "label": "Aria",
-        "fallbacks": [],
     },
     {
         "id": "en-US-AvaNeural",
         "lang": "en-US",
         "gender": "female",
         "label": "Ava",
-        "fallbacks": [],
     },
 ]
 
 VOICE_MAP: Dict[str, Dict[str, Any]] = {v["id"]: v for v in VOICES}
-
-# Deprecated backward compatibility aliases
-POPULAR_VOICES: List[Dict[str, str]] = [
-    {
-        "id": "zh-CN-XiaoxiaoNeural",
-        "name": "晓晓 (女性 - 温暖温柔)",
-        "lang": "zh-CN",
-        "gender": "female",
-        "persona": "zh-female",
-    },
-    {
-        "id": "zh-CN-YunxiNeural",
-        "name": "云希 (男性 - 自然沉稳)",
-        "lang": "zh-CN",
-        "gender": "male",
-        "persona": "zh-male",
-    },
-    {
-        "id": "en-US-JennyNeural",
-        "name": "Jenny (Female - English)",
-        "lang": "en-US",
-        "gender": "female",
-        "persona": "en-female",
-    },
-    {
-        "id": "en-US-GuyNeural",
-        "name": "Guy (Male - English)",
-        "lang": "en-US",
-        "gender": "male",
-        "persona": "en-male",
-    },
-]
-
-
-def get_available_voices() -> List[Dict[str, str]]:
-    """Return list of popular/supported voice personas (deprecated; use VOICES)."""
-    return POPULAR_VOICES
-
 
 def default_voice(lang: str, enabled: Optional[List[str]] = None) -> str:
     """Return the default voice ID for the given language.
@@ -235,6 +200,10 @@ def detect_language(text: str) -> str:
     return "en" if is_mostly_english(text) else "zh"
 
 
+# Symbols in the otherwise-stripped categories that carry meaning when read aloud ("25℃").
+_SPOKEN_SYMBOLS = frozenset("°℃℉")
+
+
 def clean_text_for_tts(text: str, *, asterisk_spans: str = "drop") -> str:
     """Preprocess text for TTS following the strict 5-stage pipeline (§7.7).
 
@@ -248,7 +217,8 @@ def clean_text_for_tts(text: str, *, asterisk_spans: str = "drop") -> str:
        Non-spans like '5 * 3 and 2 * 4' are preserved untouched.
     4. Unwrap _italic_ only when word-boundary flanked; replace remaining
        underscores between letters/digits with a space (my_var_name -> my var name).
-    5. Remove ~, ～, emoji and symbol categories (So, Sk, Cn, Cs, U+FE0F, U+200D);
+    5. Remove ~, ～, emoji and symbol categories (So, Sk, Cn, Cs, U+FE0F, U+200D) except the
+       measurement signs in _SPOKEN_SYMBOLS (°, ℃, ℉) that change the meaning of a number;
        collapse whitespace; remove space before punctuation marks (. , ! ? ; :).
     """
     if not text:
@@ -289,7 +259,7 @@ def clean_text_for_tts(text: str, *, asterisk_spans: str = "drop") -> str:
     t = t.replace("~", "").replace("～", "")
     cleaned_chars = [
         c for c in t
-        if unicodedata.category(c) not in ("So", "Sk", "Cn", "Cs")
+        if (c in _SPOKEN_SYMBOLS or unicodedata.category(c) not in ("So", "Sk", "Cn", "Cs"))
         and c not in ("\ufe0f", "\u200d")
     ]
     t = "".join(cleaned_chars)
@@ -608,11 +578,6 @@ async def synthesize(
 
         except Exception as e:
             last_err = e
-            # If the error specifically indicates voice not found or invalid voice
-            err_str = str(e).lower()
-            if "voice" in err_str and ("not found" in err_str or "unsupported" in err_str):
-                raise VoiceUnavailableError(f"Voice {voice} unavailable: {e}") from e
-
             # Only retry once on transient connection issues
             if attempt == 0:
                 logger.warning(f"[TTS] Transient error on attempt 1 for voice {voice}: {e}. Retrying...")
@@ -646,117 +611,3 @@ async def verify_voices_available(ids: List[str]) -> List[str]:
     except Exception as e:
         warnings.append(f"Failed to check Edge-TTS voice list: {e}")
     return warnings
-
-
-# ---------------------------------------------------------------------------
-# Backward Compatibility Wrappers (for MyCompanion / Legacy Callers)
-# ---------------------------------------------------------------------------
-
-
-def get_audio_hash(
-    text: str,
-    voice: str,
-    rate: str = "+0%",
-    pitch: str = "+0Hz",
-    volume: str = "+0%",
-) -> str:
-    """Compute a deterministic MD5 hash for legacy cached audio files."""
-    key = f"{text}_{voice}_{rate}_{pitch}_{volume}"
-    return hashlib.md5(key.encode("utf-8")).hexdigest()
-
-
-def prune_tts_cache(cache_dir: str = DEFAULT_CACHE_DIR, max_files: int = 100) -> None:
-    """Legacy file-count bounded cache pruner."""
-    try:
-        if not os.path.exists(cache_dir):
-            return
-        files = [
-            os.path.join(cache_dir, f)
-            for f in os.listdir(cache_dir)
-            if f.endswith(".mp3")
-        ]
-        if len(files) > max_files:
-            files.sort(key=lambda x: os.path.getmtime(x))
-            excess = len(files) - max_files
-            for f in files[:excess]:
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
-    except Exception as e:
-        logger.warning(f"[TTS Cache] Legacy pruning warning: {e}")
-
-
-async def synthesize_speech(
-    text: str,
-    voice: str = DEFAULT_VOICE,
-    rate: str = "+0%",
-    pitch: str = "+0Hz",
-    volume: str = "+0%",
-    cache_dir: str = DEFAULT_CACHE_DIR,
-    voice_override: Optional[str] = None,
-) -> str:
-    """Legacy synthesizer: cleans text and saves to a file path."""
-    actual_voice = voice_override or voice or DEFAULT_VOICE
-    tts_text = clean_text_for_tts(text)
-    if not tts_text:
-        return ""
-
-    actual_rate = rate or "+0%"
-    actual_pitch = pitch or "+0Hz"
-    actual_volume = volume or "+0%"
-
-    os.makedirs(cache_dir, exist_ok=True)
-    audio_hash = get_audio_hash(tts_text, actual_voice, actual_rate, actual_pitch, actual_volume)
-    filename = f"{audio_hash}.mp3"
-    filepath = os.path.join(cache_dir, filename)
-
-    if not os.path.exists(filepath) or os.path.getsize(filepath) < 100:
-        try:
-            result = await synthesize(
-                text=tts_text,
-                voice=actual_voice,
-                rate=actual_rate,
-                pitch=actual_pitch,
-                volume=actual_volume,
-                with_cues=False,
-            )
-            with open(filepath, "wb") as f:
-                f.write(result.audio)
-            prune_tts_cache(cache_dir=cache_dir, max_files=100)
-        except Exception as e:
-            logger.error(f"[TTS] synthesize_speech failed: {e}")
-            return ""
-
-    return filepath
-
-
-async def synthesize_chunk_bytes(
-    text: str,
-    voice: str = DEFAULT_VOICE,
-    rate: str = "+0%",
-    pitch: str = "+0Hz",
-    volume: str = "+0%",
-) -> bytes:
-    """Legacy synthesizer: cleans text and returns in-memory audio bytes."""
-    tts_text = clean_text_for_tts(text)
-    if not tts_text:
-        return b""
-
-    actual_rate = rate or "+0%"
-    actual_pitch = pitch or "+0Hz"
-    actual_volume = volume or "+0%"
-
-    try:
-        result = await synthesize(
-            text=tts_text,
-            voice=voice,
-            rate=actual_rate,
-            pitch=actual_pitch,
-            volume=actual_volume,
-            with_cues=False,
-        )
-        return result.audio
-    except Exception as e:
-        logger.error(f"[TTS] synthesize_chunk_bytes failed: {e}")
-        return b""
