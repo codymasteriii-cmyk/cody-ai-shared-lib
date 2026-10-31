@@ -119,11 +119,15 @@ class JevClient:
         retry_base_wait_secs: float = 1.0,
         api_key: str | None = None,
         base_url: str | None = None,
+        timeout: float | None = None,
     ):
         self.retry_max = retry_max
         self.retry_base_wait_secs = retry_base_wait_secs
         self._api_key = api_key
         self._base_url = base_url
+        # Per-HTTP-request timeout in seconds handed to the SDK. None keeps the SDK's own
+        # default; callers on a latency-sensitive path (e.g. a batch job) should set one.
+        self._timeout = timeout
         self._client = None
 
     def _get_client(self) -> TypeSafeClient:
@@ -140,7 +144,7 @@ class JevClient:
                     "for a shared, production-facing client)."
                 )
             base_url = self._base_url or os.getenv("TYPESAFE_BASE_URL", _DEFAULT_BASE_URL)
-            self._client = TypeSafeClient(api_key=api_key, base_url=base_url)
+            self._client = TypeSafeClient(api_key=api_key, base_url=base_url, timeout=self._timeout)
         return self._client
 
     @staticmethod
@@ -195,7 +199,13 @@ class JevClient:
 
         raise RuntimeError(f"[Jev] {model} failed after {self.retry_max} attempts: {last_exc}")
 
-    def ask_noul_batch(self, state: str, questions: dict[str, str], model: str = JEV_MODEL) -> dict[str, NoulAnswer]:
+    def ask_noul_batch(
+        self,
+        state: str,
+        questions: dict[str, str],
+        model: str = JEV_MODEL,
+        strict: bool = False,
+    ) -> dict[str, NoulAnswer]:
         """Convenience wrapper for the common case: a batch of yes/no questions, each a
         plain instruction string, all answered as Noul (probability-of-yes) in one call.
 
@@ -207,13 +217,22 @@ class JevClient:
         caveat, and the benchmark writeup this client was ported from, for why Jev is
         positioned as a secondary signal rather than a primary classifier here).
 
-        Returns {question_key: NoulAnswer(probability, confidence)}.
+        By default a question Jev returned no answer for is reported as probability 0.0,
+        which is indistinguishable from a confident "no". Pass strict=True to raise
+        ValueError naming the unanswered questions instead — use it wherever a silently
+        missing answer would corrupt a stored decision.
+
+        Returns {question_key: NoulAnswer(probability)}.
         """
         result = self.system_one(
             state=state,
             questions={key: Noul(instructions=instruction) for key, instruction in questions.items()},
             model=model,
         )
+        if strict:
+            missing = [key for key, answer in result.answers.items() if getattr(answer, "noul", None) is None]
+            if missing:
+                raise ValueError(f"Jev returned no answer for: {', '.join(missing)}")
         return {
             key: NoulAnswer(probability=getattr(answer, "noul", 0.0) if answer else 0.0)
             for key, answer in result.answers.items()
