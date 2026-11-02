@@ -171,9 +171,9 @@ def extract_pdf_bytes(
 
     Raises:
         ValueError: If the PDF contains 0 pages.
-        Exception:  On corrupt/unreadable PDF streams (fitz.FileDataError).
+        Exception:  On corrupt/unreadable PDF streams (pymupdf.FileDataError).
     """
-    import fitz          # lazy import — provided by pymupdf
+    import pymupdf as fitz   # lazy import (the old `import fitz` name is deprecated since pymupdf 2.0)
     import pymupdf4llm   # lazy import — not needed for HTML-only callers
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -258,7 +258,7 @@ def _fetch_pdf(
         ValueError:          If the PDF is larger than max_bytes.
         requests.HTTPError:  On non-2xx response (e.g. 403 for auth-gated PDFs
                              such as SSRN — no fix possible without credentials).
-        fitz.FileDataError:  If the downloaded content is not a valid PDF.
+        pymupdf.FileDataError:  If the downloaded content is not a valid PDF.
     """
     logger.info(f"[Fetcher] Downloading PDF directly: {url}")
     # This is the one path where the SERVER itself fetches an article URL (the Jina

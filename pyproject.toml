@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cody-ai-shared-lib"
-version = "0.4.2"
+version = "0.5.0"
 description = "Shared utilities for Cody AI projects: Gemini embeddings, Jina article fetcher, model-agnostic LLM client, Jev (TypeSafe System One) client, URL safety validator, Supabase client, JWT authentication, Resend email delivery, and Edge-TTS synthesis"
 requires-python = ">=3.11"
 dependencies = [
@@ -12,8 +12,14 @@ dependencies = [
     "supabase>=2.0.0",
     "python-dotenv>=1.0.0",
     "requests>=2.31.0",
-    "pymupdf>=1.24.0",
-    "pymupdf4llm>=0.0.17",
+    # PDF text for reading aloud (pdf_text module, used by AudioReading): pure Python, small memory.
+    "pdfminer.six>=20260107",
+    # PDF to Markdown (fetcher.extract_pdf_bytes, used by News Intelligence). pymupdf 2.0 bundles
+    # pymupdf4llm and pymupdf-layout at the same version, so the three move together. Unpinned, a
+    # fresh install floated from 1.x to 2.0 and changed the extraction engine. Move this pin
+    # deliberately, after re-checking PDF output in every app that installs this library.
+    "pymupdf>=2.0,<2.1",
+    "pymupdf4llm>=2.0,<2.1",
     "typesafe-sdk>=0.7.0",
     "pyjwt[crypto]>=2.8.0",
     "edge-tts>=7.0.0,<8.0.0",
