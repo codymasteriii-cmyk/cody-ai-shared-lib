@@ -3,6 +3,7 @@ from .email import EmailError, send_email
 from .embedding import generate_embedding
 from .fetcher import (
     extract_pdf_bytes,
+    extract_pdf_text,
     extract_title_and_markdown,
     fetch_article,
     normalize_url,
@@ -31,6 +32,7 @@ __all__ = [
     "fetch_article",
     "normalize_url",
     "extract_pdf_bytes",
+    "extract_pdf_text",
     "extract_title_and_markdown",
     "LLMClient",
     "get_supabase_client",

@@ -5,7 +5,7 @@ navigation, consent dialogs, footers) at HTML level using Jina's content-
 targeting headers before the page is converted to markdown.
 
 PDF handling: Jina is an HTML→Markdown converter and cannot render PDF binary.
-Direct .pdf URLs bypass Jina entirely and are extracted with pymupdf4llm. This
+Direct .pdf URLs bypass Jina entirely and are extracted as plain text with pdfminer.six. This
 preserves tables, multi-column layouts, and outputs native Markdown matching the
 Jina HTML response. If an empty Markdown Content section is returned for any URL,
 a ValueError is raised so the caller knows the fetch failed — no silent empty-text storage.
@@ -23,10 +23,12 @@ stays in one place.
 import logging
 import os
 import re
+import time
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import requests
 
+from .pdf_text import PdfTextError
 from .url_validator import safe_get, validate_public_url
 
 logger = logging.getLogger("shared-fetcher")
@@ -41,6 +43,12 @@ _DEFAULT_TIMEOUT = 30
 #   - A PDF with too many pages keeps its first _MAX_PDF_PAGES pages.
 _MAX_PDF_BYTES = 30 * 1024 * 1024
 _MAX_PDF_PAGES = 150
+# Pages sampled to learn repeated headers/footers. Kept small because fetch_article callers usually
+# stop reading after a few thousand words (see max_pdf_chars); these pages are read anyway.
+_PDF_PROFILE_PAGES = 10
+# Pages are read until this many characters have been collected, then the cleaned text is returned
+# whole. Cleaning (header/footer removal) can drop a little, so the stop point carries a margin.
+_PDF_CHARS_MARGIN = 1.15
 
 # Boilerplate removed at HTML level before Jina converts to markdown.
 # Covers cookie consent walls, navigation bars, footers, and GDPR dialogs
@@ -163,6 +171,9 @@ def extract_pdf_bytes(
 ) -> tuple[str, int, int]:
     """Extract structural Markdown from an in-memory PDF byte buffer via pymupdf4llm.
 
+    Legacy: fetch_article no longer uses this (see extract_pdf_text). It stays for callers that
+    want Markdown from a PDF they already hold, and will be removed in a later release.
+
     Processes one page at a time to bound peak MuPDF C-buffer RAM usage on 512 MB hosts,
     and guarantees deterministic native memory cleanup via try/finally doc.close().
 
@@ -195,6 +206,75 @@ def extract_pdf_bytes(
         doc.close()
 
     return full_text, n_pages, converted
+
+
+def extract_pdf_text(
+    pdf_bytes: bytes | bytearray,
+    max_pages: int = _MAX_PDF_PAGES,
+    max_chars: int | None = None,
+    max_seconds: float | None = None,
+    source_label: str = "document.pdf",
+) -> tuple[str, int, int]:
+    """Extract plain text (paragraphs, no Markdown) from an in-memory PDF via pdfminer.six.
+
+    Reads one page at a time through pdf_text.PdfTextReader: pure Python, roughly 50-70 MB for an
+    ordinary PDF where the pymupdf4llm path needed 200-450 MB. Repeated headers/footers and page
+    numbers are removed. Tables come out as ordinary text lines, not Markdown pipes.
+
+    Args:
+        max_pages: Pages read at most; later pages are dropped.
+        max_chars: When given, stop reading once about this many characters have been collected
+                   (a caller that only uses the first N characters need not read the whole file).
+                   The cleaned text is returned in full, so it can exceed max_chars by up to a page.
+        max_seconds: When given, stop starting new pages after this many seconds of reading and
+                   return what was read (pdfminer needs about 0.3-0.5 s per page, so a long deck of
+                   mostly images could otherwise run for minutes). At least the profile pages are
+                   always read first, whatever the budget.
+
+    Returns:
+        Tuple of (text, total_pages, converted_pages).
+
+    Raises:
+        PdfEncryptedError: The PDF is password-protected.
+        PdfTextError:      The PDF is corrupt/unreadable or has no pages.
+        ValueError:        The PDF has no extractable text (for example a scan without a text layer).
+    """
+    from .pdf_text import PdfTextReader
+
+    started = time.monotonic()
+    reader = PdfTextReader(pdf_bytes, profile_pages=_PDF_PROFILE_PAGES)
+    try:
+        reader.prepare()    # reads and caches the profile pages up front, so the loop below reuses them
+        n_pages = len(reader)
+        limit = min(n_pages, max_pages)
+        stop_at = int(max_chars * _PDF_CHARS_MARGIN) if max_chars else None
+        pages = []
+        collected = converted = 0
+        for i in range(limit):
+            converted = i + 1
+            try:
+                page = reader.page_boxes(i)
+            except MemoryError:
+                raise
+            except Exception as exc:    # a damaged page costs only that page
+                logger.warning(f"[Fetcher] PDF page {i + 1} skipped ({exc}): {source_label}")
+                continue
+            pages.append(page)
+            collected += sum(len(line) for box in page.boxes for line in box.lines)
+            if stop_at and collected >= stop_at:
+                break
+            if max_seconds is not None and time.monotonic() - started >= max_seconds:
+                logger.warning(f"[Fetcher] PDF read stopped at {max_seconds:g}s, page {i + 1} of {n_pages}: {source_label}")
+                break
+        if converted < n_pages:
+            logger.info(f"[Fetcher] PDF has {n_pages} pages; read the first {converted}: {source_label}")
+        text = reader.clean_pages(pages).strip()
+    finally:
+        reader.close()
+
+    if not text:
+        raise ValueError(f"PDF has no extractable text (scanned images without a text layer?): {source_label}")
+    return text, n_pages, converted
 
 
 def is_pdf_url(url: str) -> bool:
@@ -233,21 +313,18 @@ def _fetch_pdf(
     timeout: int,
     max_bytes: int = _MAX_PDF_BYTES,
     max_pages: int = _MAX_PDF_PAGES,
+    max_chars: int | None = None,
+    max_seconds: float | None = None,
 ) -> str:
-    """Download a PDF and extract structural Markdown using pymupdf4llm.
+    """Download a PDF and extract plain text with pdfminer.six (see extract_pdf_text).
 
-    Output is formatted to match the Jina Reader response structure so callers
-    handle both fetch paths identically. pymupdf4llm natively produces Markdown
-    that perfectly preserves tables and multi-column layouts, matching Jina's
-    style.
+    Output is framed like the Jina Reader response ("URL Source", "Number of Pages",
+    "Markdown Content:") so callers handle both fetch paths identically. The body is
+    plain paragraphs, not Markdown.
 
-    Memory strategy: pages are converted one at a time via the pages=[i] argument
-    rather than converting the whole document in a single call. pymupdf4llm renders
-    each page through the C-level MuPDF engine, which allocates a large working buffer
-    per page. Processing the full document at once holds all page buffers simultaneously;
-    page-by-page processing keeps peak RAM bounded to roughly one page at a time,
-    preventing OOM crashes on low-memory hosts (e.g. Render hobby plan, 512 MB RAM)
-    when processing large academic or quantitative research PDFs (50+ pages).
+    Memory strategy: pdfminer is pure Python and the reader works one page at a time, so
+    peak RAM stays near 50-70 MB on ordinary PDFs. The pymupdf4llm path this replaced
+    reached 380-450 MB on a 512 MB host (Render hobby plan).
 
     Download strategy: the body is streamed and counted as it arrives. A declared
     Content-Length over max_bytes is rejected before any body is read; the running
@@ -255,10 +332,10 @@ def _fetch_pdf(
     after decompression, so a compressed response cannot slip past the cap.
 
     Raises:
-        ValueError:          If the PDF is larger than max_bytes.
+        ValueError:          If the PDF is larger than max_bytes, is password-protected,
+                             is not a readable PDF, or has no extractable text.
         requests.HTTPError:  On non-2xx response (e.g. 403 for auth-gated PDFs
                              such as SSRN — no fix possible without credentials).
-        pymupdf.FileDataError:  If the downloaded content is not a valid PDF.
     """
     logger.info(f"[Fetcher] Downloading PDF directly: {url}")
     # This is the one path where the SERVER itself fetches an article URL (the Jina
@@ -283,12 +360,17 @@ def _fetch_pdf(
     finally:
         response.close()
 
-    full_text, n_pages, converted = extract_pdf_bytes(
-        pdf_bytes, max_pages=max_pages, source_label=url
-    )
+    try:
+        full_text, n_pages, converted = extract_pdf_text(
+            pdf_bytes, max_pages=max_pages, max_chars=max_chars, max_seconds=max_seconds, source_label=url
+        )
+    except PdfTextError as exc:
+        # Same class as the other content failures (oversized, empty), so callers treat a bad PDF
+        # as a permanent content error rather than a transient fetch error.
+        raise ValueError(f"{exc.message}: {url}") from exc
 
     truncation_note = (
-        f"Pages Converted: {converted} of {n_pages} (page limit)\n\n" if converted < n_pages else ""
+        f"Pages Converted: {converted} of {n_pages}\n\n" if converted < n_pages else ""
     )
     return (
         f"URL Source: {url}\n\n"
@@ -341,10 +423,12 @@ def fetch_article(
     retain_images: bool = False,
     max_pdf_bytes: int = _MAX_PDF_BYTES,
     max_pdf_pages: int = _MAX_PDF_PAGES,
+    max_pdf_chars: int | None = None,
+    max_pdf_seconds: float | None = None,
 ) -> str:
     """Fetch article text, routing to the appropriate extractor.
 
-    - Direct .pdf URLs bypass Jina and extract structural Markdown with pymupdf4llm.
+    - Direct .pdf URLs bypass Jina and are read as plain text with pdfminer.six.
     - All other URLs use Jina Reader. If Jina returns a 200 OK but with empty
       Markdown Content (paywall, bot detection, auth gate), a ValueError is
       raised — callers must not silently store empty article text.
@@ -362,7 +446,13 @@ def fetch_article(
                          content audits).
         max_pdf_bytes:   Largest direct-download PDF accepted (default 30 MB).
                          Larger files raise ValueError.
-        max_pdf_pages:   Pages converted per PDF (default 150); extra pages dropped.
+        max_pdf_pages:   Pages read per PDF (default 150); extra pages dropped.
+        max_pdf_chars:   Stop reading PDF pages once about this many characters are collected
+                         (default None: read up to max_pdf_pages). A caller that only uses the
+                         first N characters of the text passes N here to save time.
+        max_pdf_seconds: Stop reading PDF pages after this many seconds (default None: no limit)
+                         and return the text read so far. Does not cover the download, which
+                         `timeout` bounds.
 
     Returns:
         Article text. Format matches Jina Reader output in all cases so callers
@@ -379,7 +469,7 @@ def fetch_article(
     validate_public_url(url)
 
     if is_pdf_url(url):
-        return _fetch_pdf(url, timeout, max_pdf_bytes, max_pdf_pages)
+        return _fetch_pdf(url, timeout, max_pdf_bytes, max_pdf_pages, max_pdf_chars, max_pdf_seconds)
 
     logger.info(f"[Fetcher] Fetching via Jina: {url}")
     result = _fetch_via_jina(url, timeout, remove_selector, target_selector, retain_images)
