@@ -2,7 +2,6 @@ from .auth import AuthError, extract_bearer_token, verify_supabase_jwt
 from .email import EmailError, send_email
 from .embedding import generate_embedding
 from .fetcher import (
-    extract_pdf_bytes,
     extract_pdf_text,
     extract_title_and_markdown,
     fetch_article,
@@ -31,7 +30,6 @@ __all__ = [
     "generate_embedding",
     "fetch_article",
     "normalize_url",
-    "extract_pdf_bytes",
     "extract_pdf_text",
     "extract_title_and_markdown",
     "LLMClient",

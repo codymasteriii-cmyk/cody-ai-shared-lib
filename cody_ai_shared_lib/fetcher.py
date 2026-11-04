@@ -164,50 +164,6 @@ def extract_title_and_markdown(raw_fetched: str, fallback_url: str = "") -> tupl
     return (title or "Untitled Article"), body
 
 
-def extract_pdf_bytes(
-    pdf_bytes: bytes | bytearray,
-    max_pages: int = _MAX_PDF_PAGES,
-    source_label: str = "document.pdf",
-) -> tuple[str, int, int]:
-    """Extract structural Markdown from an in-memory PDF byte buffer via pymupdf4llm.
-
-    Legacy: fetch_article no longer uses this (see extract_pdf_text). It stays for callers that
-    want Markdown from a PDF they already hold, and will be removed in a later release.
-
-    Processes one page at a time to bound peak MuPDF C-buffer RAM usage on 512 MB hosts,
-    and guarantees deterministic native memory cleanup via try/finally doc.close().
-
-    Returns:
-        Tuple of (markdown_text, total_pages, converted_pages).
-
-    Raises:
-        ValueError: If the PDF contains 0 pages.
-        Exception:  On corrupt/unreadable PDF streams (pymupdf.FileDataError).
-    """
-    import pymupdf as fitz   # lazy import (the old `import fitz` name is deprecated since pymupdf 2.0)
-    import pymupdf4llm   # lazy import — not needed for HTML-only callers
-
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        n_pages = len(doc)
-        if n_pages == 0:
-            raise ValueError(f"PDF document contains no pages: {source_label}")
-        converted = min(n_pages, max_pages)
-        if converted < n_pages:
-            logger.warning(
-                f"[Fetcher] PDF has {n_pages} pages; converting the first {converted} only: {source_label}"
-            )
-        page_markdowns = [
-            pymupdf4llm.to_markdown(doc, pages=[i])
-            for i in range(converted)
-        ]
-        full_text = "\n\n".join(page_markdowns).strip()
-    finally:
-        doc.close()
-
-    return full_text, n_pages, converted
-
-
 def extract_pdf_text(
     pdf_bytes: bytes | bytearray,
     max_pages: int = _MAX_PDF_PAGES,
