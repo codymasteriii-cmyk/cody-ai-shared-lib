@@ -54,12 +54,25 @@ class StoreCapabilityError(RAGEngineError):
 
 class MissingRequiredScopeError(RAGEngineError):
     """Raised when required filter keys (e.g. tenant_id) are missing from effective filters."""
-    pass
+
+    def __init__(self, message: str, missing_keys: list[str] | None = None, **kwargs: Any):
+        super().__init__(message, **kwargs)
+        self.missing_keys = list(missing_keys or [])
 
 
 class UnsupportedFilterError(RAGEngineError):
     """Raised when an unknown custom filter key or wrong value type is passed to a store."""
-    pass
+
+    def __init__(
+        self,
+        message: str,
+        key: str | None = None,
+        unsupported_keys: list[str] | None = None,
+        **kwargs: Any,
+    ):
+        super().__init__(message, **kwargs)
+        self.key = key
+        self.unsupported_keys = list(unsupported_keys or ([key] if key else []))
 
 
 class EmbeddingProviderError(RAGEngineError):

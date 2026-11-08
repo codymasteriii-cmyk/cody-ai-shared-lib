@@ -6,9 +6,10 @@ The library contains no SQL, table name, or database client (D-01).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Generic, Protocol, runtime_checkable
+from typing import Any, Generic, Protocol, get_origin, runtime_checkable
 from pydantic import BaseModel, Field
 
+from .errors import MissingRequiredScopeError, UnsupportedFilterError
 from .models import FilterPatch, MetaT, RAGFilterSpec, RAGNode
 from .render import NodeRenderer
 from .text.analyzer import TokenGroup
@@ -62,14 +63,10 @@ class StoreCapabilities(BaseModel):
     supports_embedding_return: bool = False
 
     required_filter_keys: frozenset[str] = frozenset()
-    supported_custom_filters: dict[str, type] = Field(default_factory=dict)
+    supported_custom_filters: dict[str, Any] = Field(default_factory=dict)
     supported_date_fields: frozenset[str] = frozenset()
     time_basis: str | None = None
     max_top_k: int = 200
-
-    @property
-    def supports_native_hybrid(self) -> bool:
-        return self.supports_native_hybrid_rpc
 
 
 class Fingerprint(BaseModel):
@@ -77,6 +74,34 @@ class Fingerprint(BaseModel):
     content_hash: str
     embedding_signature: str
     fts_signature: str | None = None
+
+
+_FILTER_KEY_ALIASES = {"tenant_id": "tenant_or_user_id", "document_ids": "doc_ids", "doc_id": "doc_ids"}
+
+
+def validate_scope(filters: RAGFilterSpec, capabilities: StoreCapabilities) -> None:
+    """Fail closed on missing required keys and on unknown or wrongly typed custom filters (§3.6, §5.6)."""
+    missing = []
+    for key in capabilities.required_filter_keys:
+        value = getattr(filters, _FILTER_KEY_ALIASES.get(key, key), None)
+        if value is None:
+            value = filters.custom.get(key)
+        if value is None or value in ("", [], {}):
+            missing.append(key)
+    if missing:
+        raise MissingRequiredScopeError(
+            f"Required filter keys are missing or empty: {sorted(missing)}", missing_keys=sorted(missing)
+        )
+
+    for key, value in filters.custom.items():
+        if key not in capabilities.supported_custom_filters:
+            raise UnsupportedFilterError(f"Unsupported custom filter key: {key!r}", key=key)
+        expected = capabilities.supported_custom_filters[key]
+        expected_type = get_origin(expected) or expected
+        if not isinstance(value, expected_type):
+            raise UnsupportedFilterError(
+                f"Custom filter '{key}' expected {expected_type.__name__}, got {type(value).__name__}", key=key
+            )
 
 
 # ── RAGStore Port (§4.2, §4.3, §4.4) ──────────────────────────────────────────

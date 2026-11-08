@@ -133,11 +133,11 @@ def test_passthrough_router_zero_calls():
     router = PassthroughRouter()
     tracker = UsageTracker("req-pt")
     degradations = DegradationTracker()
-    models = ModelBindings(generation=["gemini-3.8-flash"])
+    models = ModelBindings(summary=["gemini-3.5-flash-lite"], generation=["gemini-3.8-flash"], embedding="gemini-embedding-2")
     profile = long_form_reader(models)
     ctx = RouterContext(usage_tracker=tracker, degradation_tracker=degradations, profile=profile)
 
-    req = RAGQueryRequest(query="Specific text search")
+    req = RAGQueryRequest(question="Specific text search")
     intent = router.route(req, None, ctx)
 
     assert intent.route == "rag"

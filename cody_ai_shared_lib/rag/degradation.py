@@ -6,11 +6,12 @@ Any failure outside this list or an agreed fallback that itself fails raises an 
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Callable
 
+from .errors import DeadlineExceeded
 from .models import Degradation
 
-logger = logging.getLogger("rag-degradation")
+logger = logging.getLogger("shared-rag")
 
 
 # Closed list table specification
@@ -122,6 +123,7 @@ class DegradationTracker:
     def __init__(self, fallbacks: dict[str, str] | None = None):
         self._fallbacks = dict(fallbacks or {})
         self._degradations: list[Degradation] = []
+        self.on_record: Callable[[Degradation], None] | None = None
 
     @property
     def degradations(self) -> list[Degradation]:
@@ -137,6 +139,7 @@ class DegradationTracker:
         error_type: str | None = None,
         message: str | None = None,
         attempts: int = 1,
+        notify: bool = True,
     ) -> Degradation:
         spec = AGREED_DEGRADATIONS.get(dg_id, {})
         log_level = spec.get("log_level", logging.WARNING)
@@ -155,4 +158,21 @@ class DegradationTracker:
 
         log_msg = f"[Degradation {dg_id}] ({stage}): {reason}. Fallback: {deg.fallback_used}. Impact: {impact}"
         logger.log(log_level, log_msg)
+        if notify and self.on_record is not None:
+            self.on_record(deg)
         return deg
+
+    def skip_for_deadline(self, deadline: Any, stage: str, budget_seconds: float) -> bool:
+        """True when an optional stage must be skipped for lack of time (DG-10, §13.4)."""
+        if deadline.fits(budget_seconds):
+            return False
+        if self._fallbacks.get("deadline") == "raise":
+            raise DeadlineExceeded(f"Deadline leaves no time for optional stage '{stage}'", stage=stage)
+        self.record(
+            dg_id="DG-10",
+            stage=stage,
+            reason=f"{deadline.remaining_seconds():.1f}s left, stage needs {budget_seconds:.1f}s",
+            fallback_used="skip_optional_stage",
+            impact=f"Optional stage '{stage}' was skipped to meet the deadline",
+        )
+        return True

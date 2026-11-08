@@ -7,46 +7,21 @@ Implements:
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Generic, Sequence
+from typing import Any, ClassVar, Generic, Sequence
 from ..models import MetaT, RAGNode
 from ..ports import NodeRenderer
+from ..render import DefaultRenderer
 from ..runtime import Clock, SystemClock
-
-
-def extract_node_timestamp(node: RAGNode[Any], renderer: NodeRenderer[Any] | None = None) -> datetime | None:
-    """Extract datetime from node via renderer or metadata fields."""
-    if renderer is not None and hasattr(renderer, "timestamp"):
-        try:
-            ts = renderer.timestamp(node)
-            if isinstance(ts, datetime):
-                return ts
-        except Exception:
-            pass
-
-    meta = node.metadata
-    extra_dict = getattr(meta, "extra", {}) or {}
-    pyd_extra = getattr(meta, "__pydantic_extra__", {}) or {}
-
-    for attr in ("created_at", "timestamp", "published_at", "date"):
-        val = getattr(meta, attr, None)
-        if val is None and isinstance(meta, dict):
-            val = meta.get(attr)
-        if val is None and isinstance(extra_dict, dict):
-            val = extra_dict.get(attr)
-        if val is None and isinstance(pyd_extra, dict):
-            val = pyd_extra.get(attr)
-        if isinstance(val, datetime):
-            return val
-        if isinstance(val, str):
-            try:
-                return datetime.fromisoformat(val)
-            except Exception:
-                pass
-    return None
 
 
 class RecencyBooster(Generic[MetaT]):
     """Multiplies node score by 1 + weight * 2^(-age / half_life) (§9.4, AC-RAG-35)."""
+    name: ClassVar[str] = "recency"
+    version: ClassVar[str] = "1.0.0"
+    accepts_score_kinds: ClassVar[frozenset[str] | None] = None
+
+    def process(self, nodes: list[RAGNode[MetaT]], ctx: Any) -> list[RAGNode[MetaT]]:
+        return self.boost(nodes, renderer=ctx.renderer)
 
     def __init__(
         self,
@@ -58,9 +33,6 @@ class RecencyBooster(Generic[MetaT]):
         self.weight = weight
         self.clock = clock or SystemClock()
 
-    def _extract_timestamp(self, node: RAGNode[MetaT], renderer: NodeRenderer[MetaT] | None = None) -> datetime | None:
-        return extract_node_timestamp(node, renderer)
-
     def boost(
         self,
         nodes: Sequence[RAGNode[MetaT]],
@@ -68,10 +40,11 @@ class RecencyBooster(Generic[MetaT]):
     ) -> list[RAGNode[MetaT]]:
         """Apply recency boost deterministically under the injected clock."""
         now = self.clock.now_utc()
+        view = renderer or DefaultRenderer()
         result: list[RAGNode[MetaT]] = []
 
         for node in nodes:
-            dt = self._extract_timestamp(node, renderer)
+            dt = view.timestamp(node.metadata)
             if dt is not None:
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
@@ -81,12 +54,18 @@ class RecencyBooster(Generic[MetaT]):
             result.append(node)
 
         # Re-sort descending by score, tie-break by node_id
-        result.sort(key=lambda n: (-n.score, n.id))
+        result.sort(key=lambda n: (-n.score, n.node_id))
         return result
 
 
 class ScoreFusionStage(Generic[MetaT]):
     """Combines min-max normalized signals and app features into score_kind='fused' (§9.4, AC-RAG-35)."""
+    name: ClassVar[str] = "score_fusion"
+    version: ClassVar[str] = "1.0.0"
+    accepts_score_kinds: ClassVar[frozenset[str] | None] = None
+
+    def process(self, nodes: list[RAGNode[MetaT]], ctx: Any) -> list[RAGNode[MetaT]]:
+        return self.fuse(nodes, renderer=ctx.renderer, clock=ctx.deadline.clock)
 
     def __init__(self, weights: dict[str, float] | None = None):
         self.weights = dict(weights or {
@@ -116,10 +95,12 @@ class ScoreFusionStage(Generic[MetaT]):
             return []
 
         node_list = list(nodes)
-        n = len(node_list)
 
-        # 1. Semantic (vector_score)
-        v_scores = [n.vector_score if n.vector_score is not None else 0.0 for n in node_list]
+        # 1. Semantic (vector_score or rerank_score)
+        v_scores = [
+            n.rerank_score if n.rerank_score is not None else (n.vector_score if n.vector_score is not None else n.score)
+            for n in node_list
+        ]
         norm_v = self._min_max_normalize(v_scores)
 
         # 2. Keyword (keyword_score)
@@ -129,9 +110,10 @@ class ScoreFusionStage(Generic[MetaT]):
         # 3. Recency factor
         clk = clock or SystemClock()
         now = clk.now_utc()
+        view = renderer or DefaultRenderer()
         r_scores: list[float] = []
         for node in node_list:
-            dt = extract_node_timestamp(node, renderer)
+            dt = view.timestamp(node.metadata)
             if isinstance(dt, datetime):
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
@@ -144,23 +126,8 @@ class ScoreFusionStage(Generic[MetaT]):
         # 4. App feature signal (e.g. confidence or priority_score)
         feat_scores: list[float] = []
         for node in node_list:
-            score_val = 0.5
-            if renderer is not None and hasattr(renderer, "features"):
-                try:
-                    f_map = renderer.features(node.metadata)
-                    if isinstance(f_map, dict):
-                        # Use average of provided feature scores
-                        if f_map:
-                            score_val = float(sum(f_map.values()) / len(f_map))
-                except Exception:
-                    pass
-            else:
-                for attr in ("confidence", "priority_score", "weight"):
-                    val = getattr(node.metadata, attr, None)
-                    if val is not None and isinstance(val, (int, float)):
-                        score_val = float(val)
-                        break
-            feat_scores.append(score_val)
+            features = view.features(node.metadata)
+            feat_scores.append(sum(features.values()) / len(features) if features else 0.5)
         norm_f = self._min_max_normalize(feat_scores)
 
         w_v = self.weights.get("semantic", 0.5)
@@ -179,5 +146,5 @@ class ScoreFusionStage(Generic[MetaT]):
             node.score = fused
             node.score_kind = "fused"
 
-        node_list.sort(key=lambda item: (-item.score, item.id))
+        node_list.sort(key=lambda item: (-item.score, item.node_id))
         return node_list

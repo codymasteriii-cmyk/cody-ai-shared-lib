@@ -5,14 +5,18 @@ without an LLM call. Emits DG-03 degradation on error or timeout and falls back 
 """
 from __future__ import annotations
 
+import logging
 import os
-from typing import Any
 
+from ...pricing import compute_cost
+from ...tokens import estimate_tokens
 from ..degradation import DegradationTracker
-from ..errors import ProfileConfigError
+from ..errors import ProfileConfigError, RAGStageError
 from ..gateway import ModelGateway
-from ..models import QueryIntent
-from ..usage import UsageTracker
+from ..models import QueryIntent, StageUsage
+from ..usage import BudgetGuard, UsageTracker, invoke_budget_guard
+
+logger = logging.getLogger("shared-rag.router")
 
 
 class JevGateRouter:
@@ -27,7 +31,9 @@ class JevGateRouter:
         key = api_key or os.getenv("TYPESAFE_API_KEY") or os.getenv("VERCEL_API_KEY")
         if not key:
             raise ProfileConfigError(
-                "Router configured with enable_jev=True but TYPESAFE_API_KEY (or VERCEL_API_KEY) is not set."
+                "Router configured with enable_jev=True but TYPESAFE_API_KEY (or VERCEL_API_KEY) is not set.",
+                missing=["TYPESAFE_API_KEY"],
+                problems=["Router configured with enable_jev=True without TYPESAFE_API_KEY"],
             )
         self.gateway = gateway
         self.timeout = timeout
@@ -37,10 +43,25 @@ class JevGateRouter:
         query: str,
         usage_tracker: UsageTracker,
         degradation_tracker: DegradationTracker,
+        budget_guard: BudgetGuard | None = None,
+        fallbacks: dict[str, str] | None = None,
     ) -> QueryIntent | None:
         """Attempt fast path via Jev. Returns QueryIntent if fast path taken, else None."""
         if not self.gateway.jev_client:
             return None
+
+        if budget_guard is not None:
+            est_in = estimate_tokens(query) or 20
+            est_cost = compute_cost("jev", input_tokens=est_in)
+            ctx = usage_tracker.call_context("intent_jev", "jev", True, est_in, est_cost)
+            if invoke_budget_guard(budget_guard, ctx) == "skip":
+                degradation_tracker.record(
+                    dg_id="DG-11",
+                    stage="intent_jev",
+                    reason="BudgetGuard returned skip",
+                    impact="Jev gate skipped by BudgetGuard",
+                )
+                return None
 
         try:
             from ...jev import Choice, Noul
@@ -60,14 +81,13 @@ class JevGateRouter:
                 questions=questions,
             )
 
-            # Record usage
-            from ..models import StageUsage
             usage_tracker.record(
                 StageUsage(
                     stage="intent_jev",
                     model=jev_res.model,
                     input_tokens=jev_res.tokens_in,
                     output_tokens=jev_res.tokens_out,
+                    calls=1,
                     latency_ms=jev_res.ms,
                     cost_usd=jev_res.cost_usd,
                     price_table_version=jev_res.price_table_version,
@@ -99,6 +119,9 @@ class JevGateRouter:
             return None
 
         except Exception as exc:
+            if (fallbacks or {}).get("jev") == "raise":
+                raise RAGStageError(stage="intent_jev", message=f"Jev fast gate failed: {exc}", cause=exc) from exc
+
             # DG-03: Jev error or timeout continues on LLM path
             degradation_tracker.record(
                 dg_id="DG-03",

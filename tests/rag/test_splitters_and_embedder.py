@@ -3,11 +3,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from cody_ai_shared_lib.rag.degradation import DegradationTracker
-from cody_ai_shared_lib.rag.embedder import BatchEmbedder
+from cody_ai_shared_lib.rag.ingestion.embedder import BatchEmbedder
 from cody_ai_shared_lib.rag.errors import EmbeddingProviderError, RAGStageError
-from cody_ai_shared_lib.rag.models import RAGNode, RAGNodeSpan
-from cody_ai_shared_lib.rag.summarizer import SectionSummarizer
-from cody_ai_shared_lib.rag.text.splitter import PassThroughSplitter, SentenceSplitter
+from cody_ai_shared_lib.rag.models import RAGNode, SourceSpan as RAGNodeSpan
+from cody_ai_shared_lib.rag.ingestion.summarizer import SectionSummarizer
+from cody_ai_shared_lib.rag.ingestion.splitter import PassThroughSplitter, SentenceSplitter
 from cody_ai_shared_lib.rag.usage import UsageTracker
 
 
@@ -52,8 +52,8 @@ def test_batch_embedder_zero_vector_guard():
     deg_tracker = DegradationTracker()
 
     nodes = [
-        RAGNode(node_id="n1", doc_id="d1", text="Text 1", granularity="passage", span=RAGNodeSpan(char_start=0, char_end=6)),
-        RAGNode(node_id="n2", doc_id="d1", text="Text 2", granularity="passage", span=RAGNodeSpan(char_start=7, char_end=13)),
+        RAGNode(node_id="n1", text="Text 1", granularity="passage", span=RAGNodeSpan(char_start=0, char_end=6, doc_id="d1")),
+        RAGNode(node_id="n2", text="Text 2", granularity="passage", span=RAGNodeSpan(char_start=7, char_end=13, doc_id="d1")),
     ]
 
     # Scenario 1: One normal vector, one zero vector

@@ -6,29 +6,27 @@ Implements every capability in pure Python with thread safety:
   - Native hybrid search with Reciprocal Rank Fusion (RRF);
   - Summary units and levels;
   - Offset addressable windows and sequential boundaries;
-  - Fingerprints, revisions, and atomic section commits.
+  - Fingerprints, revisions, atomic section commits, and JSONL fixture round-tripping.
 """
 from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import math
 import threading
+from collections import Counter
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Generic
 
-from .errors import (
-    EmbeddingProviderError,
-    MissingRequiredScopeError,
-    UnsupportedFilterError,
-)
+from .errors import EmbeddingProviderError
 from .granularity import TRAIT_OFFSET_ADDRESSABLE, has_trait
 from .models import (
     DefaultNodeMeta,
     MetaT,
     RAGFilterSpec,
     RAGNode,
-    ScoreKind,
     SourceSpan,
 )
 from .ports import (
@@ -37,8 +35,10 @@ from .ports import (
     RAGStore,
     ScopeStats,
     StoreCapabilities,
+    validate_scope,
 )
-from .text.analyzer import CjkAwareAnalyzer, TokenGroup
+from .text.analyzer import CjkAwareAnalyzer, TokenGroup, estimate_tokens
+from .vectors import is_zero_vector
 
 
 class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
@@ -91,8 +91,6 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         self._section_summaries: dict[tuple[str, int], RAGNode[MetaT]] = {}
         # doc_id -> {node_id: Fingerprint}
         self._fingerprints: dict[str, dict[str, Fingerprint]] = {}
-        # doc_id -> list of raw full-document text sections for window extraction
-        self._doc_texts: dict[str, dict[int, str]] = {}
         # Store-level revision counter
         self._revision_counter = 1
 
@@ -106,24 +104,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
 
     def _validate_filters(self, filters: RAGFilterSpec) -> None:
         """Enforce required filter keys and supported custom filter types."""
-        caps = self._capabilities
-        # Check required filter keys
-        for req_key in caps.required_filter_keys:
-            val = getattr(filters, req_key, None)
-            if val is None:
-                val = filters.custom.get(req_key)
-            if val is None or (isinstance(val, (str, list, set, dict)) and len(val) == 0):
-                raise MissingRequiredScopeError(f"Required filter key '{req_key}' is missing or empty")
-
-        # Check custom filters
-        for k, v in filters.custom.items():
-            if k not in caps.supported_custom_filters:
-                raise UnsupportedFilterError(f"Unsupported custom filter key: {k!r}")
-            expected_type = caps.supported_custom_filters[k]
-            if not isinstance(v, expected_type):
-                raise UnsupportedFilterError(
-                    f"Custom filter '{k}' expected type {expected_type.__name__}, got {type(v).__name__}"
-                )
+        validate_scope(filters, self._capabilities)
 
     def _passes_filters(self, node: RAGNode[MetaT], filters: RAGFilterSpec) -> bool:
         """Return True if node matches all criteria in filters."""
@@ -134,21 +115,36 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         # tenant_or_user_id
         if filters.tenant_or_user_id is not None:
             extra = getattr(node.metadata, "extra", {}) if hasattr(node.metadata, "extra") else {}
-            node_tenant = getattr(node.metadata, "tenant_id", None) or extra.get("tenant_id")
+            if isinstance(node.metadata, dict):
+                node_tenant = node.metadata.get("tenant_id")
+            else:
+                node_tenant = getattr(node.metadata, "tenant_id", None) or (
+                    extra.get("tenant_id") if isinstance(extra, dict) else None
+                )
             if node_tenant is not None and node_tenant != filters.tenant_or_user_id:
                 return False
 
         # domain_id
         if filters.domain_id is not None:
             extra = getattr(node.metadata, "extra", {}) if hasattr(node.metadata, "extra") else {}
-            node_domain = getattr(node.metadata, "domain_id", None) or extra.get("domain_id")
+            if isinstance(node.metadata, dict):
+                node_domain = node.metadata.get("domain_id")
+            else:
+                node_domain = getattr(node.metadata, "domain_id", None) or (
+                    extra.get("domain_id") if isinstance(extra, dict) else None
+                )
             if node_domain is not None and node_domain != filters.domain_id:
                 return False
 
         # categories
         if filters.categories is not None:
             extra = getattr(node.metadata, "extra", {}) if hasattr(node.metadata, "extra") else {}
-            node_cat = getattr(node.metadata, "category", None) or extra.get("category")
+            if isinstance(node.metadata, dict):
+                node_cat = node.metadata.get("category")
+            else:
+                node_cat = getattr(node.metadata, "category", None) or (
+                    extra.get("category") if isinstance(extra, dict) else None
+                )
             if node_cat is not None and node_cat not in filters.categories:
                 return False
 
@@ -179,7 +175,12 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             dt_start, dt_end = filters.date_range_utc
             extra = getattr(node.metadata, "extra", {}) if hasattr(node.metadata, "extra") else {}
             date_field = filters.date_field or "created_at"
-            node_dt = getattr(node.metadata, date_field, None) or extra.get(date_field)
+            if isinstance(node.metadata, dict):
+                node_dt = node.metadata.get(date_field)
+            else:
+                node_dt = getattr(node.metadata, date_field, None) or (
+                    extra.get(date_field) if isinstance(extra, dict) else None
+                )
             if node_dt is not None and isinstance(node_dt, datetime):
                 if dt_start is not None and node_dt < dt_start:
                     return False
@@ -190,9 +191,12 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         if filters.custom:
             extra = getattr(node.metadata, "extra", {}) if hasattr(node.metadata, "extra") else {}
             for k, expected_v in filters.custom.items():
-                node_v = getattr(node.metadata, k, None)
-                if node_v is None and isinstance(extra, dict):
-                    node_v = extra.get(k)
+                if isinstance(node.metadata, dict):
+                    node_v = node.metadata.get(k)
+                else:
+                    node_v = getattr(node.metadata, k, None)
+                    if node_v is None and isinstance(extra, dict):
+                        node_v = extra.get(k)
                 if node_v is not None and node_v != expected_v:
                     return False
 
@@ -211,15 +215,41 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             return 0.0
         return max(-1.0, min(1.0, dot / (norm1 * norm2)))
 
-    def _score_bm25(self, query_tokens: list[str], node: RAGNode[MetaT]) -> float:
-        """Compute term overlap score over node text or search_tokens."""
-        if not query_tokens:
-            return 0.0
-        node_tokens = set(node.search_tokens or self.analyzer.tokenize(node.text))
-        if not node_tokens:
-            return 0.0
-        matches = sum(1 for t in query_tokens if t in node_tokens)
-        return float(matches) / float(len(query_tokens))
+    def _node_tokens(self, node: RAGNode[MetaT]) -> list[str]:
+        return node.search_tokens if node.search_tokens is not None else self.analyzer.tokenize(node.text)
+
+    @staticmethod
+    def _matches_group(tokens: list[str], group: TokenGroup) -> bool:
+        """Apply one token group: any, all, or adjacent in order (§6.1)."""
+        if group.mode == "any":
+            return bool(set(group.tokens) & set(tokens))
+        if group.mode == "all":
+            return set(group.tokens) <= set(tokens)
+        size = len(group.tokens)
+        return any(tokens[i:i + size] == group.tokens for i in range(len(tokens) - size + 1))
+
+    @staticmethod
+    def _bm25_scores(query_terms: list[str], documents: list[list[str]]) -> list[float]:
+        """Okapi BM25 over the candidate documents (k1=1.2, b=0.75)."""
+        if not documents:
+            return []
+        k1, b = 1.2, 0.75
+        average_length = sum(len(tokens) for tokens in documents) / len(documents) or 1.0
+        frequencies = [Counter(tokens) for tokens in documents]
+        terms = list(dict.fromkeys(query_terms))
+        doc_frequency = {term: sum(1 for counts in frequencies if term in counts) for term in terms}
+
+        scores: list[float] = []
+        for tokens, counts in zip(documents, frequencies):
+            score = 0.0
+            for term in terms:
+                tf = counts.get(term, 0)
+                if tf == 0:
+                    continue
+                idf = math.log(1 + (len(documents) - doc_frequency[term] + 0.5) / (doc_frequency[term] + 0.5))
+                score += idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * len(tokens) / average_length))
+            scores.append(score)
+        return scores
 
     # ── Retrieval Methods (§4.2) ───────────────────────────────────────────────
 
@@ -230,7 +260,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         top_k: int,
     ) -> list[RAGNode[MetaT]]:
         # Conformance kit check 6: zero vector query must be rejected
-        if not query_vector or all(x == 0.0 for x in query_vector):
+        if is_zero_vector(query_vector):
             raise EmbeddingProviderError("Zero-vector query rejected by vector_search")
 
         self._validate_filters(filters)
@@ -240,7 +270,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             for node in self._nodes.values():
                 if not self._passes_filters(node, filters):
                     continue
-                if not node.embedding or all(x == 0.0 for x in node.embedding):
+                if is_zero_vector(node.embedding):
                     continue
                 sim = self._cosine_similarity(query_vector, node.embedding)
                 if filters.min_similarity is not None and sim < filters.min_similarity:
@@ -267,17 +297,22 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
     ) -> list[RAGNode[MetaT]]:
         self._validate_filters(filters)
 
-        if analyzer_tokens:
-            flat_tokens = [t for g in analyzer_tokens for t in g.tokens]
-        else:
-            flat_tokens = self.analyzer.tokenize(query_text)
+        groups = analyzer_tokens or [
+            TokenGroup(tokens=self.analyzer.tokenize(self.analyzer.normalize(query_text)), mode="any")
+        ]
+        query_terms = [token for group in groups for token in group.tokens]
 
         with self._lock:
-            candidates: list[tuple[float, RAGNode[MetaT]]] = []
+            matched = []
             for node in self._nodes.values():
                 if not self._passes_filters(node, filters):
                     continue
-                score = self._score_bm25(flat_tokens, node)
+                tokens = self._node_tokens(node)
+                if all(self._matches_group(tokens, group) for group in groups if group.tokens):
+                    matched.append((node, tokens))
+
+            candidates: list[tuple[float, RAGNode[MetaT]]] = []
+            for (node, _), score in zip(matched, self._bm25_scores(query_terms, [t for _, t in matched])):
                 if score > 0.0:
                     node_copy = copy.deepcopy(node)
                     if self._capabilities.returns_snippets:
@@ -350,6 +385,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
     ) -> list[RAGNode[MetaT]]:
         self._validate_filters(filters)
         with self._lock:
+            seen_ids: set[str] = set()
             summaries: list[RAGNode[MetaT]] = []
             for summary in self._section_summaries.values():
                 if level is not None and summary.level != level:
@@ -357,6 +393,19 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                 if not self._passes_filters(summary, filters):
                     continue
                 summaries.append(copy.deepcopy(summary))
+                seen_ids.add(summary.node_id)
+
+            for node in self._nodes.values():
+                if node.node_id in seen_ids:
+                    continue
+                if not (node.is_summary or node.granularity == "parent_summary"):
+                    continue
+                if level is not None and node.level != level:
+                    continue
+                if not self._passes_filters(node, filters):
+                    continue
+                summaries.append(copy.deepcopy(node))
+                seen_ids.add(node.node_id)
 
             summaries.sort(key=lambda s: (s.span.doc_id, s.span.section_seq, s.span.char_start))
             return summaries
@@ -370,10 +419,9 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
     ) -> list[RAGNode[MetaT]]:
         self._validate_filters(filters)
         with self._lock:
-            # Find contiguous text from stored nodes for doc_id
             doc_nodes = [
                 n for n in self._nodes.values()
-                if n.span.doc_id == doc_id and not n.is_summary
+                if n.span.doc_id == doc_id and not n.is_summary and self._passes_filters(n, filters)
             ]
             if not doc_nodes:
                 return []
@@ -385,32 +433,33 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             if filters.max_char_offset_by_doc and doc_id in filters.max_char_offset_by_doc:
                 doc_bound = filters.max_char_offset_by_doc[doc_id]
                 boundary = min(boundary, doc_bound) if boundary is not None else doc_bound
-
             if boundary is not None:
                 end_offset = min(end_offset, boundary)
-
             if start_offset >= end_offset:
                 return []
 
-            # Extract window text
+            # Passages overlap, so each one contributes only the text after the previous one ended
             window_parts: list[str] = []
+            window_start: int | None = None
+            position = start_offset
             for n in sorted(doc_nodes, key=lambda x: x.span.char_start):
-                # Check overlap with [start_offset, end_offset)
-                if n.span.char_end > start_offset and n.span.char_start < end_offset:
-                    local_s = max(0, start_offset - n.span.char_start)
-                    local_e = min(len(n.text), end_offset - n.span.char_start)
-                    if local_e > local_s:
-                        window_parts.append(n.text[local_s:local_e])
+                local_start = max(position, n.span.char_start)
+                local_end = min(end_offset, n.span.char_end)
+                if local_end <= local_start:
+                    continue
+                if window_start is None:
+                    window_start = local_start
+                elif local_start > position:
+                    break  # a gap in the indexed text ends the contiguous window
+                window_parts.append(n.text[local_start - n.span.char_start:local_end - n.span.char_start])
+                position = local_end
 
-            window_text = "".join(window_parts)
+            if window_start is None:
+                return []
             window_node = RAGNode[MetaT](
-                node_id=f"window_{doc_id}_{start_offset}_{end_offset}",
-                text=window_text,
-                span=SourceSpan(
-                    doc_id=doc_id,
-                    char_start=start_offset,
-                    char_end=end_offset,
-                ),
+                node_id=f"window_{doc_id}_{window_start}_{position}",
+                text="".join(window_parts),
+                span=SourceSpan(doc_id=doc_id, char_start=window_start, char_end=position),
                 granularity="local_window",
                 metadata=DefaultNodeMeta(),  # type: ignore[arg-type]
             )
@@ -422,7 +471,13 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             matched_nodes = [n for n in self._nodes.values() if self._passes_filters(n, filters)]
             docs = {n.span.doc_id for n in matched_nodes}
             char_count = sum(len(n.text) for n in matched_nodes)
-            est_tok = sum(n.token_estimate or 0 for n in matched_nodes)
+            est_tok = sum(
+                n.token_estimate if (n.token_estimate is not None and n.token_estimate > 0) else estimate_tokens(n.text)
+                for n in matched_nodes
+            )
+            has_sums = any(
+                self._passes_filters(s, filters) for s in self._section_summaries.values()
+            ) or any(n.is_summary or n.granularity == "parent_summary" for n in matched_nodes)
             revision = f"rev_{self._revision_counter}_{len(matched_nodes)}"
             return ScopeStats(
                 doc_count=len(docs),
@@ -430,6 +485,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                 char_count=char_count,
                 est_tokens=est_tok,
                 revision=revision,
+                has_summaries=has_sums,
             )
 
     def fetch_full_scope(self, filters: RAGFilterSpec) -> list[RAGNode[MetaT]]:
@@ -481,33 +537,46 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             # Prepare all passage nodes with embeddings and signatures
             for node, emb in zip(nodes, embeddings):
                 node_copy = copy.deepcopy(node)
+                if not node_copy.span.doc_id and doc_id:
+                    node_copy.span.doc_id = doc_id
                 node_copy.embedding = emb
-                norm_text = self.analyzer.normalize(node_copy.text)
-                node_copy.content_hash = hashlib.sha256(norm_text.encode("utf-8")).hexdigest()
-                node_copy.token_estimate = node_copy.token_estimate or math.ceil(len(node_copy.text) * 0.3)
-                if self._capabilities.uses_analyzer_tokens:
+                node_copy.content_hash = node_copy.content_hash or self._hash_text(node_copy.text)
+                node_copy.token_estimate = node_copy.token_estimate or estimate_tokens(node_copy.text)
+                if self._capabilities.uses_analyzer_tokens and node_copy.search_tokens is None:
                     node_copy.search_tokens = self.analyzer.tokenize(node_copy.text)
 
                 self._nodes[node_copy.node_id] = node_copy
                 written_ids.append(node_copy.node_id)
 
-                doc_fprints[node_copy.node_id] = Fingerprint(
-                    content_hash=node_copy.content_hash,
-                    embedding_signature=f"{self._embedding_space.model}|{self._embedding_space.dims}|{self._embedding_space.task_type_documents}|{self._embedding_space.splitter_version}",
-                    fts_signature=f"{self.analyzer.name}|{self.analyzer.version}" if self._capabilities.uses_analyzer_tokens else None,
-                )
+                doc_fprints[node_copy.node_id] = self._fingerprint(node_copy)
 
-            self._section_nodes[(doc_id, section_seq)] = written_ids
+            # A partial upsert (sync) adds to the section; it does not replace it
+            existing_ids = self._section_nodes.get((doc_id, section_seq), [])
+            self._section_nodes[(doc_id, section_seq)] = list(dict.fromkeys(existing_ids + written_ids))
 
             if summary is not None:
                 sum_copy = copy.deepcopy(summary)
+                if not sum_copy.span.doc_id and doc_id:
+                    sum_copy.span.doc_id = doc_id
                 sum_copy.is_summary = True
-                norm_sum = self.analyzer.normalize(sum_copy.text)
-                sum_copy.content_hash = hashlib.sha256(norm_sum.encode("utf-8")).hexdigest()
+                sum_copy.content_hash = sum_copy.content_hash or self._hash_text(sum_copy.text)
                 self._section_summaries[(doc_id, section_seq)] = sum_copy
+                doc_fprints[sum_copy.node_id] = self._fingerprint(sum_copy)
 
             self._revision_counter += 1
             return len(written_ids)
+
+    def _hash_text(self, text: str) -> str:
+        return hashlib.sha256(self.analyzer.normalize(text).encode("utf-8")).hexdigest()
+
+    def _fingerprint(self, node: RAGNode[MetaT]) -> Fingerprint:
+        space = self._embedding_space
+        uses_tokens = self._capabilities.uses_analyzer_tokens
+        return Fingerprint(
+            content_hash=node.content_hash or self._hash_text(node.text),
+            embedding_signature=f"{space.model}|{space.dims}|{space.task_type_documents}|{space.splitter_version}",
+            fts_signature=f"{self.analyzer.name}|{self.analyzer.version}" if uses_tokens else None,
+        )
 
     def get_fingerprints(self, doc_id: str) -> dict[str, Fingerprint]:
         with self._lock:
@@ -519,9 +588,14 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             for nid in node_ids:
                 if nid in self._nodes:
                     node = self._nodes.pop(nid)
-                    doc_id = node.span.doc_id
-                    if doc_id in self._fingerprints and nid in self._fingerprints[doc_id]:
-                        del self._fingerprints[doc_id][nid]
+                    self._fingerprints.get(node.span.doc_id, {}).pop(nid, None)
+                    deleted += 1
+
+            targets = set(node_ids)
+            for key, summary in list(self._section_summaries.items()):
+                if summary.node_id in targets:
+                    del self._section_summaries[key]
+                    self._fingerprints.get(key[0], {}).pop(summary.node_id, None)
                     deleted += 1
             self._revision_counter += 1
             return deleted
@@ -532,7 +606,6 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             for nid in to_delete:
                 del self._nodes[nid]
             self._fingerprints.pop(doc_id, None)
-            # Remove section summaries
             sec_keys = [k for k in self._section_summaries if k[0] == doc_id]
             for k in sec_keys:
                 del self._section_summaries[k]
@@ -546,8 +619,12 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                 if d_id == doc_id and seq >= from_seq:
                     to_delete_nodes.extend(nids)
                     del self._section_nodes[(d_id, seq)]
-                    self._section_summaries.pop((d_id, seq), None)
 
+            to_delete_nodes.extend(
+                summary.node_id
+                for (d_id, seq), summary in self._section_summaries.items()
+                if d_id == doc_id and seq >= from_seq
+            )
             return self.delete_nodes(to_delete_nodes)
 
     def current_revisions(self, node_ids: list[str]) -> dict[str, str]:
@@ -558,20 +635,89 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                 if nid in self._nodes
             }
 
-    def upsert_section(
-        self,
-        document_id: str,
-        section_id: str | int = 0,
-        nodes: Sequence[RAGNode[MetaT]] = (),
-        embeddings: list[list[float]] | None = None,
-        metadata: MetaT | None = None,
-        summary: RAGNode[MetaT] | None = None,
-    ) -> int:
-        seq = int(section_id) if isinstance(section_id, int) or str(section_id).isdigit() else 0
-        return self.upsert_section_nodes(
-            doc_id=document_id,
-            section_seq=seq,
-            nodes=list(nodes),
-            embeddings=embeddings,
-            summary=summary,
+    # ── Fixture Serialization (§14.1 RAG-EVAL-10) ─────────────────────────────
+
+    def to_jsonl(self, path: str | Path) -> None:
+        """Serialize nodes, summaries, fingerprints, and store header to JSONL (§14.1 RAG-EVAL-10)."""
+        file_path = Path(path)
+        with self._lock:
+            lines: list[str] = []
+            header = {
+                "_kind": "header",
+                "embedding_space": self._embedding_space.model_dump(mode="json"),
+                "revision_counter": self._revision_counter,
+            }
+            lines.append(json.dumps(header, ensure_ascii=False))
+            for nid, node in self._nodes.items():
+                doc_id = node.span.doc_id
+                fp = self._fingerprints.get(doc_id, {}).get(nid)
+                row = {
+                    "_kind": "node",
+                    "node": node.model_dump(mode="json"),
+                    "fingerprint": fp.model_dump(mode="json") if fp else None,
+                }
+                lines.append(json.dumps(row, ensure_ascii=False))
+            for (doc_id, sec_seq), sum_node in self._section_summaries.items():
+                row = {
+                    "_kind": "summary",
+                    "doc_id": doc_id,
+                    "section_seq": sec_seq,
+                    "node": sum_node.model_dump(mode="json"),
+                    "fingerprint": self._fingerprint(sum_node).model_dump(mode="json"),
+                }
+                lines.append(json.dumps(row, ensure_ascii=False))
+            file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    @classmethod
+    def from_jsonl(
+        cls,
+        path: str | Path,
+        capabilities: StoreCapabilities | None = None,
+        analyzer: CjkAwareAnalyzer | None = None,
+    ) -> InMemoryRAGStore[Any]:
+        """Load an InMemoryRAGStore snapshot from a JSONL file (§14.1 RAG-EVAL-10)."""
+        file_path = Path(path)
+        raw_lines = [ln.strip() for ln in file_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        emb_space: EmbeddingSpace | None = None
+        rev_counter = 1
+        nodes_to_load: list[tuple[RAGNode[Any], Fingerprint | None]] = []
+        summaries_to_load: list[tuple[str, int, RAGNode[Any]]] = []
+        summary_fingerprints: list[tuple[str, str, Fingerprint]] = []
+
+        for ln in raw_lines:
+            record = json.loads(ln)
+            kind = record.get("_kind")
+            if kind == "header":
+                if "embedding_space" in record and record["embedding_space"]:
+                    emb_space = EmbeddingSpace.model_validate(record["embedding_space"])
+                rev_counter = int(record.get("revision_counter", 1))
+            elif kind == "node":
+                node = RAGNode.model_validate(record["node"])
+                fp = Fingerprint.model_validate(record["fingerprint"]) if record.get("fingerprint") else None
+                nodes_to_load.append((node, fp))
+            elif kind == "summary":
+                s_node = RAGNode.model_validate(record["node"])
+                summaries_to_load.append((record["doc_id"], int(record["section_seq"]), s_node))
+                if record.get("fingerprint"):
+                    summary_fingerprints.append(
+                        (record["doc_id"], s_node.node_id, Fingerprint.model_validate(record["fingerprint"]))
+                    )
+
+        store: InMemoryRAGStore[Any] = cls(
+            capabilities=capabilities,
+            embedding_space=emb_space,
+            analyzer=analyzer,
         )
+        store._revision_counter = rev_counter
+        for node, fp in nodes_to_load:
+            store._nodes[node.node_id] = node
+            doc_id = node.span.doc_id
+            sec_seq = node.span.section_seq
+            store._section_nodes.setdefault((doc_id, sec_seq), []).append(node.node_id)
+            if fp is not None:
+                store._fingerprints.setdefault(doc_id, {})[node.node_id] = fp
+        for doc_id, sec_seq, s_node in summaries_to_load:
+            store._section_summaries[(doc_id, sec_seq)] = s_node
+        for doc_id, node_id, fp in summary_fingerprints:
+            store._fingerprints.setdefault(doc_id, {})[node_id] = fp
+        return store

@@ -1,107 +1,135 @@
-"""Tier ladder AdaptiveStrategy (§8.9, AC-RAG-10, AC-RAG-20)."""
+"""Tier ladder AdaptiveStrategy driven by ordered (predicate, strategy) rules (§8.9, §8.12)."""
 from __future__ import annotations
 
-from typing import ClassVar, Generic
-from ..models import MetaT, RAGNode
+from dataclasses import dataclass, field
+from typing import Any, ClassVar, Generic
+
+from ..errors import StoreCapabilityError
+from ..models import MetaT, QueryIntent, QueryPlan, RAGFilterSpec, RAGNode, RAGQueryRequest
+from ..ports import ScopeStats, StoreCapabilities
+from ..profile import EngineProfile
+from ..registry import ComponentRegistry, create_default_registry
 from .context import RetrievalContext, RetrievalStrategy
-from .dense_vector import DenseVectorStrategy
-from .full_context import FullContextStrategy
-from .hierarchical import HierarchicalStrategy
-from .hybrid_rrf import HybridRRFStrategy
-from .keyword import KeywordFirstStrategy, KeywordOnlyStrategy
+
+# The lowest rate estimate_tokens can produce (non-CJK text), so a document ruled out is truly too large.
+_MIN_TOKENS_PER_CHAR = 0.25
+
+OVERRIDE_STRATEGY = "$override"
+NO_STRATEGY = "none"
+
+DEFAULT_ADAPTIVE_RULES: tuple[tuple[str, str], ...] = (
+    ("has_strategy_override", OVERRIDE_STRATEGY),
+    ("route_no_retrieval", NO_STRATEGY),
+    ("fits_full_context", "full_context"),
+    ("wants_overview", "hierarchical"),
+    ("exact_terms_only", "keyword_first"),
+    ("hybrid_available", "hybrid_rrf"),
+    ("vector_available", "dense_vector"),
+    ("keyword_available", "keyword_only"),
+)
+
+
+@dataclass
+class RuleContext:
+    """What a rule predicate may inspect. `stats` is filled when Tier 0 is measured."""
+    request: RAGQueryRequest
+    intent: QueryIntent
+    filters: RAGFilterSpec
+    store: Any
+    caps: StoreCapabilities
+    profile: EngineProfile
+    stats: ScopeStats | None = field(default=None)
+
+
+def _hint_exceeds_gate(rc: RuleContext, gate: int) -> bool:
+    """True when doc_total_chars proves the visible text cannot fit, avoiding a store call (§8.2)."""
+    chars = rc.request.doc_total_chars
+    if chars is None:
+        return False
+    if rc.filters.max_char_offset is not None:
+        chars = min(chars, rc.filters.max_char_offset)
+    if rc.filters.max_char_offset_by_doc:
+        chars = min(chars, max(rc.filters.max_char_offset_by_doc.values()))
+    return chars * _MIN_TOKENS_PER_CHAR > gate
+
+
+def fits_full_context(rc: RuleContext) -> bool:
+    gate = rc.profile.retrieval.full_context_max_tokens
+    if gate <= 0 or not rc.caps.supports_full_scope_fetch or _hint_exceeds_gate(rc, gate):
+        return False
+    rc.stats = rc.store.scope_stats(rc.filters)
+    return 0 < rc.stats.total_tokens <= gate
+
+
+BUILTIN_PREDICATES = {
+    "has_strategy_override": lambda rc: bool(rc.request.strategy_override)
+    and rc.request.strategy_override != AdaptiveStrategy.name,
+    "route_no_retrieval": lambda rc: rc.intent.route == "no_retrieval",
+    "fits_full_context": fits_full_context,
+    "wants_overview": lambda rc: rc.intent.scope == "document_overview"
+    or rc.profile.retrieval.always_include_summaries,
+    "exact_terms_only": lambda rc: bool(rc.intent.exact_terms) and rc.profile.retrieval.enable_keyword_first,
+    "hybrid_available": lambda rc: rc.caps.supports_vector_search
+    and (rc.caps.supports_keyword_fts or rc.caps.supports_native_hybrid_rpc),
+    "vector_available": lambda rc: rc.caps.supports_vector_search,
+    "keyword_available": lambda rc: rc.caps.supports_keyword_fts,
+}
 
 
 class AdaptiveStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
-    """Selects optimal retrieval tier based on scope statistics, query intent, and store capabilities."""
+    """Runs the first rule that is true and whose strategy the store can serve (§8.9)."""
     name: ClassVar[str] = "adaptive"
     version: ClassVar[str] = "1.0.0"
 
+    @staticmethod
+    def decide_tier(
+        request: RAGQueryRequest,
+        intent: QueryIntent,
+        filters: RAGFilterSpec,
+        store: Any,
+        profile: EngineProfile,
+        registry: ComponentRegistry | None = None,
+    ) -> QueryPlan:
+        """Evaluate the adaptive rules and return a QueryPlan without retrieving anything (§8.12)."""
+        components = registry or create_default_registry()
+        caps = store.capabilities()
+        rc = RuleContext(request, intent, filters, store, caps, profile)
+        rules = profile.retrieval.adaptive_rules or DEFAULT_ADAPTIVE_RULES
+
+        for number, (predicate, configured) in enumerate(rules, start=1):
+            if not components.get("predicate", predicate)(rc):
+                continue
+            is_override = configured == OVERRIDE_STRATEGY
+            strategy = request.strategy_override if is_override else configured
+            cls = components.get("strategy", strategy)
+            if strategy != NO_STRATEGY and not is_override and not cls.is_runnable(caps):
+                continue
+
+            measured = (
+                f"scope {rc.stats.total_tokens} tokens, Tier 0 gate {profile.retrieval.full_context_max_tokens}"
+                if rc.stats is not None
+                else "Tier 0 not evaluated"
+            )
+            return QueryPlan(
+                strategy=strategy,
+                tier_decision_reason=f"{strategy}: rule {number} {predicate}; {measured}",
+                rule=number,
+                requires_index=strategy not in ("full_context", NO_STRATEGY),
+                reads=cls.requires if cls is not None else frozenset(),
+                applied_filters=filters,
+                scope=rc.stats,
+            )
+
+        raise StoreCapabilityError("No adaptive rule matched a strategy this store can run", stage="retrieval")
+
     def retrieve(self, ctx: RetrievalContext[MetaT]) -> list[RAGNode[MetaT]]:
-        # Rule 1: has_strategy_override (§8.9)
-        if ctx.request.strategy_override:
-            override = ctx.request.strategy_override
-            ctx.request.metadata = dict(ctx.request.metadata or {})
-            ctx.request.metadata["strategy_used"] = override
-            ctx.request.metadata["tier_decision_reason"] = f"override: {override}"
-            if override == "hierarchical":
-                return HierarchicalStrategy().retrieve(ctx)
-            if override == "hybrid_rrf":
-                return HybridRRFStrategy().retrieve(ctx)
-            if override == "full_context":
-                return FullContextStrategy().retrieve(ctx)
-            if override == "dense_vector":
-                return DenseVectorStrategy().retrieve(ctx)
-            if override == "keyword_first":
-                return KeywordFirstStrategy().retrieve(ctx)
-            if override == "keyword_only":
-                return KeywordOnlyStrategy().retrieve(ctx)
+        registry = ctx.registry or create_default_registry()
+        plan = self.decide_tier(ctx.request, ctx.intent, ctx.filters, ctx.store, ctx.profile, registry)
+        ctx.last_strategy_used = plan.strategy
+        ctx.last_tier_reason = plan.tier_decision_reason
+        ctx.last_rule = plan.rule
+        ctx.scope_revision = plan.scope.revision if plan.scope is not None else None
 
-        # Rule 2: route_no_retrieval (§8.9)
-        if ctx.intent.route == "direct":
-            ctx.request.metadata = dict(ctx.request.metadata or {})
-            ctx.request.metadata["strategy_used"] = "none"
-            ctx.request.metadata["tier_decision_reason"] = "route_no_retrieval: direct route"
+        if plan.strategy == NO_STRATEGY:
             return []
-
-        stats = ctx.store.scope_stats(ctx.filters)
-        max_t0 = ctx.profile.retrieval.full_context_max_tokens
-        caps = ctx.store.capabilities() if callable(ctx.store.capabilities) else ctx.store.capabilities
-
-        # Rule 3: Tier 0 Full Context Gate (AC-RAG-10, AC-RAG-11)
-        if (
-            max_t0 > 0
-            and stats.total_tokens > 0
-            and stats.total_tokens <= max_t0
-            and caps.supports_full_scope_fetch
-        ):
-            ctx.request.metadata = dict(ctx.request.metadata or {})
-            ctx.request.metadata["strategy_used"] = "full_context"
-            ctx.request.metadata["tier_decision_reason"] = (
-                f"full_context: {stats.total_tokens} <= {max_t0} tokens"
-            )
-            return FullContextStrategy().retrieve(ctx)
-
-        # Rule 2: Tier 3 Hierarchical Strategy (AC-RAG-22)
-        if (
-            (ctx.intent.scope == "document_overview" or ctx.profile.retrieval.always_include_summaries)
-            and caps.supports_parent_summaries
-        ):
-            ctx.request.metadata = dict(ctx.request.metadata or {})
-            ctx.request.metadata["strategy_used"] = "hierarchical"
-            ctx.request.metadata["tier_decision_reason"] = "hierarchical: overview query or always_include_summaries"
-            return HierarchicalStrategy().retrieve(ctx)
-
-        # Rule 3: Exact Terms -> Keyword First
-        if ctx.intent.exact_terms and caps.supports_keyword_fts:
-            ctx.request.metadata = dict(ctx.request.metadata or {})
-            ctx.request.metadata["strategy_used"] = "keyword_first"
-            ctx.request.metadata["tier_decision_reason"] = "keyword_first: exact terms in query"
-            return KeywordFirstStrategy().retrieve(ctx)
-
-        # Rule 4: Hybrid RRF (Tier 2)
-        if caps.supports_vector_search and caps.supports_keyword_fts:
-            ctx.request.metadata = dict(ctx.request.metadata or {})
-            ctx.request.metadata["strategy_used"] = "hybrid_rrf"
-            ctx.request.metadata["tier_decision_reason"] = (
-                f"hybrid_rrf: scope {stats.total_tokens} tokens exceeded Tier 0 gate {max_t0}"
-            )
-            return HybridRRFStrategy().retrieve(ctx)
-
-        # Rule 5: Dense Vector (Tier 1)
-        if caps.supports_vector_search:
-            ctx.request.metadata = dict(ctx.request.metadata or {})
-            ctx.request.metadata["strategy_used"] = "dense_vector"
-            ctx.request.metadata["tier_decision_reason"] = "dense_vector: store supports vector search"
-            return DenseVectorStrategy().retrieve(ctx)
-
-        # Rule 6: Keyword Only
-        if caps.supports_keyword_fts:
-            ctx.request.metadata = dict(ctx.request.metadata or {})
-            ctx.request.metadata["strategy_used"] = "keyword_only"
-            ctx.request.metadata["tier_decision_reason"] = "keyword_only: keyword store available"
-            return KeywordOnlyStrategy().retrieve(ctx)
-
-        # Default fallback: DenseVector
-        ctx.request.metadata = dict(ctx.request.metadata or {})
-        ctx.request.metadata["strategy_used"] = "dense_vector"
-        return DenseVectorStrategy().retrieve(ctx)
+        return registry.get("strategy", plan.strategy)().retrieve(ctx)

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime
-from typing import Any
+from typing import Any, Sequence
 
 from .granularity import TRAIT_OFFSET_ADDRESSABLE, has_trait
 from .models import (
@@ -23,7 +23,6 @@ class SequentialBoundaryGuard:
     """Enforces spoiler prevention by cutting or dropping text beyond reading boundary B (§5.2)."""
     name: str = "sequential_boundary"
     hard: bool = True
-    forces_strict_grounding: bool = True
 
     def __init__(
         self,
@@ -36,6 +35,14 @@ class SequentialBoundaryGuard:
         self.max_char_offset_by_doc = dict(max_char_offset_by_doc or {})
         self.max_snap_back_chars = max_snap_back_chars
         self.analyzer = analyzer or CjkAwareAnalyzer()
+
+    @property
+    def is_active(self) -> bool:
+        return self.max_char_offset is not None or bool(self.max_char_offset_by_doc)
+
+    @property
+    def forces_strict_grounding(self) -> bool:
+        return self.is_active
 
     def get_boundary_for_doc(self, doc_id: str) -> int | None:
         """Resolve the effective boundary B for a specific document."""
@@ -70,7 +77,7 @@ class SequentialBoundaryGuard:
             return None
 
         # Rule 2: Offset-addressable node with char_end >= B is cut at sentence end
-        if node.span.char_end > b:
+        if node.span.char_end >= b:
             limit = b - node.span.char_start
             prefix = node.text[:limit]
             last_end = self.analyzer.last_sentence_end(prefix)
@@ -83,6 +90,8 @@ class SequentialBoundaryGuard:
             cut = max(0, min(cut, limit))
             if cut == 0:
                 return None
+            if cut == len(node.text):
+                return node
 
             new_node = copy.deepcopy(node)
             new_node.text = prefix[:cut]
@@ -101,9 +110,17 @@ class SequentialBoundaryGuard:
         return citation.span.char_end <= b
 
     def prompt_rules(self) -> list[str]:
+        if not self.is_active:
+            return []
+        if self.max_char_offset is not None:
+            b_desc = str(self.max_char_offset)
+        else:
+            b_desc = ", ".join(f"{k}:{v}" for k, v in sorted(self.max_char_offset_by_doc.items()))
         return [
-            "Do not disclose, reference, or foreshadow any events, facts, or reveals "
-            "that occur beyond the specified reading position in the story."
+            f"SPOILER GUARD ACTIVE: The user has read only up to character offset {b_desc}. "
+            "Everything in the <data-...> block is at or before that offset. "
+            "You MUST NOT mention, imply, foreshadow, or deduce any event, character fate, "
+            "relationship, or reveal that occurs after that point, even if you know the work from pre-training."
         ]
 
 
@@ -134,7 +151,12 @@ class TemporalGuard:
             return node
         dt_start, dt_end = self.date_range_utc
         extra = getattr(node.metadata, "extra", {}) if hasattr(node.metadata, "extra") else {}
-        node_dt = getattr(node.metadata, self.date_field, None) or extra.get(self.date_field)
+        if isinstance(node.metadata, dict):
+            node_dt = node.metadata.get(self.date_field)
+        else:
+            node_dt = getattr(node.metadata, self.date_field, None) or (
+                extra.get(self.date_field) if isinstance(extra, dict) else None
+            )
         if node_dt is not None and isinstance(node_dt, datetime):
             if dt_start is not None and node_dt < dt_start:
                 return None
@@ -150,7 +172,7 @@ class TemporalGuard:
 
 
 class TenantGuard:
-    """Enforces fail-closed multi-tenant isolation (§5.1, §5.6)."""
+    """Drops nodes whose metadata names a different tenant (§5.1); required scope is checked separately (§5.6)."""
     name: str = "tenant"
     hard: bool = True
     forces_strict_grounding: bool = False
@@ -168,7 +190,12 @@ class TenantGuard:
         if self.tenant_or_user_id is None:
             return node
         extra = getattr(node.metadata, "extra", {}) if hasattr(node.metadata, "extra") else {}
-        node_tenant = getattr(node.metadata, "tenant_id", None) or extra.get("tenant_id")
+        if isinstance(node.metadata, dict):
+            node_tenant = node.metadata.get("tenant_id")
+        else:
+            node_tenant = getattr(node.metadata, "tenant_id", None) or (
+                extra.get("tenant_id") if isinstance(extra, dict) else None
+            )
         if node_tenant is not None and node_tenant != self.tenant_or_user_id:
             return None
         return node
@@ -215,23 +242,104 @@ class ScopeGuard:
             return None
         extra = getattr(node.metadata, "extra", {}) if hasattr(node.metadata, "extra") else {}
         if self.domain_id is not None:
-            node_domain = getattr(node.metadata, "domain_id", None) or extra.get("domain_id")
+            if isinstance(node.metadata, dict):
+                node_domain = node.metadata.get("domain_id")
+            else:
+                node_domain = getattr(node.metadata, "domain_id", None) or (
+                    extra.get("domain_id") if isinstance(extra, dict) else None
+                )
             if node_domain is not None and node_domain != self.domain_id:
                 return None
         if self.categories is not None:
-            node_cat = getattr(node.metadata, "category", None) or extra.get("category")
+            if isinstance(node.metadata, dict):
+                node_cat = node.metadata.get("category")
+            else:
+                node_cat = getattr(node.metadata, "category", None) or (
+                    extra.get("category") if isinstance(extra, dict) else None
+                )
             if node_cat is not None and node_cat not in self.categories:
                 return None
         for k, v in self.custom.items():
-            node_v = getattr(node.metadata, k, None) or (extra.get(k) if isinstance(extra, dict) else None)
+            if isinstance(node.metadata, dict):
+                node_v = node.metadata.get(k)
+            else:
+                node_v = getattr(node.metadata, k, None) or (extra.get(k) if isinstance(extra, dict) else None)
             if node_v is not None and node_v != v:
                 return None
         return node
 
     def verify_citation(self, citation: RAGCitation) -> bool:
-        if self.doc_ids is not None and citation.span.doc_id not in self.doc_ids:
+        if self.doc_ids is not None and citation.span.doc_id and citation.span.doc_id not in self.doc_ids:
             return False
         return True
 
     def prompt_rules(self) -> list[str]:
         return []
+
+
+def build_turn_guards(
+    filters: RAGFilterSpec,
+    analyzer: TextAnalyzer | None = None,
+    profile_guards: Sequence[str] = (),
+    extra_guards: Sequence[Any] = (),
+) -> list[Any]:
+    """Build the turn's guards from the effective filters, plus app guards, which only ever add (§5.3)."""
+    eff_analyzer = analyzer or CjkAwareAnalyzer()
+    active: list[Any] = []
+
+    # 1. Sequential boundary guard from filters or profile
+    if (
+        filters.max_char_offset is not None
+        or filters.max_char_offset_by_doc
+        or "sequential_boundary" in profile_guards
+    ):
+        active.append(
+            SequentialBoundaryGuard(
+                max_char_offset=filters.max_char_offset,
+                max_char_offset_by_doc=filters.max_char_offset_by_doc,
+                analyzer=eff_analyzer,
+            )
+        )
+
+    # 2. Caller hard temporal guard (only when caller set date_range_utc; soft intent time window is NOT a guard per D-04)
+    if filters.date_range_utc is not None:
+        active.append(
+            TemporalGuard(
+                date_range_utc=filters.date_range_utc,
+                date_field=filters.date_field,
+            )
+        )
+
+    # 3. Tenant guard
+    if filters.tenant_or_user_id is not None:
+        active.append(TenantGuard(tenant_or_user_id=filters.tenant_or_user_id))
+
+    # 4. Scope guard
+    if (
+        filters.doc_ids is not None
+        or filters.domain_id is not None
+        or filters.categories is not None
+        or filters.custom
+    ):
+        active.append(
+            ScopeGuard(
+                doc_ids=filters.doc_ids,
+                domain_id=filters.domain_id,
+                categories=filters.categories,
+                custom=filters.custom,
+            )
+        )
+
+    # 5. App-supplied guards
+    active.extend(extra_guards)
+
+    return active
+
+
+# Names built from the turn's filters; any other profile guard name comes from the registry.
+BUILTIN_GUARDS: dict[str, Any] = {
+    SequentialBoundaryGuard.name: SequentialBoundaryGuard,
+    TemporalGuard.name: TemporalGuard,
+    TenantGuard.name: TenantGuard,
+    ScopeGuard.name: ScopeGuard,
+}

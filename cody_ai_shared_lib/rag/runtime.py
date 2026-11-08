@@ -5,6 +5,7 @@ import random
 import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol, Sequence, TypeVar, runtime_checkable
 
@@ -109,6 +110,10 @@ class Deadline:
     def is_expired(self) -> bool:
         return self.remaining_seconds() <= 0.0
 
+    def fits(self, stage_budget_seconds: float) -> bool:
+        """True when an optional stage of this cost still fits in the remaining time."""
+        return self.remaining_seconds() >= stage_budget_seconds
+
     def check(self, stage: str, is_optional: bool = False) -> None:
         """Enforce deadline; raises DeadlineExceeded if a required stage cannot complete."""
         if self.is_expired() and not is_optional:
@@ -121,3 +126,13 @@ class Deadline:
 def make_bounded_pool(max_workers: int = 4) -> ThreadPoolExecutor:
     """Create a bounded thread pool for independent concurrent operations."""
     return ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="rag-pool")
+
+
+@dataclass
+class RequestRun:
+    """Everything scoped to one request; the engine itself holds no per-request state (D-03)."""
+    request_id: str
+    usage: Any
+    degradations: Any
+    deadline: Deadline
+    trace: Any

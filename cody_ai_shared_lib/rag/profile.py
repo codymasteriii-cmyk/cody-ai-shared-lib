@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from typing import Any, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .errors import ProfileConfigError
-from .registry import ComponentRegistry
+from .registry import ComponentRegistry, split_component_name
 
 
 class ModelBindings(BaseModel):
@@ -19,7 +18,7 @@ class ModelBindings(BaseModel):
     generation: list[str]
     intent: list[str] | None = None
     summary: list[str] | None = None
-    embedding: str = "gemini-embedding-2"
+    embedding: str
     reranker: str | None = None
     judge: list[str] | None = None
 
@@ -32,6 +31,14 @@ class RouterConfig(BaseModel):
     jev_timeout: float = 2.0
 
 
+DEFAULT_FUSION_WEIGHTS: dict[str, tuple[float, float]] = {
+    "exact_terms": (0.7, 1.3),
+    "negation": (0.7, 1.3),
+    "entity_terms": (0.9, 1.1),
+    "default": (1.0, 1.0),
+}
+
+
 class RetrievalConfig(BaseModel):
     model_config = {"frozen": True}
     default_strategy: str = "dense_vector"
@@ -42,6 +49,13 @@ class RetrievalConfig(BaseModel):
     always_include_summaries: bool = False
     rrf_k: int = 60
     min_similarity: float | None = None
+    min_results_before_relax: int = 3
+    relaxation: list[str] = Field(default_factory=list)
+    adaptive_rules: list[tuple[str, str]] | None = None
+    enable_keyword_first: bool = False
+    fusion_weights: dict[str, tuple[float, float]] = Field(
+        default_factory=lambda: dict(DEFAULT_FUSION_WEIGHTS)
+    )
 
 
 class ContextConfig(BaseModel):
@@ -49,14 +63,27 @@ class ContextConfig(BaseModel):
     max_context_tokens: int = 160_000
     reserved_instruction_tokens: int = 4000
     reserved_history_tokens: int = 4000
+    question_reserve_tokens: int = 1000
+    answer_reserve_tokens: int = 4000
+    history_ratio: float = 0.15
+    summary_ratio: float = 0.25
+    local_window_ratio: float = 0.20
+    retrieved_ratio: float = 0.40
+    turn_decay: float = 0.7
+    recent_turns_full: int = 2
+    turn_summary_cutoff_tokens: int = 300
+    state_max_bytes: int = 16_384
+    reused_turns: int = 3
+    max_reused_nodes: int = 24
+    rolling_summary_max_tokens: int = 400
 
 
 class GenerationConfig(BaseModel):
     model_config = {"frozen": True}
     strategy: str = "stuff"
     temperature: float | None = None
-    grounding_mode: Literal["strict", "labelled_fallback", "open"] = "strict"
-    fallback_label: str = "Based on retrieved context"
+    grounding_mode: Literal["strict", "labelled_fallback"] = "strict"
+    fallback_label: str = "Not from your sources:"
     stream_mode: Literal["native", "buffered"] = "buffered"
 
 
@@ -65,11 +92,23 @@ class CitationConfig(BaseModel):
     formatter: str = "ref"
     verify_quotes: bool = False
     policy: str = "filter"
+    on_unverified: Literal["filter", "flag"] = "filter"
+    min_citation_coverage: float = 0.0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sync_policy(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "on_unverified" in data and "policy" not in data:
+                data["policy"] = data["on_unverified"]
+            elif "policy" in data and "on_unverified" not in data and data["policy"] in ("filter", "flag"):
+                data["on_unverified"] = data["policy"]
+        return data
 
 
 class SummariesConfig(BaseModel):
     model_config = {"frozen": True}
-    enabled: bool = True
+    enabled: bool = False
     min_chars_for_summary: int = 1500
     summary_unit_chars: int = 8000
 
@@ -86,11 +125,33 @@ class RuntimeConfig(BaseModel):
     model_config = {"frozen": True}
     deadline_seconds: float = 30.0
     pool_size: int = 4
+    stage_budgets: dict[str, float] = Field(
+        default_factory=lambda: {"rerank": 4.0, "secondary_queries": 3.0}
+    )
+
+
+class CacheConfig(BaseModel):
+    model_config = {"frozen": True}
+    enabled: bool = True
+    max_bytes: int = 32 * 1024 * 1024
+    query_embedding_ttl_seconds: int = 3600
+    enable_embedding_cache: bool = True
+    enable_result_cache: bool = False
+
+
+class ValidationReport(BaseModel):
+    """Report returned by engine.validate() / profile.validate() (§13.3)."""
+    valid: bool = True
+    profile_fingerprint: str = ""
+    problems: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    unknown: list[str] = Field(default_factory=list)
 
 
 VALID_FALLBACK_KEYS = {
     "rerank", "jev", "intent", "generation", "summarizer",
     "query_embedding", "ingest_embedding", "cache", "observer", "deadline",
+    "relax_soft_filters",
 }
 
 
@@ -103,7 +164,7 @@ class EngineProfile(BaseModel):
     models: ModelBindings
     router: RouterConfig = Field(default_factory=RouterConfig)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
-    transforms: list[str] = Field(default_factory=list)
+    transforms: list[str] = Field(default_factory=lambda: ["secondary_fanout"])
     post_stages: list[str] = Field(default_factory=list)
     context: ContextConfig = Field(default_factory=ContextConfig)
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
@@ -116,6 +177,8 @@ class EngineProfile(BaseModel):
     fallbacks: dict[str, str] = Field(default_factory=dict)
     observer_errors: Literal["log", "raise"] = "log"
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    cache: CacheConfig = Field(default_factory=CacheConfig)
+    allowed_link_hosts: list[str] = Field(default_factory=list)
     trace_level: Literal["light", "verbose"] = "light"
     hydration_projection: str = "context"
     variants: dict[str, dict[str, Any]] = Field(default_factory=dict)
@@ -151,19 +214,23 @@ class EngineProfile(BaseModel):
         """Construct EngineProfile from mapping dictionary (§12.1)."""
         return cls(**data)
 
-    def validate(self, registry: ComponentRegistry | None = None) -> None:
-        """Validate configuration and bindings; raises ProfileConfigError with all issues."""
+    def check(self, registry: ComponentRegistry | None = None) -> ValidationReport:
+        """Return every configuration problem without raising."""
         problems: list[str] = []
         missing: list[str] = []
         unknown: list[str] = []
 
-        if not self.models.generation:
-            missing.append("models.generation")
-            problems.append("ModelBindings.generation cannot be empty")
+        def require_binding(present: Any, binding: str, reason: str) -> None:
+            if not present:
+                missing.append(binding)
+                problems.append(f"{reason} requires {binding} to be configured")
 
-        if "rerank" in self.post_stages and not self.models.reranker:
-            missing.append("models.reranker")
-            problems.append("Stage 'rerank' requires models.reranker to be configured")
+        require_binding(self.models.generation, "models.generation", "Generation")
+        require_binding(self.models.reranker or "rerank" not in self.post_stages, "models.reranker", "Stage 'rerank'")
+        require_binding(self.models.intent or self.router.name != "llm", "models.intent", "Router 'llm'")
+        require_binding(
+            self.models.summary or not self.ingestion.summaries.enabled, "models.summary", "Enabled summaries"
+        )
 
         # AC-RAG-62: Tier 0 gate plus reserved zones cannot exceed max_context_tokens
         reserved_sum = (
@@ -177,27 +244,76 @@ class EngineProfile(BaseModel):
                 f"reserved zones exceeds max_context_tokens ({self.context.max_context_tokens})"
             )
 
-        # Check fallback keys
+        ratio_sum = (
+            self.context.history_ratio
+            + self.context.summary_ratio
+            + self.context.local_window_ratio
+            + self.context.retrieved_ratio
+        )
+        if ratio_sum > 1.0 + 1e-9:
+            problems.append(f"Context zone ratios sum to {ratio_sum:.2f}, above 1")
+
         for k in self.fallbacks:
             if k not in VALID_FALLBACK_KEYS:
                 unknown.append(f"fallback:{k}")
                 problems.append(f"Unknown fallback key '{k}' in profile.fallbacks")
 
-        if registry:
-            if not registry.has("analyzer", self.analyzer):
-                unknown.append(f"analyzer:{self.analyzer}")
-                problems.append(f"Unknown analyzer '{self.analyzer}'")
-            if not registry.has("renderer", self.renderer):
-                unknown.append(f"renderer:{self.renderer}")
-                problems.append(f"Unknown renderer '{self.renderer}'")
+        if registry is not None:
+            for category, name in self._component_names():
+                if not registry.has(category, name):
+                    unknown.append(f"{category}:{name}")
+                    problems.append(f"Unknown {category} '{name}'")
 
-        if problems:
+        return ValidationReport(
+            valid=not problems,
+            profile_fingerprint=self.fingerprint(),
+            problems=problems,
+            missing=missing,
+            unknown=unknown,
+        )
+
+    def _component_names(self) -> list[tuple[str, str]]:
+        """Every (registry category, name) this profile refers to."""
+        names = [
+            ("analyzer", self.analyzer),
+            ("renderer", self.renderer),
+            ("router", self.router.name),
+            ("strategy", self.retrieval.default_strategy),
+            ("splitter", self.ingestion.splitter),
+            ("generator", self.generation.strategy),
+            ("formatter", self.citations.formatter),
+        ]
+        names += [("transform", name) for name in self.transforms]
+        names += [("guard", name) for name in self.guards]
+        names += [("post_generation", name) for name in self.post_generation]
+        names += [
+            ("stage", split_component_name(name)[0])
+            for name in self.post_stages
+            if name not in ("hydrate", "guard_enforcement")
+        ]
+        names += [("relaxation", split_component_name(step)[0]) for step in self.retrieval.relaxation]
+        for predicate, strategy in self.retrieval.adaptive_rules or ():
+            names.append(("predicate", predicate))
+            if not strategy.startswith("$") and strategy != "none":
+                names.append(("strategy", strategy))
+        return names
+
+    def validate(self, registry: ComponentRegistry | None = None) -> ValidationReport:
+        """Raise ProfileConfigError listing every configuration problem at once (§12.1)."""
+        report = self.check(registry)
+        if not report.valid:
             raise ProfileConfigError(
-                f"Profile validation failed for '{self.name}': {'; '.join(problems)}",
-                problems=problems,
-                missing=missing,
-                unknown=unknown,
+                f"Profile validation failed for '{self.name}': {'; '.join(report.problems)}",
+                problems=report.problems,
+                missing=report.missing,
+                unknown=report.unknown,
             )
+        return report
+
+
+def _rerank_if_bound(models: ModelBindings) -> list[str]:
+    """The rerank stage needs a bound model; a preset without one simply has no such stage."""
+    return ["rerank"] if models.reranker else []
 
 
 # ── Preset Profiles (§12.2) ────────────────────────────────────────────────────
@@ -217,7 +333,7 @@ def long_form_reader(models: ModelBindings, **overrides: Any) -> EngineProfile:
             local_window_radius_chars=6000,
             always_include_summaries=True,
         ),
-        "post_stages": ["offset_dedup", "top_k"],
+        "post_stages": ["offset_dedup", *_rerank_if_bound(models), "top_k"],
         "context": ContextConfig(max_context_tokens=160_000),
         "generation": GenerationConfig(grounding_mode="strict", stream_mode="native"),
         "guards": ["sequential_boundary"],
@@ -241,7 +357,7 @@ def news_intelligence(models: ModelBindings, **overrides: Any) -> EngineProfile:
             always_include_summaries=False,
             min_similarity=0.60,
         ),
-        "post_stages": ["identity_dedup", "rerank", "recency", "top_k"],
+        "post_stages": ["identity_dedup(url)", *_rerank_if_bound(models), "recency", "top_k"],
         "context": ContextConfig(max_context_tokens=32_000),
         "generation": GenerationConfig(grounding_mode="labelled_fallback", stream_mode="buffered"),
         "ingestion": IngestionConfig(
@@ -252,13 +368,13 @@ def news_intelligence(models: ModelBindings, **overrides: Any) -> EngineProfile:
         "variants": {
             "news_chat": {
                 "retrieval": {"top_k": 12, "min_similarity": 0.60, "retrieve_max_results": 100},
-                "post_stages": ["identity_dedup", "rerank", "recency", "top_k"],
+                "post_stages": ["identity_dedup(url)", *_rerank_if_bound(models), "recency", "top_k"],
                 "hydration_projection": "context",
             },
             "news_search": {
                 "router": {"name": "none"},
                 "retrieval": {"top_k": 2000, "min_similarity": 0.68, "retrieve_max_results": 2000},
-                "post_stages": ["identity_dedup", "recency", "top_k"],
+                "post_stages": ["identity_dedup(url)", "recency", "top_k"],
                 "hydration_projection": "card",
             },
         },
@@ -285,15 +401,17 @@ def knowledge_base(models: ModelBindings, **overrides: Any) -> EngineProfile:
         "name": "knowledge_base",
         "models": models,
         "retrieval": RetrievalConfig(
-            default_strategy="dense_vector",
+            default_strategy="adaptive",
             top_k=10,
             full_context_max_tokens=100_000,
             local_window_radius_chars=0,
             always_include_summaries=False,
+            enable_keyword_first=True,
         ),
-        "post_stages": ["identity_dedup", "top_k"],
+        "post_stages": ["identity_dedup", *_rerank_if_bound(models), "score_fusion(confidence)", "top_k"],
         "context": ContextConfig(max_context_tokens=160_000),
-        "generation": GenerationConfig(grounding_mode="strict"),
+        "generation": GenerationConfig(grounding_mode="strict", stream_mode="native"),
+        "citations": CitationConfig(verify_quotes=True),
         "observer_errors": "raise",
         "fallbacks": {
             "rerank": "raise",

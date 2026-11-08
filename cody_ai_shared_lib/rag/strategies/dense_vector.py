@@ -1,13 +1,13 @@
-"""Tier 1 DenseVectorStrategy (§8.4).
-
-Embeds query using gateway embedder and performs exact or ANN cosine vector search.
-"""
+"""Tier 1 DenseVectorStrategy (§8.4)."""
 from __future__ import annotations
 
 from typing import ClassVar, Generic
+
 from ..errors import StoreCapabilityError
 from ..models import MetaT, RAGNode
+from ..vectors import is_zero_vector
 from .context import RetrievalContext, RetrievalStrategy
+from .shared import embed_query, keyword_fallback, with_local_window
 
 
 class DenseVectorStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
@@ -16,29 +16,13 @@ class DenseVectorStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
     requires: ClassVar[frozenset[str]] = frozenset(["supports_vector_search"])
 
     def retrieve(self, ctx: RetrievalContext[MetaT]) -> list[RAGNode[MetaT]]:
-        caps = ctx.store.capabilities() if callable(ctx.store.capabilities) else ctx.store.capabilities
-        if not caps.supports_vector_search:
-            raise StoreCapabilityError(
-                "DenseVectorStrategy requires store capability 'supports_vector_search'"
-            )
+        if not self.is_runnable(ctx.store.capabilities()):
+            raise StoreCapabilityError("DenseVectorStrategy requires store capability 'supports_vector_search'")
 
-        query_text = ctx.intent.search_query or ctx.request.query
-        emb_res = ctx.gateway.embed(
-            texts=query_text,
-            model=ctx.profile.models.embedding,
-            stage="retrieval_embedding",
-            usage_tracker=ctx.usage_tracker,
-            task_type="RETRIEVAL_QUERY",
-        )
+        top_k = ctx.target_limit() + 1
+        query_vector = embed_query(ctx)
+        if is_zero_vector(query_vector):
+            return keyword_fallback(ctx, top_k)
 
-        target_limit = (
-            ctx.request.top_k_override
-            or ctx.intent.suggested_top_k
-            or ctx.profile.retrieval.retrieve_max_results
-            or ctx.profile.retrieval.top_k
-        )
-        return ctx.store.vector_search(
-            query_vector=emb_res.vectors[0],
-            top_k=target_limit + 1,
-            filters=ctx.filters,
-        )
+        results = ctx.store.vector_search(query_vector=query_vector, top_k=top_k, filters=ctx.filters)
+        return with_local_window(ctx, results)

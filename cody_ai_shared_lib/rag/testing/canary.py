@@ -5,8 +5,8 @@ in retrieved nodes, assembled prompt, streaming deltas, answer text, citations, 
 """
 from __future__ import annotations
 
-from typing import Any, Sequence
-from ..models import RAGCitation, RAGNode, RAGResponse, RAGStreamEvent
+from typing import Sequence
+from ..models import RAGNode, RAGResponse, RAGStreamEvent
 
 
 def assert_no_text_past_boundary(

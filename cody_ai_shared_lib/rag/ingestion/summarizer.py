@@ -1,4 +1,4 @@
-"""Section summarizer and summary unit generator for RAG ingestion.
+"""Section summarizer and summary unit generator for RAG ingestion (§6.3).
 
 Implements:
   - Parent section summaries (level=1, parent_kind="section") (RAG-ING-3)
@@ -13,14 +13,14 @@ import logging
 from typing import Generic, Literal
 from pydantic import BaseModel
 
-from .degradation import DegradationTracker
-from .errors import RAGStageError
-from .gateway import ModelGateway
-from .models import DefaultNodeMeta, MetaT, RAGNode, RAGNodeSpan
-from .text.analyzer import CjkAwareAnalyzer, TextAnalyzer
-from .usage import UsageTracker
+from ..degradation import DegradationTracker
+from ..errors import RAGStageError
+from ..gateway import FINISH_SKIPPED, ModelGateway
+from ..models import DefaultNodeMeta, MetaT, RAGNode, SourceSpan
+from ..text.analyzer import CjkAwareAnalyzer, TextAnalyzer
+from ..usage import BudgetGuard, UsageTracker
 
-logger = logging.getLogger("shared-rag.ingestion")
+logger = logging.getLogger("shared-rag")
 
 
 class SummarizerResult(BaseModel, Generic[MetaT]):
@@ -63,6 +63,7 @@ class SectionSummarizer(Generic[MetaT]):
         usage_tracker: UsageTracker,
         degradation_tracker: DegradationTracker,
         stage: str = "summarizer",
+        budget_guard: BudgetGuard | None = None,
     ) -> SummarizerResult[MetaT]:
         """Summarize a section, generating section summary and summary units."""
         # 1. Check existing summary (usable even if LLM summarizer is disabled)
@@ -75,7 +76,7 @@ class SectionSummarizer(Generic[MetaT]):
                 parent_id=section_id or doc_id,
                 level=1,
                 text=existing_summary,
-                span=RAGNodeSpan(
+                span=SourceSpan(
                     doc_id=doc_id,
                     section_id=section_id,
                     section_seq=section_seq,
@@ -98,7 +99,6 @@ class SectionSummarizer(Generic[MetaT]):
         if not self.summary_models:
             return SummarizerResult(summary_status="skipped")
 
-        # 2. Generate section summary
         section_summary_node: RAGNode[MetaT] | None = None
         status: Literal["generated", "provided", "skipped", "failed"] = "skipped"
 
@@ -115,7 +115,10 @@ class SectionSummarizer(Generic[MetaT]):
                 stage=stage,
                 usage_tracker=usage_tracker,
                 degradation_tracker=degradation_tracker,
+                budget_guard=budget_guard,
             )
+            if res.finish_reason == FINISH_SKIPPED:
+                return SummarizerResult(summary_status="skipped")
             section_summary_node = RAGNode[MetaT](
                 node_id=f"{doc_id}#s{section_seq}_sum",
                 is_summary=True,
@@ -124,7 +127,7 @@ class SectionSummarizer(Generic[MetaT]):
                 parent_id=section_id or doc_id,
                 level=1,
                 text=res.text.strip(),
-                span=RAGNodeSpan(
+                span=SourceSpan(
                     doc_id=doc_id,
                     section_id=section_id,
                     section_seq=section_seq,
@@ -166,19 +169,19 @@ class SectionSummarizer(Generic[MetaT]):
                         stage=f"{stage}_unit",
                         usage_tracker=usage_tracker,
                         degradation_tracker=degradation_tracker,
+                        budget_guard=budget_guard,
                     )
+                    if u_res.finish_reason == FINISH_SKIPPED:
+                        continue
                     unit_node = RAGNode[MetaT](
                         node_id=f"{doc_id}#s{section_seq}_u{u_idx}_sum",
-                        doc_id=doc_id,
-                        section_id=section_id,
-                        section_seq=section_seq,
                         is_summary=True,
                         granularity="parent_summary",
                         parent_kind="section_unit",
                         parent_id=section_id or doc_id,
                         level=0,
                         text=u_res.text.strip(),
-                        span=RAGNodeSpan(
+                        span=SourceSpan(
                             doc_id=doc_id,
                             section_id=section_id,
                             section_seq=section_seq,
@@ -218,7 +221,6 @@ class SectionSummarizer(Generic[MetaT]):
             return [(0, len(text))]
 
         units: list[tuple[int, int]] = []
-        curr_start = sents[0][0]
         curr_sent_idx = 0
         n_sents = len(sents)
 

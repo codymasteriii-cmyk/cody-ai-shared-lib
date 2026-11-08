@@ -25,6 +25,7 @@ from google import genai
 from google.genai import types
 
 from .pricing import PRICE_TABLE_VERSION, compute_cost
+from .tokens import estimate_tokens
 
 logger = logging.getLogger("service-embedding")
 
@@ -235,8 +236,6 @@ def generate_embedding_with_usage(
     is_batch = isinstance(text, list)
     input_list = text if is_batch else [text]
 
-    from .rag.text.analyzer import estimate_tokens
-
     est_tokens = sum(estimate_tokens(t) for t in input_list if t and t.strip())
     vectors = generate_embedding(text, task_type=task_type)
     cost_usd = compute_cost(EMBEDDING_MODEL, input_tokens=est_tokens)
@@ -250,4 +249,3 @@ def generate_embedding_with_usage(
             estimated=True,
         ),
     )
-

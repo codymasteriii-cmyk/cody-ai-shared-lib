@@ -235,6 +235,7 @@ def test_engine_profile_presets_valid():
     """AC-RAG-49: Built-in presets are valid against default registry."""
     registry = create_default_registry()
     models = ModelBindings(
+        summary=["gemini-3.5-flash-lite"],
         generation=["gemini-3.8-flash", "gpt-6.1-sol"],
         intent=["gemini-3.5-flash-lite"],
         embedding="gemini-embedding-2",
@@ -262,7 +263,7 @@ def test_engine_profile_validation_empty_generation():
 
 def test_engine_profile_validation_tier0_overflow():
     """AC-RAG-62: Rejects full_context_max_tokens + reserved zones > max_context_tokens."""
-    models = ModelBindings(generation=["gemini-3.8-flash"])
+    models = ModelBindings(summary=["gemini-3.5-flash-lite"], generation=["gemini-3.8-flash"], embedding="gemini-embedding-2")
     profile = long_form_reader(
         models,
         retrieval=RetrievalConfig(full_context_max_tokens=155_000),
@@ -275,7 +276,7 @@ def test_engine_profile_validation_tier0_overflow():
 
 def test_engine_profile_validation_unknown_fallback():
     """AC-RAG-49: Rejects unknown fallback keys."""
-    models = ModelBindings(generation=["gemini-3.8-flash"])
+    models = ModelBindings(summary=["gemini-3.5-flash-lite"], generation=["gemini-3.8-flash"], embedding="gemini-embedding-2")
     profile = long_form_reader(models, fallbacks={"invalid_stage": "raise"})
     with pytest.raises(ProfileConfigError) as exc_info:
         profile.validate()
@@ -284,7 +285,7 @@ def test_engine_profile_validation_unknown_fallback():
 
 def test_engine_profile_fingerprint():
     """AC-RAG-49: SHA-256 fingerprint is deterministic and sensitive to configuration changes."""
-    models = ModelBindings(generation=["gemini-3.8-flash"])
+    models = ModelBindings(summary=["gemini-3.5-flash-lite"], generation=["gemini-3.8-flash"], embedding="gemini-embedding-2")
     p1 = long_form_reader(models)
     p2 = long_form_reader(models)
     assert p1.fingerprint() == p2.fingerprint()
@@ -337,7 +338,7 @@ def test_observer_dispatcher_dg13_fault_tolerance():
     dispatcher = ObserverDispatcher(observers=[broken_observer], observer_errors="log")
 
     # Should not raise
-    dispatcher.notify_stage(StageRecord(stage="retrieval", latency_ms=12.5))
+    dispatcher.notify_stage(StageRecord(name="retrieval", duration_ms=12.5))
     assert broken_observer.on_stage.call_count == 1
 
 
@@ -349,7 +350,7 @@ def test_observer_dispatcher_raises_when_configured():
     dispatcher = ObserverDispatcher(observers=[broken_observer], observer_errors="raise")
 
     with pytest.raises(RuntimeError):
-        dispatcher.notify_stage(StageRecord(stage="retrieval"))
+        dispatcher.notify_stage(StageRecord(name="retrieval"))
 
 
 # ── UsageTracker Aggregation ───────────────────────────────────────────────────

@@ -1,49 +1,52 @@
-"""RAGEngine public facade (§14, Phase P1).
+"""RAGEngine public facade (§2.2, §14).
 
-Coordinates query understanding, retrieval tiers, guards, context assembly,
-grounded generation, post-generation citation verification, sanitization,
-spend accounting, and observable tracing.
+Wires the components from the profile and registry, and exposes query, stream, retrieval,
+ingestion and lifecycle calls. The work itself lives in the modules it delegates to.
 """
 from __future__ import annotations
 
-import hashlib
-import time
+import logging
+import os
+import threading
 import uuid
-from typing import Any, Callable, Generic
+from typing import Any, Callable, Generic, Iterator
 
-from .context.assembler import ContextAssembler
+from ..embedding import EMBEDDING_MODEL
+from ..pricing import get_model_pricing
+from .answering import AnswerFinalizer
+from .cache import Cache, InMemoryLRUCache
+from .context.assembler import AssembledPrompt, ContextAssembler
 from .context.conversation import ConversationManager
 from .context.fence import ContextFencer
 from .degradation import DegradationTracker
-from .embedder import BatchEmbedder
 from .errors import (
-    EmbeddingSignatureMismatch,
     GenerationError,
-    MissingRequiredScopeError,
     ProfileConfigError,
+    RAGEngineError,
     StoreCapabilityError,
 )
-from ..pricing import compute_cost
 from .gateway import ModelGateway
 from .generation.flag_buffer import FlagStreamBuffer
-from .generation.stuff import StuffStrategy
-from .guards import ScopeGuard, SequentialBoundaryGuard, TemporalGuard, TenantGuard
-from .intent.heuristic import HeuristicRouter
-from .intent.jev_gate import JevGateRouter
-from .intent.llm_rewriter import LLMIntentRouter, clamp_intent
-from .intent.router import AutoRouter, HeuristicIntentRouter, IntentRouter, PassthroughRouter, RouterContext
+from .generation.stuff import GenerationContext, GenerationStrategy
+from .ingestion import BatchEmbedder, DocumentSynchronizer, SectionSummarizer
+from .ingestion.nodes import (
+    build_section_nodes,
+    embedding_signature,
+    finalize_node,
+    fts_signature,
+    prepare_summaries,
+)
+from .intent.llm_rewriter import clamp_intent
+from .intent.router import IntentRouter, RouterContext
 from .intent.temporal import TemporalExtractor
 from .models import (
-    CitationCoverage,
-    ConversationState,
     IngestionProgress,
     MetaT,
-    NodeRef,
     PreparedNode,
     QueryIntent,
     QueryPlan,
+    RAGCitation,
     RAGDocumentInput,
-    RAGFilterSpec,
     RAGNode,
     RAGQueryRequest,
     RAGResponse,
@@ -51,36 +54,22 @@ from .models import (
     RAGSectionInput,
     RAGStreamEvent,
     ReindexStatus,
-    SourceSpan,
-    StageUsage,
     UsageTotal,
 )
 from .ports import Fingerprint, Guard, NodeRenderer, RAGStore
 from .postgen.citations import CitationExtractor
 from .postgen.quotes import QuoteVerifier
 from .postgen.sanitizer import OutputSanitizer
-from .summarizer import SectionSummarizer
-from .text.analyzer import CjkAwareAnalyzer, estimate_tokens
-from .text.splitter import PassThroughSplitter, SentenceSplitter
-from .postretrieval.boosters import RecencyBooster, ScoreFusionStage
-from .postretrieval.dedup import IdentityDeduplicator, OffsetDeduplicator
-from .postretrieval.rerank import JinaCrossEncoderReranker
-from .postretrieval.threshold import ThresholdFilter
-from .profile import EngineProfile
-from .registry import ComponentRegistry, create_default_registry
-from .render import DefaultRenderer
-from .runtime import Clock, Deadline, Rng, SystemClock, SystemRng
+from .profile import EngineProfile, ValidationReport
+from .registry import ComponentDeps, ComponentRegistry, create_default_registry
+from .retrieval_pipeline import RetrievalPipeline, apply_guards
+from .runtime import Clock, Deadline, RequestRun, Rng, SystemClock, SystemRng, make_bounded_pool
 from .strategies.adaptive import AdaptiveStrategy
-from .strategies.context import QueryVariant, RetrievalContext, RetrievalStrategy
-from .strategies.dense_vector import DenseVectorStrategy
-from .strategies.full_context import FullContextStrategy
-from .strategies.hierarchical import HierarchicalStrategy
-from .strategies.hybrid_rrf import HybridRRFStrategy
-from .strategies.keyword import KeywordFirstStrategy, KeywordOnlyStrategy
-from .strategies.transforms import SecondaryQueryFanOut, fair_interleave
-from .trace import ObserverDispatcher, RAGObserver, RAGTrace, StageRecord
-from .usage import BudgetGuard, CallContext, UsageTracker
-from typing import Iterator
+from .trace import ObserverDispatcher, RAGObserver, TraceCollector
+from .usage import BudgetGuard, UsageTracker
+from .vectors import is_zero_vector
+
+logger = logging.getLogger("shared-rag")
 
 
 class RAGStream(Generic[MetaT]):
@@ -98,12 +87,11 @@ class RAGStream(Generic[MetaT]):
 
     def close(self) -> None:
         """Close the stream, stopping generation and recording cancelled usage if needed."""
-        if hasattr(self._gen, "close"):
-            self._gen.close()
+        self._gen.close()
 
     @property
     def usage_total(self) -> UsageTotal:
-        """Report total spend and tokens, readable at any time and after close (AC-RAG-70, RAG-OPS-2)."""
+        """Total spend and tokens, readable at any time and after close (AC-RAG-70, RAG-OPS-2)."""
         return self._usage_tracker.total()
 
 
@@ -122,6 +110,9 @@ class RAGEngine(Generic[MetaT]):
         budget_guard: BudgetGuard | None = None,
         renderer: NodeRenderer[MetaT] | None = None,
         guards: list[Guard] | None = None,
+        cache: Cache | None = None,
+        pool: Any = None,
+        router: IntentRouter | None = None,
     ):
         self.profile = profile
         self.store = store
@@ -130,1014 +121,586 @@ class RAGEngine(Generic[MetaT]):
         self.rng = rng or SystemRng()
         self.registry = registry or create_default_registry()
         self.budget_guard = budget_guard
-        self.renderer = renderer or DefaultRenderer()
-        self.dispatcher = ObserverDispatcher(
-            observers=observers,
-            observer_errors=profile.observer_errors,
+        self._observers = list(observers or [])
+        self._explicit_guards = list(guards or [])
+        self._explicit_router = router
+        self._variant_engines: dict[str, "RAGEngine[MetaT]"] = {}
+        self._variant_lock = threading.Lock()
+        self.dispatcher = ObserverDispatcher(observers=self._observers, observer_errors=profile.observer_errors)
+
+        self._raise_on_startup_problems()
+
+        self.cache: Cache | None = cache
+        if self.cache is None and profile.cache.enabled:
+            self.cache = InMemoryLRUCache(max_bytes=profile.cache.max_bytes)
+        self._pool = pool or make_bounded_pool(profile.runtime.pool_size)
+
+        self.renderer = renderer or self.registry.get("renderer", profile.renderer)()
+        self.analyzer = self.registry.get("analyzer", profile.analyzer)()
+        self.splitter = self.registry.get("splitter", profile.ingestion.splitter)(
+            target_size=profile.ingestion.target_size,
+            overlap=profile.ingestion.overlap,
+            analyzer=self.analyzer,
         )
-
-        # 1. Startup validation (AC-RAG-49, AC-RAG-62)
-        self.profile.validate(self.registry)
-
-        # 2. Wire components
         self.temporal_extractor = TemporalExtractor(clock=self.clock)
-        self.fencer = ContextFencer(rng=self.rng)
-        self.assembler = ContextAssembler(
-            profile=self.profile,
-            renderer=self.renderer,
-            fencer=self.fencer,
-        )
-        self.conversation_manager = ConversationManager()
-        self.generator = StuffStrategy(gateway=self.gateway, profile=self.profile)
-        self.citation_extractor = CitationExtractor()
-        self.quote_verifier = QuoteVerifier()
-        self.sanitizer = OutputSanitizer()
-
-        # Guards
-        self.guards = list(guards or [])
-        if not self.guards:
-            self._init_builtin_guards()
-
-        # Text analyzer & splitter
-        analyzer_cls = self.registry.get("analyzer", self.profile.analyzer) or CjkAwareAnalyzer
-        self.analyzer = analyzer_cls() if callable(analyzer_cls) else analyzer_cls
-
-        splitter_cls = self.registry.get("splitter", self.profile.ingestion.splitter) or SentenceSplitter
-        if callable(splitter_cls):
-            try:
-                self.splitter = splitter_cls(
-                    target_size=self.profile.ingestion.target_size,
-                    overlap=self.profile.ingestion.overlap,
-                    analyzer=self.analyzer,
-                )
-            except TypeError:
-                self.splitter = splitter_cls()
-        else:
-            self.splitter = splitter_cls
-
-        self.embedder = BatchEmbedder(
+        self._deps = ComponentDeps(
+            profile=profile,
             gateway=self.gateway,
-            model=self.profile.models.embedding,
             renderer=self.renderer,
+            analyzer=self.analyzer,
+            clock=self.clock,
+            temporal_extractor=self.temporal_extractor,
+            registry=self.registry,
         )
 
+        self.formatter = self.registry.get("formatter", profile.citations.formatter)(self.renderer)
+        self.fencer = ContextFencer(rng=self.rng)
+        self.assembler = ContextAssembler(profile, self.renderer, self.fencer, self.formatter)
+        self.conversation_manager = ConversationManager(
+            max_reused_turns=profile.context.reused_turns,
+            max_reused_nodes=profile.context.max_reused_nodes,
+            max_state_bytes=profile.context.state_max_bytes,
+            rolling_summary_max_tokens=profile.context.rolling_summary_max_tokens,
+        )
+        self.generator: GenerationStrategy = self.registry.get("generator", profile.generation.strategy)(self._deps)
+        self.citation_extractor = CitationExtractor(profile.citations.on_unverified, self.formatter)
+        self.quote_verifier = QuoteVerifier(analyzer=self.analyzer)
+        self.sanitizer = OutputSanitizer(allowed_link_hosts=profile.allowed_link_hosts)
+        self.finalizer = AnswerFinalizer(
+            profile,
+            store,
+            self.analyzer,
+            self.citation_extractor,
+            self.quote_verifier,
+            self.sanitizer,
+            self.conversation_manager,
+        )
+        self.embedder = BatchEmbedder(gateway=self.gateway, model=profile.models.embedding, renderer=self.renderer)
         self.summarizer = SectionSummarizer(
             gateway=self.gateway,
-            summary_models=self.profile.models.summary,
-            enabled=self.profile.ingestion.summaries.enabled,
-            min_chars_for_summary=self.profile.ingestion.summaries.min_chars_for_summary,
-            summary_unit_chars=self.profile.ingestion.summaries.summary_unit_chars,
+            summary_models=profile.models.summary,
+            enabled=profile.ingestion.summaries.enabled,
+            min_chars_for_summary=profile.ingestion.summaries.min_chars_for_summary,
+            summary_unit_chars=profile.ingestion.summaries.summary_unit_chars,
             analyzer=self.analyzer,
-            fallback_action=self.profile.fallbacks.get("summarizer", "raise"),
+            fallback_action=profile.fallbacks.get("summarizer", "raise"),
         )
+        self.synchronizer = DocumentSynchronizer(
+            store=store,
+            splitter=self.splitter,
+            analyzer=self.analyzer,
+            renderer=self.renderer,
+            embedder=self.embedder,
+            summarizer=self.summarizer,
+            embedding_model=profile.models.embedding,
+            budget_guard=budget_guard,
+        )
+        self.pipeline: RetrievalPipeline[MetaT] = RetrievalPipeline(
+            self._deps, store, self._pool, self.cache, budget_guard, self._explicit_guards
+        )
+        self.router: IntentRouter = router or self.registry.get("router", profile.router.name)(self._deps)
 
-        # Router setup
-        self._init_router()
+    # ── Validation ────────────────────────────────────────────────────────
 
-    def _init_builtin_guards(self) -> None:
-        """Instantiate guards configured in profile."""
-        for g_name in self.profile.guards:
-            if g_name == "sequential_boundary":
-                self.guards.append(SequentialBoundaryGuard())
-            elif g_name == "temporal":
-                self.guards.append(TemporalGuard())
-            elif g_name == "tenant":
-                self.guards.append(TenantGuard())
-            elif g_name == "scope":
-                self.guards.append(ScopeGuard())
+    def _engine_problems(self) -> tuple[list[str], list[str], list[str]]:
+        """Return (problems, missing, capability_gaps) knowable before the first request (§13.3)."""
+        problems: list[str] = []
+        missing: list[str] = []
+        gaps: list[str] = []
+        profile = self.profile
 
-    def _init_router(self) -> None:
-        """Instantiate router based on profile configuration."""
-        r_name = self.profile.router.name
-        heuristic = HeuristicRouter()
-
-        if r_name == "none":
-            self.router: IntentRouter = PassthroughRouter()
-        elif r_name == "heuristic":
-            self.router = HeuristicIntentRouter(heuristic=heuristic)
-        else:
-            # Auto / Hybrid
-            jev_gate = None
-            if self.profile.router.enable_jev:
-                jev_gate = JevGateRouter(
-                    gateway=self.gateway,
-                    timeout=self.profile.router.jev_timeout,
-                )
-
-            intent_models = self.profile.models.intent
-            llm_router = None
-            if intent_models:
-                llm_router = LLMIntentRouter(
-                    gateway=self.gateway,
-                    models=intent_models,
-                    temporal_extractor=self.temporal_extractor if self.profile.router.enable_temporal_extraction else None,
-                )
-
-            self.router = AutoRouter(
-                gateway=self.gateway,
-                heuristic=heuristic,
-                jev_gate=jev_gate,
-                llm_router=llm_router,
-                temporal_extractor=self.temporal_extractor,
+        space = self.store.embedding_space()
+        if space.model != profile.models.embedding:
+            problems.append(
+                f"Store embedding space model '{space.model}' does not match "
+                f"profile embedding model '{profile.models.embedding}'"
             )
 
-    # ── Public API ─────────────────────────────────────────────────────────────
+        real_gateway = isinstance(self.gateway, ModelGateway)
+        if real_gateway and self.gateway.embedding_client is None and profile.models.embedding != EMBEDDING_MODEL:
+            problems.append(
+                f"models.embedding '{profile.models.embedding}' is not the model the lib embeds with ('{EMBEDDING_MODEL}')"
+            )
+
+        caps = self.store.capabilities()
+        strategy_cls = self.registry.get("strategy", profile.retrieval.default_strategy)
+        if strategy_cls is not None and not strategy_cls.is_runnable(caps):
+            gaps.append(f"Strategy '{strategy_cls.name}' needs store capabilities {sorted(strategy_cls.requires)}")
+
+        if "rerank" in profile.post_stages and profile.models.reranker and real_gateway:
+            if self.gateway.rerank_client is None and not os.environ.get("JINA_API_KEY"):
+                missing.append("JINA_API_KEY")
+                problems.append("Rerank stage is enabled but JINA_API_KEY is not set")
+        if profile.router.enable_jev and not (os.getenv("TYPESAFE_API_KEY") or os.getenv("VERCEL_API_KEY")):
+            missing.append("TYPESAFE_API_KEY")
+            problems.append("Router configured with enable_jev=True without TYPESAFE_API_KEY")
+        if profile.generation.stream_mode == "native" and real_gateway and not hasattr(self.gateway.llm_client, "stream"):
+            problems.append("stream_mode='native' but the LLM client cannot stream")
+
+        if self.budget_guard is not None and getattr(self.budget_guard, "enforces_cost", False):
+            bindings = [
+                *profile.models.generation,
+                *(profile.models.intent or []),
+                *(profile.models.summary or []),
+                profile.models.embedding,
+                *([profile.models.reranker] if profile.models.reranker else []),
+            ]
+            for model in bindings:
+                if get_model_pricing(model) is None:
+                    problems.append(f"BudgetGuard enforces_cost=True but model '{model}' has no price")
+        return problems, missing, gaps
+
+    def validate(self) -> ValidationReport:
+        """Report every configuration problem without raising (§13.3)."""
+        report = self.profile.check(self.registry)
+        problems, missing, gaps = self._engine_problems()
+        all_problems = [*report.problems, *problems, *gaps]
+        return ValidationReport(
+            valid=not all_problems,
+            profile_fingerprint=self.profile.fingerprint(),
+            problems=all_problems,
+            missing=[*report.missing, *missing],
+            unknown=report.unknown,
+        )
+
+    def _raise_on_startup_problems(self) -> None:
+        report = self.profile.check(self.registry)
+        problems, missing, gaps = self._engine_problems()
+        if report.problems or problems:
+            all_problems = [*report.problems, *problems, *gaps]
+            raise ProfileConfigError(
+                f"Engine validation failed: {'; '.join(all_problems)}",
+                problems=all_problems,
+                missing=[*report.missing, *missing],
+                unknown=report.unknown,
+            )
+        if gaps:
+            raise StoreCapabilityError(f"Engine validation failed: {'; '.join(gaps)}", stage="startup")
+
+    def with_profile(self, profile: EngineProfile) -> "RAGEngine[MetaT]":
+        """Return an engine for another profile that shares this engine's store, gateway and pool."""
+        return RAGEngine[MetaT](
+            profile=profile,
+            store=self.store,
+            gateway=self.gateway,
+            clock=self.clock,
+            rng=self.rng,
+            registry=self.registry,
+            observers=self._observers,
+            budget_guard=self.budget_guard,
+            renderer=self.renderer,
+            guards=self._explicit_guards or None,
+            cache=self.cache,
+            pool=self._pool,
+            router=self._explicit_router,
+        )
+
+    def _variant_engine(self, name: str) -> "RAGEngine[MetaT]":
+        """Return the engine for a named profile variant (§12.1)."""
+        if name not in self.profile.variants:
+            raise ProfileConfigError(f"Unknown profile variant '{name}'", unknown=[f"variant:{name}"])
+        with self._variant_lock:
+            if name not in self._variant_engines:
+                self._variant_engines[name] = self.with_profile(self.profile.variant(name))
+            return self._variant_engines[name]
+
+    # ── Per-request plumbing ──────────────────────────────────────────────
+
+    def _begin(self, request: RAGQueryRequest) -> RequestRun:
+        request_id = request.request_id or f"req-{uuid.uuid4().hex[:12]}"
+        filters = request.filters
+        degradations = DegradationTracker(fallbacks=self.profile.fallbacks)
+        dispatcher = self.dispatcher.for_request(degradations)
+        degradations.on_record = dispatcher.notify_degrade
+        usage = UsageTracker(
+            request_id=request_id,
+            tenant_or_user_id=request.tenant_id or filters.tenant_or_user_id,
+            doc_ids=filters.doc_ids,
+            profile_name=self.profile.name,
+            variant=request.variant,
+            on_record=dispatcher.notify_usage,
+        )
+        return RequestRun(
+            request_id=request_id,
+            usage=usage,
+            degradations=degradations,
+            deadline=Deadline(self.profile.runtime.deadline_seconds, clock=self.clock),
+            trace=TraceCollector(
+                request_id,
+                self.profile,
+                self.clock,
+                dispatcher,
+                request.trace_level or self.profile.trace_level,
+                request.variant,
+            ),
+        )
+
+    @staticmethod
+    def _attach_failure_context(
+        exc: Exception,
+        run: RequestRun,
+        retrieval: RAGRetrievalResult[MetaT] | None = None,
+    ) -> None:
+        """Give a typed error what the request had spent and found before it failed (RAG-OPS-1, §10.7)."""
+        if not isinstance(exc, RAGEngineError):
+            return
+        exc.request_id = exc.request_id or run.request_id
+        exc.degradations = run.degradations.degradations
+        exc.usage = run.usage.stage_usages
+        exc.usage_total = run.usage.total()
+        if isinstance(exc, GenerationError) and exc.retrieval is None:
+            exc.retrieval = retrieval
+
+    def _fail(self, exc: Exception, run: RequestRun, retrieval: RAGRetrievalResult[MetaT] | None = None) -> None:
+        self._attach_failure_context(exc, run, retrieval)
+        logger.error(f"[RAG] id={run.request_id} error={type(exc).__name__} stage={getattr(exc, 'stage', None)}")
+
+    def _select_router(self, request: RAGQueryRequest) -> IntentRouter:
+        """Selection order: request override, then the engine's router (§7.2)."""
+        name = request.router_override
+        if name is None:
+            return self.router
+        factory = self.registry.get("router", name)
+        if factory is None:
+            raise ProfileConfigError(f"Unknown router '{name}'", unknown=[f"router:{name}"])
+        return factory(self._deps)
+
+    def _resolve_intent(self, request: RAGQueryRequest, intent: QueryIntent | None, run: RequestRun) -> QueryIntent:
+        if intent is not None:
+            return clamp_intent(intent.model_dump(), run.degradations)
+        started = run.trace.elapsed_ms()
+        router = self._select_router(request)
+        context = RouterContext(
+            usage_tracker=run.usage,
+            degradation_tracker=run.degradations,
+            profile=self.profile,
+            budget_guard=self.budget_guard,
+            deadline=run.deadline,
+        )
+        resolved = router.route(request, request.state, context)
+        run.trace.record_stage(router.name, "router", started, version=router.version)
+        run.trace.router_decision = {
+            "source": resolved.router_source,
+            "route": resolved.route,
+            "scope": resolved.scope,
+        }
+        return resolved
+
+    def _prepare_generation(
+        self,
+        request: RAGQueryRequest,
+        intent: QueryIntent,
+        run: RequestRun,
+    ) -> tuple[AssembledPrompt[MetaT], RAGRetrievalResult[MetaT], list[Guard], str]:
+        """Retrieve and assemble, or build the conversational prompt on the no-retrieval route."""
+        state_fence = request.state.fence_id if request.state else None
+        if intent.route == "no_retrieval":
+            _, guards, _ = self.pipeline.scoped_filters(request, intent)
+            retrieval = RAGRetrievalResult[MetaT](
+                intent=intent,
+                strategy_used="none",
+                tier_decision_reason="no_retrieval route selected",
+            )
+            prompt = self.assembler.assemble_conversational(request, state_fence, guards)
+            return prompt, retrieval, guards, "generation_no_retrieval"
+
+        retrieval, guards = self.pipeline.run(request, intent, "query", run)
+        return self.assembler.assemble_prompt(request, retrieval.nodes, state_fence, guards), retrieval, guards, "generation"
+
+    def _generation_context(self, request: RAGQueryRequest, run: RequestRun, stage: str) -> GenerationContext:
+        return GenerationContext(
+            usage_tracker=run.usage,
+            degradation_tracker=run.degradations,
+            budget_guard=self.budget_guard,
+            request_id=run.request_id,
+            tenant_or_user_id=request.tenant_id,
+            stage=stage,
+        )
+
+    # ── Public API ────────────────────────────────────────────────────────
 
     def route(self, request: RAGQueryRequest) -> QueryIntent:
         """Public routing entry point (§7.2, AC-RAG-16)."""
-        tracker = UsageTracker(request_id=request.query)
-        degradations = DegradationTracker(fallbacks=self.profile.fallbacks)
-        ctx = RouterContext(
-            usage_tracker=tracker,
-            degradation_tracker=degradations,
-            profile=self.profile,
-        )
-        return self.router.route(request, request.conversation, ctx)
+        return self._resolve_intent(request, None, self._begin(request))
 
     def plan(self, request: RAGQueryRequest, intent: QueryIntent | None = None) -> QueryPlan:
-        """Evaluates adaptive strategy rules without retrieval or generation (§8.12, AC-RAG-48, AC-RAG-58)."""
-        resolved_intent = intent or QueryIntent(
-            route="rag",
-            scope="local_lookup",
-            search_query=request.query,
-            router_source="passthrough",
-        )
-        effective_filters = self._build_effective_filters(request)
-        for g in self.guards + list(request.guards):
-            patch = g.to_filter()
-            if patch is not None:
-                effective_filters = effective_filters.patch(patch)
+        """Evaluate the adaptive rules without retrieval or generation (§8.12, AC-RAG-48, AC-RAG-58)."""
+        resolved = intent or QueryIntent(search_query=request.question, router_source="passthrough")
+        filters, _, _ = self.pipeline.scoped_filters(request, resolved)
+        return AdaptiveStrategy.decide_tier(request, resolved, filters, self.store, self.profile, self.registry)
 
-        stats = self.store.scope_stats(effective_filters)
-        max_t0 = self.profile.retrieval.full_context_max_tokens
-        caps = self.store.capabilities() if callable(self.store.capabilities) else self.store.capabilities
-
-        # Rule evaluation matching §8.9 Adaptive Rules
-        if (
-            max_t0 > 0
-            and stats.total_tokens > 0
-            and stats.total_tokens <= max_t0
-            and caps.supports_full_scope_fetch
-        ):
-            return QueryPlan(
-                strategy="full_context",
-                tier_decision_reason=f"full_context: {stats.total_tokens} <= {max_t0} tokens",
-                rule=1,
-                requires_index=False,
-                reads=frozenset(["supports_full_scope_fetch"]),
-                applied_filters=effective_filters,
-                scope=stats,
-            )
-
-        if (
-            (resolved_intent.scope == "document_overview" or self.profile.retrieval.always_include_summaries)
-            and caps.supports_parent_summaries
-        ):
-            return QueryPlan(
-                strategy="hierarchical",
-                tier_decision_reason="hierarchical: document overview query or always_include_summaries",
-                rule=2,
-                requires_index=True,
-                reads=frozenset(["supports_parent_summaries", "supports_vector_search"]),
-                applied_filters=effective_filters,
-                scope=stats,
-            )
-
-        if resolved_intent.exact_terms and caps.supports_keyword_fts:
-            return QueryPlan(
-                strategy="keyword_first",
-                tier_decision_reason="keyword_first: exact terms in query",
-                rule=3,
-                requires_index=True,
-                reads=frozenset(["supports_keyword_fts"]),
-                applied_filters=effective_filters,
-                scope=stats,
-            )
-
-        strat_name = "hybrid_rrf" if caps.supports_native_hybrid else "dense_vector"
-        return QueryPlan(
-            strategy=strat_name,
-            tier_decision_reason=f"{strat_name}: scope {stats.total_tokens} tokens exceeded Tier 0 gate {max_t0}",
-            rule=4,
-            requires_index=True,
-            reads=frozenset(["supports_vector_search"]),
-            applied_filters=effective_filters,
-            scope=stats,
-        )
-
-    def validate(self) -> None:
-        """Validate engine configuration and store compatibility (AC-RAG-07, AC-RAG-49)."""
-        self.profile.validate(self.registry)
-        store_space = self.store.embedding_space()
-        if store_space.model != self.profile.models.embedding:
-            raise ProfileConfigError(
-                f"Store embedding space model '{store_space.model}' does not match "
-                f"profile embedding model '{self.profile.models.embedding}'"
-            )
-
-    def retrieve(
-        self,
-        request: RAGQueryRequest,
-        intent: QueryIntent | None = None,
-    ) -> RAGRetrievalResult[MetaT]:
+    def retrieve(self, request: RAGQueryRequest, intent: QueryIntent | None = None) -> RAGRetrievalResult[MetaT]:
         """Ranked list retrieval mode (§8.10, AC-RAG-51)."""
-        # Check embedding space match (RAG-ING-7, AC-RAG-07)
-        store_space = self.store.embedding_space()
-        if store_space.model != self.profile.models.embedding:
-            raise EmbeddingSignatureMismatch(
-                f"Store embedding space '{store_space.model}' does not match profile '{self.profile.models.embedding}'"
-            )
-
-        t0 = self.clock.monotonic()
-        req_id = f"req-{uuid.uuid4().hex[:12]}"
-        usage_tracker = UsageTracker(request_id=req_id, tenant_or_user_id=request.tenant_id)
-        degradations = DegradationTracker(fallbacks=self.profile.fallbacks)
-        deadline = Deadline(deadline_seconds=self.profile.runtime.deadline_seconds, clock=self.clock)
-
-        # 1. Resolve Intent
-        resolved_intent = intent or self.route(request)
-        if intent is not None:
-            resolved_intent = clamp_intent(intent.model_dump(), degradations)
-
-        effective_filters = self._build_effective_filters(request, intent=resolved_intent)
-        all_guards = list(self.guards) + list(request.guards)
-
-        # 2. Run guards before_retrieval
-        for guard in all_guards:
-            patch = guard.to_filter()
-            if patch is not None:
-                effective_filters = effective_filters.patch(patch)
-
-        # 3. Build Retrieval Context
-        ret_ctx = RetrievalContext[MetaT](
-            request=request,
-            intent=resolved_intent,
-            variants=[QueryVariant(text=resolved_intent.search_query or request.query, weight=1.0)],
-            filters=effective_filters,
-            store=self.store,
-            profile=self.profile,
-            analyzer=self.registry.get("analyzer", self.profile.analyzer)(),
-            renderer=self.renderer,
-            gateway=self.gateway,
-            deadline=deadline,
-            usage_tracker=usage_tracker,
-            degradation_tracker=degradations,
+        if request.variant:
+            return self._variant_engine(request.variant).retrieve(request.model_copy(update={"variant": None}), intent)
+        run = self._begin(request)
+        try:
+            resolved = self._resolve_intent(request, intent, run)
+            result, _ = self.pipeline.run(request, resolved, "retrieve", run)
+        except Exception as exc:
+            self._fail(exc, run)
+            raise
+        result.trace = run.trace.build(
+            result.applied_filters, run.degradations.degradations, run.usage.stage_usages, run.usage.total()
         )
+        run.trace.dispatcher.notify_complete(result.trace, result)
+        return result
 
-        # 4. Fan out query variants if comparisons present (AC-RAG-19)
-        fanout = SecondaryQueryFanOut()
-        ret_ctx.variants = fanout.transform(request, resolved_intent)
+    def query(self, request: RAGQueryRequest, intent: QueryIntent | None = None) -> RAGResponse[MetaT]:
+        """End-to-end question answering (§14)."""
+        if request.variant:
+            return self._variant_engine(request.variant).query(request.model_copy(update={"variant": None}), intent)
+        run = self._begin(request)
+        retrieval: RAGRetrievalResult[MetaT] | None = None
+        try:
+            resolved = self._resolve_intent(request, intent, run)
+            prompt, retrieval, guards, stage = self._prepare_generation(request, resolved, run)
+            return self._generate_and_finish(request, prompt, retrieval, guards, stage, run)
+        except Exception as exc:
+            self._fail(exc, run, retrieval)
+            raise
 
-        # 5. Execute Strategy
-        strat_name = request.strategy_override or self.profile.retrieval.default_strategy
-        if strat_name == "adaptive":
-            strategy: RetrievalStrategy[MetaT] = AdaptiveStrategy()
-        elif strat_name == "hierarchical":
-            strategy = HierarchicalStrategy()
-        elif strat_name == "full_context":
-            strategy = FullContextStrategy()
-        elif strat_name == "hybrid_rrf":
-            strategy = HybridRRFStrategy()
-        elif strat_name == "keyword_only":
-            strategy = KeywordOnlyStrategy()
-        elif strat_name == "keyword_first":
-            strategy = KeywordFirstStrategy()
-        else:
-            strategy = DenseVectorStrategy()
-
-        # Multi-variant execution and fair interleave
-        if len(ret_ctx.variants) > 1:
-            variant_results: list[list[RAGNode[MetaT]]] = []
-            for v in ret_ctx.variants:
-                v_intent = resolved_intent.model_copy(update={"search_query": v.text})
-                v_ctx = ret_ctx.model_copy(update={"intent": v_intent})
-                v_nodes = strategy.retrieve(v_ctx)
-                variant_results.append(v_nodes)
-            top_k = resolved_intent.suggested_top_k or self.profile.retrieval.top_k
-            nodes = fair_interleave(variant_results, top_k=top_k)
-        else:
-            nodes = strategy.retrieve(ret_ctx)
-
-        # Follow-up node reuse (§7.7, AC-RAG-29, AC-RAG-30)
-        caps = self.store.capabilities() if callable(self.store.capabilities) else self.store.capabilities
-        if request.conversation and request.conversation.prior_nodes and caps.supports_fetch_nodes:
-            prior_ids = [ref.node_id for ref in request.conversation.prior_nodes]
-            reused = self.store.fetch_nodes(prior_ids, effective_filters)
-            guarded_reused: list[RAGNode[MetaT]] = []
-            for rn in reused:
-                passed = rn
-                for g in all_guards:
-                    passed = g.verify(passed) if passed is not None else None
-                if passed is not None:
-                    guarded_reused.append(passed)
-            seen_ids = {n.id for n in nodes}
-            nodes = [rn for rn in guarded_reused if rn.id not in seen_ids] + nodes
-
-        # 6. Apply post-retrieval guards
-        for guard in all_guards:
-            verified_nodes: list[RAGNode[MetaT]] = []
-            for n in nodes:
-                res = guard.verify(n)
-                if res is not None:
-                    verified_nodes.append(res)
-            nodes = verified_nodes
-
-        # 7. Post-retrieval pipeline stages
-        # Threshold filter (AC-RAG-31)
-        min_sim = self.profile.retrieval.min_similarity
-        if min_sim is not None and min_sim > 0.0:
-            nodes = ThresholdFilter[MetaT](min_similarity=min_sim, kind="cosine").filter(nodes)
-
-        # Deduplication (AC-RAG-32, AC-RAG-33)
-        if "offset_dedup" in self.profile.post_stages:
-            nodes = OffsetDeduplicator[MetaT]().deduplicate(nodes)
-        if "identity_dedup" in self.profile.post_stages:
-            nodes = IdentityDeduplicator[MetaT]().deduplicate(nodes)
-
-        # Rerank if configured (AC-RAG-34)
-        reranked = False
-        if "rerank" in self.profile.post_stages and self.profile.models.reranker:
-            reranker = JinaCrossEncoderReranker[MetaT](
-                gateway=self.gateway,
-                model=self.profile.models.reranker,
-            )
-            nodes = reranker.rerank(
-                query=resolved_intent.search_query or request.query,
-                nodes=nodes,
-                usage_tracker=usage_tracker,
-                degradation_tracker=degradations,
-            )
-            reranked = True
-
-        # Boosters (§9.4, AC-RAG-35)
-        if "recency" in self.profile.post_stages:
-            nodes = RecencyBooster[MetaT](clock=self.clock).boost(nodes, renderer=self.renderer)
-
-        if "score_fusion" in self.profile.post_stages:
-            nodes = ScoreFusionStage[MetaT]().fuse(nodes, renderer=self.renderer, clock=self.clock)
-
-        # Relaxation ladder (§7.6, §5.5, AC-RAG-18)
-        relaxations: list[str] = []
-        is_soft_date = (
-            resolved_intent.has_time_expression
-            and (request.filters is None or request.filters.date_range_utc is None)
-            and effective_filters.date_range_utc is not None
-        )
-        if not nodes and is_soft_date:
-            start_dt, end_dt = effective_filters.date_range_utc
-            if start_dt is not None and end_dt is not None:
-                delta = end_dt - start_dt
-                widened_start = end_dt - delta * 2
-                relaxed_filters = effective_filters.model_copy(update={"date_range_utc": (widened_start, end_dt)})
-                ret_ctx_widen = ret_ctx.model_copy(update={"filters": relaxed_filters})
-                relaxed_nodes = strategy.retrieve(ret_ctx_widen)
-                if relaxed_nodes:
-                    relaxations.append("widen_time_window(x2)")
-                    nodes = relaxed_nodes
-                    effective_filters = relaxed_filters
-
-            if not nodes:
-                relaxed_filters = effective_filters.model_copy(update={"date_range_utc": None})
-                ret_ctx_drop = ret_ctx.model_copy(update={"filters": relaxed_filters})
-                relaxed_nodes = strategy.retrieve(ret_ctx_drop)
-                if relaxed_nodes:
-                    relaxations.append("drop_time_window")
-                    nodes = relaxed_nodes
-                    effective_filters = relaxed_filters
-
-        # Hydration (§9.6, AC-RAG-36)
-        if caps.supports_hydration and nodes:
-            proj = self.profile.hydration_projection
-            meta_map = self.store.hydrate([n.id for n in nodes], projection=proj)
-            for n in nodes:
-                if n.id in meta_map:
-                    n.metadata = meta_map[n.id]
-                    n.hydrated = True
-
-        tier_reason = request.metadata.get("tier_decision_reason", "") if request.metadata else ""
-        strat_used = request.metadata.get("strategy_used", strategy.name) if request.metadata else strategy.name
-
-        # Sizing and truncation (§8.10, AC-RAG-63)
-        truncated = False
-        if strat_used != "full_context":
-            target_limit = (
-                request.top_k_override
-                or resolved_intent.suggested_top_k
-                or self.profile.retrieval.retrieve_max_results
-                or self.profile.retrieval.top_k
-            )
-            truncated = len(nodes) > target_limit
-            nodes = nodes[:target_limit]
-
-        trace = RAGTrace(
-            request_id=req_id,
-            profile_version=self.profile.version,
-            total_latency_ms=(self.clock.monotonic() - t0) * 1000.0,
-            level=self.profile.trace_level,
-        )
-
-        return RAGRetrievalResult[MetaT](
-            nodes=nodes,
-            intent=resolved_intent,
-            strategy_used=strat_used,
-            tier_decision_reason=tier_reason,
-            applied_filters=effective_filters,
-            reranked=reranked,
-            degradations=degradations.degradations,
-            relaxations=relaxations,
-            truncated=truncated,
-            usage=usage_tracker.stage_usages,
-            trace=trace,
-        )
-
-    def query(
+    def generate_from_nodes(
         self,
         request: RAGQueryRequest,
+        nodes: list[RAGNode[MetaT]],
         intent: QueryIntent | None = None,
     ) -> RAGResponse[MetaT]:
-        """Main end-to-end RAG question answering pipeline (§14)."""
-        t0 = self.clock.monotonic()
-        req_id = f"req-{uuid.uuid4().hex[:12]}"
-        usage_tracker = UsageTracker(request_id=req_id, tenant_or_user_id=request.tenant_id)
-        degradations = DegradationTracker(fallbacks=self.profile.fallbacks)
-        deadline = Deadline(deadline_seconds=self.profile.runtime.deadline_seconds, clock=self.clock)
-
-        # 1. Routing
-        resolved_intent = intent or self.route(request)
-        if intent is not None:
-            resolved_intent = clamp_intent(intent.model_dump(), degradations)
-
-        # Check no-retrieval route (greetings / chitchat, AC-RAG-12)
-        if resolved_intent.route == "no_retrieval":
-            gen_res = self.gateway.generate(
-                system_prompt="You are a helpful, polite assistant. Respond warmly to the user.",
-                user_message=request.query,
-                models=self.profile.models.generation,
-                stage="generation_no_retrieval",
-                usage_tracker=usage_tracker,
-                degradation_tracker=degradations,
-                budget_guard=self.budget_guard,
-                request_id=req_id,
-                tenant_or_user_id=request.tenant_id,
+        """Run guards, assembly, generation and citation checks on caller-supplied nodes (§14.4)."""
+        run = self._begin(request)
+        resolved = intent or QueryIntent(search_query=request.question, router_source="passthrough")
+        retrieval: RAGRetrievalResult[MetaT] | None = None
+        try:
+            filters, guards, _ = self.pipeline.scoped_filters(request, resolved)
+            guarded = apply_guards(list(nodes), guards, run.trace.record_guard_effect)
+            retrieval = RAGRetrievalResult[MetaT](
+                nodes=guarded,
+                intent=resolved,
+                strategy_used="caller_supplied",
+                tier_decision_reason="generate_from_nodes",
+                applied_filters=filters,
             )
-            lat_ms = (self.clock.monotonic() - t0) * 1000.0
-            total_u = usage_tracker.total()
-            return RAGResponse[MetaT](
-                answer_id=f"ans-{uuid.uuid4().hex[:12]}",
-                answer=gen_res.text,
-                answer_final=gen_res.text,
-                grounded=True,
-                answer_found="yes",
-                retrieved=RAGRetrievalResult[MetaT](
-                    intent=resolved_intent,
-                    strategy_used="none",
-                    tier_decision_reason="no_retrieval route selected",
-                ),
-                usage=usage_tracker.stage_usages,
-                usage_total=total_u,
-                degradations=degradations.degradations,
-                latency_ms=lat_ms,
-            )
+            state_fence = request.state.fence_id if request.state else None
+            prompt = self.assembler.assemble_prompt(request, guarded, state_fence, guards)
+            return self._generate_and_finish(request, prompt, retrieval, guards, "generation", run)
+        except Exception as exc:
+            self._fail(exc, run, retrieval)
+            raise
 
-        # 2. Candidate Retrieval
-        ret_result = self.retrieve(request, intent=resolved_intent)
-        for d in ret_result.degradations:
-            degradations.record(d.id, d.stage, d.reason, d.impact, d.fallback_used)
-        for u in ret_result.usage:
-            usage_tracker.record(u)
-
-        nodes = ret_result.nodes
-
-        # 3. Context Assembly & Fencing (AC-RAG-37)
-        state_fence_id = request.conversation.fence_id if request.conversation else None
-        sys_prompt, user_msg, active_fence_id = self.assembler.assemble(
-            request=request,
-            nodes=nodes,
-            fence_id=state_fence_id,
-        )
-
-        # 4. Generation
-        gen_res = self.generator.generate(
-            system_prompt=sys_prompt,
-            user_message=user_msg,
-            usage_tracker=usage_tracker,
-            degradation_tracker=degradations,
-            budget_guard=self.budget_guard,
-            request_id=req_id,
-            tenant_or_user_id=request.tenant_id,
-        )
-
-        # 5. Post-generation: citation extraction, quote verification, sanitization
-        clean_text, citations = self.citation_extractor.extract(gen_res.text, nodes)
-        if self.profile.citations.verify_quotes:
-            citations, coverage = self.quote_verifier.verify(citations, nodes)
-        else:
-            coverage = CitationCoverage(
-                total_citations=len(citations),
-                verified_citations=len(citations),
-                coverage_ratio=1.0,
-            )
-
-        flag_buf = FlagStreamBuffer()
-        stripped_deltas = flag_buf.feed(clean_text) + flag_buf.finalize()
-        final_answer = self.sanitizer.sanitize("".join(stripped_deltas))
-
-        # Answer found classification (§10.5)
-        answer_found = flag_buf.answer_found
-        if answer_found is None:
-            if not nodes:
-                answer_found = "no"
-                citations = []
-            else:
-                answer_found = "yes"
-                not_found_phrases = ["cannot be found", "not found in the provided", "not enough information"]
-                if any(p in final_answer.lower() for p in not_found_phrases):
-                    answer_found = "no"
-
-        all_guards = list(self.guards) + list(request.guards)
-        forces_strict = any(getattr(g, "forces_strict_grounding", False) for g in all_guards)
-        is_strict = (self.profile.generation.grounding_mode == "strict" or forces_strict)
-        abstained = (answer_found == "no") if is_strict else False
-
-        # Update conversation state
-        conv_state = request.conversation or ConversationState(fence_id=active_fence_id)
-        conv_state.fence_id = active_fence_id
-        for n in nodes:
-            conv_state.prior_nodes.append(NodeRef(node_id=n.id))
-        conv_state = self.conversation_manager.prune_state(conv_state)
-
-        total_u = usage_tracker.total()
-        lat_ms = (self.clock.monotonic() - t0) * 1000.0
-
-        trace = RAGTrace(
-            request_id=req_id,
-            profile_version=self.profile.version,
-            total_latency_ms=lat_ms,
-            state_size_bytes=len(conv_state.model_dump_json().encode("utf-8")),
-            level=self.profile.trace_level,
-        )
-
-        resp = RAGResponse[MetaT](
-            answer_id=f"ans-{uuid.uuid4().hex[:12]}",
-            answer=gen_res.text,
-            answer_final=final_answer,
-            citations=citations,
-            sources=citations,
-            retrieved=ret_result,
-            grounded=True,
-            answer_found=answer_found,
-            abstained=abstained,
-            citation_coverage=coverage,
-            state=conv_state,
-            usage=usage_tracker.stage_usages,
-            usage_total=total_u,
-            degradations=degradations.degradations,
-            latency_ms=lat_ms,
-            trace=trace,
-        )
-
-        self.dispatcher.notify_complete(trace, resp)
-        return resp
-
-    def stream_query(
+    def _generate_and_finish(
         self,
         request: RAGQueryRequest,
-        intent: QueryIntent | None = None,
-    ) -> RAGStream[MetaT]:
-        """Event streaming RAG query pipeline (§10.8, AC-RAG-45, RAG-OPS-1, RAG-OPS-2)."""
-        t0 = self.clock.monotonic()
-        req_id = f"req-{uuid.uuid4().hex[:12]}"
-        usage_tracker = UsageTracker(request_id=req_id, tenant_or_user_id=request.tenant_id)
-        degradations = DegradationTracker(fallbacks=self.profile.fallbacks)
-        deadline = Deadline(deadline_seconds=self.profile.runtime.deadline_seconds, clock=self.clock)
-        all_guards = list(self.guards) + list(request.guards)
+        prompt: AssembledPrompt[MetaT],
+        retrieval: RAGRetrievalResult[MetaT],
+        guards: list[Guard],
+        stage: str,
+        run: RequestRun,
+    ) -> RAGResponse[MetaT]:
+        run.deadline.check("generation")
+        started = run.trace.elapsed_ms()
+        result = self.generator.generate(prompt, self._generation_context(request, run, stage))
+        run.trace.record_stage(self.generator.name, "generation", started, version=self.generator.version)
 
-        def _generator() -> Iterator[RAGStreamEvent]:
-            stream_completed = False
-            active_model = self.profile.models.generation[0] if self.profile.models.generation else "gemini-3.5-flash-lite"
-            est_in_tokens = 1000
-            emitted_deltas: list[str] = []
+        buffer = FlagStreamBuffer()
+        visible = "".join(buffer.feed(result.text) + buffer.finalize())
+        return self.finalizer.finish(request, result.text, visible, buffer.answer_found, prompt, retrieval, guards, run)
 
-            try:
-                # 1. Routing
-                resolved_intent = intent or self.route(request)
-                if intent is not None:
-                    resolved_intent = clamp_intent(intent.model_dump(), degradations)
+    def verify_answer(
+        self,
+        answer_text: str,
+        response_or_nodes: RAGResponse[MetaT] | RAGRetrievalResult[MetaT] | list[RAGNode[MetaT]],
+    ) -> list[RAGCitation]:
+        """Run citation and quote checks on an edited answer, without model calls (§14.4)."""
+        if isinstance(response_or_nodes, RAGResponse):
+            nodes = response_or_nodes.retrieved.nodes
+        elif isinstance(response_or_nodes, RAGRetrievalResult):
+            nodes = response_or_nodes.nodes
+        else:
+            nodes = list(response_or_nodes)
 
-                yield RAGStreamEvent(
-                    event="intent",
-                    data={
-                        "route": resolved_intent.route,
-                        "scope": resolved_intent.scope,
-                        "search_query": resolved_intent.search_query,
-                        "router_source": resolved_intent.router_source,
-                    },
-                )
+        clean_text, citations = self.citation_extractor.extract(answer_text, nodes)
+        if self.profile.citations.verify_quotes:
+            citations, _ = self.quote_verifier.verify(citations, nodes, answer_text=clean_text)
+        return citations
 
-                # Emit any degradations that fired during routing
-                for d in degradations.degradations:
-                    yield RAGStreamEvent(event="degradation", data=d.model_dump())
+    def stream_query(self, request: RAGQueryRequest, intent: QueryIntent | None = None) -> RAGStream[MetaT]:
+        """Event streaming query pipeline (§10.8, AC-RAG-45, RAG-OPS-1, RAG-OPS-2)."""
+        if request.variant:
+            return self._variant_engine(request.variant).stream_query(
+                request.model_copy(update={"variant": None}), intent
+            )
+        run = self._begin(request)
+        return RAGStream[MetaT](self._stream_events(request, intent, run), usage_tracker=run.usage)
 
-                # 2. Check no-retrieval route
-                if resolved_intent.route == "no_retrieval":
-                    yield RAGStreamEvent(event="status", data={"stage": "generating"})
-                    flag_buf = FlagStreamBuffer()
-                    accumulated_text: list[str] = []
+    def _stream_events(
+        self,
+        request: RAGQueryRequest,
+        intent: QueryIntent | None,
+        run: RequestRun,
+    ) -> Iterator[RAGStreamEvent]:
+        retrieval: RAGRetrievalResult[MetaT] | None = None
+        chunks: Any = None
+        emitted_degradations = 0
 
-                    chunk_iter = self.gateway.stream(
-                        system_prompt="You are a helpful, polite assistant. Respond warmly to the user.",
-                        user_message=request.query,
-                        models=self.profile.models.generation,
-                        stage="generation_no_retrieval",
-                        usage_tracker=usage_tracker,
-                        degradation_tracker=degradations,
-                        budget_guard=self.budget_guard,
-                        request_id=req_id,
-                        tenant_or_user_id=request.tenant_id,
-                    )
-                    for chunk in chunk_iter:
-                        if chunk.delta:
-                            deltas = flag_buf.feed(chunk.delta)
-                            for d in deltas:
-                                emitted_deltas.append(d)
-                                accumulated_text.append(d)
-                                yield RAGStreamEvent(event="delta", data={"text": d})
+        def new_degradations() -> list[RAGStreamEvent]:
+            nonlocal emitted_degradations
+            pending = run.degradations.degradations[emitted_degradations:]
+            emitted_degradations += len(pending)
+            return [RAGStreamEvent(event="degradation", data=d.model_dump()) for d in pending]
 
-                    final_deltas = flag_buf.finalize()
-                    for d in final_deltas:
-                        emitted_deltas.append(d)
-                        accumulated_text.append(d)
-                        yield RAGStreamEvent(event="delta", data={"text": d})
+        try:
+            resolved = self._resolve_intent(request, intent, run)
+            yield RAGStreamEvent(
+                event="intent",
+                data={
+                    "route": resolved.route,
+                    "scope": resolved.scope,
+                    "search_query": resolved.search_query,
+                    "router_source": resolved.router_source,
+                },
+            )
+            yield from new_degradations()
 
-                    full_text = "".join(accumulated_text)
-                    clean_text, citations = self.citation_extractor.extract(full_text, [])
-                    final_answer = self.sanitizer.sanitize(clean_text)
-
-                    yield RAGStreamEvent(
-                        event="citations",
-                        data={"citations": [], "sources": [], "citation_coverage": 1.0},
-                    )
-
-                    total_u = usage_tracker.total()
-                    stream_completed = True
-                    yield RAGStreamEvent(
-                        event="done",
-                        data={
-                            "answer_id": f"ans-{uuid.uuid4().hex[:12]}",
-                            "answer_final": final_answer,
-                            "citations": [],
-                            "sources": [],
-                            "usage": [u.model_dump() for u in usage_tracker.stage_usages],
-                            "usage_total": total_u.model_dump(),
-                            "degradations": [d.model_dump() for d in degradations.degradations],
-                            "state": (request.conversation or ConversationState()).model_dump(),
-                            "grounded": True,
-                            "answer_found": flag_buf.answer_found or "yes",
-                            "abstained": False,
-                            "message_id": getattr(request, "message_id", None),
-                        },
-                    )
-                    return
-
-                # 3. Candidate Retrieval
+            if resolved.route != "no_retrieval":
                 yield RAGStreamEvent(event="status", data={"stage": "retrieving"})
-                ret_result = self.retrieve(request, intent=resolved_intent)
-
-                for d in ret_result.degradations:
-                    degradations.record(d.id, d.stage, d.reason, d.impact, d.fallback_used)
-                    yield RAGStreamEvent(event="degradation", data=d.model_dump())
-                for u in ret_result.usage:
-                    usage_tracker.record(u)
-
-                nodes = ret_result.nodes
+            prompt, retrieval, guards, stage = self._prepare_generation(request, resolved, run)
+            yield from new_degradations()
+            if resolved.route != "no_retrieval":
                 yield RAGStreamEvent(
                     event="retrieval",
                     data={
-                        "nodes": [n.id for n in nodes],
-                        "node_count": len(nodes),
-                        "strategy_used": ret_result.strategy_used,
-                        "applied_filters": ret_result.applied_filters.model_dump() if ret_result.applied_filters else {},
+                        "nodes": [n.node_id for n in retrieval.nodes],
+                        "node_count": len(retrieval.nodes),
+                        "strategy_used": retrieval.strategy_used,
+                        "applied_filters": retrieval.applied_filters.model_dump(),
                     },
                 )
 
-                # 4. Context Assembly & Fencing
-                state_fence_id = request.conversation.fence_id if request.conversation else None
-                sys_prompt, user_msg, active_fence_id = self.assembler.assemble(
-                    request=request,
-                    nodes=nodes,
-                    fence_id=state_fence_id,
-                )
-                est_in_tokens = estimate_tokens(sys_prompt + "\n" + user_msg)
+            yield RAGStreamEvent(event="status", data={"stage": "generating"})
+            run.deadline.check("generation")
+            started = run.trace.elapsed_ms()
+            context = self._generation_context(request, run, stage)
+            buffer = FlagStreamBuffer()
+            raw_parts: list[str] = []
+            visible_parts: list[str] = []
 
-                # 5. Generation
-                yield RAGStreamEvent(event="status", data={"stage": "generating"})
-                flag_buf = FlagStreamBuffer()
-                accumulated_text: list[str] = []
+            def deltas_for(texts: list[str]) -> list[RAGStreamEvent]:
+                visible_parts.extend(texts)
+                return [RAGStreamEvent(event="delta", data={"text": text}) for text in texts]
 
-                if self.profile.generation.stream_mode == "buffered":
-                    gen_res = self.generator.generate(
-                        system_prompt=sys_prompt,
-                        user_message=user_msg,
-                        usage_tracker=usage_tracker,
-                        degradation_tracker=degradations,
-                        budget_guard=self.budget_guard,
-                        request_id=req_id,
-                        tenant_or_user_id=request.tenant_id,
-                    )
-                    deltas = flag_buf.feed(gen_res.text) + flag_buf.finalize()
-                    for d in deltas:
-                        emitted_deltas.append(d)
-                        accumulated_text.append(d)
-                        yield RAGStreamEvent(event="delta", data={"text": d})
-                else:
-                    chunk_iter = self.generator.stream(
-                        system_prompt=sys_prompt,
-                        user_message=user_msg,
-                        usage_tracker=usage_tracker,
-                        degradation_tracker=degradations,
-                        budget_guard=self.budget_guard,
-                        request_id=req_id,
-                        tenant_or_user_id=request.tenant_id,
-                    )
-                    for chunk in chunk_iter:
-                        if chunk.delta:
-                            deltas = flag_buf.feed(chunk.delta)
-                            for d in deltas:
-                                emitted_deltas.append(d)
-                                accumulated_text.append(d)
-                                yield RAGStreamEvent(event="delta", data={"text": d})
+            if self.profile.generation.stream_mode == "buffered":
+                result = self.generator.generate(prompt, context)
+                raw_parts.append(result.text)
+                yield from new_degradations()
+                yield from deltas_for(buffer.feed(result.text))
+            else:
+                chunks = self.generator.stream(prompt, context)
+                for chunk in chunks:
+                    yield from new_degradations()
+                    if chunk.delta:
+                        raw_parts.append(chunk.delta)
+                        yield from deltas_for(buffer.feed(chunk.delta))
+                chunks = None
+            yield from deltas_for(buffer.finalize())
+            yield from new_degradations()
+            run.trace.record_stage(self.generator.name, "generation", started, version=self.generator.version)
 
-                    final_deltas = flag_buf.finalize()
-                    for d in final_deltas:
-                        emitted_deltas.append(d)
-                        accumulated_text.append(d)
-                        yield RAGStreamEvent(event="delta", data={"text": d})
+            response = self.finalizer.finish(
+                request,
+                "".join(raw_parts),
+                "".join(visible_parts),
+                buffer.answer_found,
+                prompt,
+                retrieval,
+                guards,
+                run,
+            )
+            yield from new_degradations()
 
-                full_text = "".join(accumulated_text)
+            citations = [c.model_dump() for c in response.citations]
+            sources = [s.model_dump() for s in response.sources]
+            coverage = response.citation_coverage
+            yield RAGStreamEvent(
+                event="citations",
+                data={
+                    "citations": citations,
+                    "sources": sources,
+                    "citation_coverage": coverage.ratio if coverage else 1.0,
+                },
+            )
+            yield RAGStreamEvent(
+                event="done",
+                data={
+                    "answer_id": response.answer_id,
+                    "answer_final": response.answer_final,
+                    "citations": citations,
+                    "sources": sources,
+                    "usage": [u.model_dump() for u in response.usage],
+                    "usage_total": response.usage_total.model_dump(),
+                    "degradations": [d.model_dump() for d in response.degradations],
+                    "state": response.state.model_dump(),
+                    "grounded": response.grounded,
+                    "answer_found": response.answer_found,
+                    "abstained": response.abstained,
+                    "message_id": request.metadata.get("message_id"),
+                },
+            )
+        except GeneratorExit:
+            # Closing the model stream makes the gateway record the cancelled call (RAG-OPS-2)
+            if chunks is not None:
+                chunks.close()
+            raise
+        except Exception as exc:
+            self._fail(exc, run, retrieval)
+            yield RAGStreamEvent(
+                event="error",
+                data={
+                    "type": type(exc).__name__,
+                    "stage": getattr(exc, "stage", None) or "stream",
+                    "message": str(exc)[:200],
+                    "request_id": run.request_id,
+                    "usage": [u.model_dump() for u in run.usage.stage_usages],
+                    "usage_total": run.usage.total().model_dump(),
+                },
+            )
+            raise
 
-                # 6. Post-generation: citation extraction, verification, sanitization
-                clean_text, citations = self.citation_extractor.extract(full_text, nodes)
-                if self.profile.citations.verify_quotes:
-                    citations, coverage = self.quote_verifier.verify(citations, nodes)
-                else:
-                    coverage = CitationCoverage(
-                        total_citations=len(citations),
-                        verified_citations=len(citations),
-                        coverage_ratio=1.0,
-                    )
+    # ── Ingestion ─────────────────────────────────────────────────────────
 
-                verified_cites = [c for c in citations if c.verified]
-                seen_sources: set[str] = set()
-                sources: list[SourceSpan] = []
-                for c in verified_cites:
-                    if c.node_id not in seen_sources:
-                        seen_sources.add(c.node_id)
-                        matching_node = next((n for n in nodes if n.id == c.node_id), None)
-                        if matching_node and matching_node.span:
-                            sources.append(matching_node.span)
-
-                yield RAGStreamEvent(
-                    event="citations",
-                    data={
-                        "citations": [c.model_dump() for c in citations],
-                        "sources": [s.model_dump() for s in sources],
-                        "citation_coverage": coverage.coverage_ratio if coverage else 1.0,
-                    },
-                )
-
-                final_answer = self.sanitizer.sanitize(clean_text)
-
-                # Answer found determination (§10.5)
-                answer_found = flag_buf.answer_found
-                if answer_found is None:
-                    if not nodes:
-                        answer_found = "no"
-                    else:
-                        answer_found = "yes"
-                        not_found_phrases = ["cannot be found", "not found in the provided", "not enough information"]
-                        if any(p in final_answer.lower() for p in not_found_phrases):
-                            answer_found = "no"
-
-                forces_strict = any(getattr(g, "forces_strict_grounding", False) for g in all_guards)
-                is_strict = (self.profile.generation.grounding_mode == "strict" or forces_strict)
-                abstained = (answer_found == "no") if is_strict else False
-
-                # Update conversation state
-                conv_state = request.conversation or ConversationState(fence_id=active_fence_id)
-                conv_state.fence_id = active_fence_id
-                for n in nodes:
-                    conv_state.prior_nodes.append(NodeRef(node_id=n.id))
-                conv_state = self.conversation_manager.prune_state(conv_state)
-
-                total_u = usage_tracker.total()
-                stream_completed = True
-                yield RAGStreamEvent(
-                    event="done",
-                    data={
-                        "answer_id": f"ans-{uuid.uuid4().hex[:12]}",
-                        "answer_final": final_answer,
-                        "citations": [c.model_dump() for c in citations],
-                        "sources": [s.model_dump() for s in sources],
-                        "usage": [u.model_dump() for u in usage_tracker.stage_usages],
-                        "usage_total": total_u.model_dump(),
-                        "degradations": [d.model_dump() for d in degradations.degradations],
-                        "state": conv_state.model_dump(),
-                        "grounded": True,
-                        "answer_found": answer_found,
-                        "abstained": abstained,
-                        "message_id": getattr(request, "message_id", None),
-                    },
-                )
-
-            except GeneratorExit:
-                if not stream_completed and emitted_deltas:
-                    out_tok = estimate_tokens("".join(emitted_deltas))
-                    cost = compute_cost(active_model, input_tokens=est_in_tokens, output_tokens=out_tok)
-                    usage_tracker.record(
-                        StageUsage(
-                            stage="generation",
-                            model=active_model,
-                            input_tokens=est_in_tokens,
-                            output_tokens=out_tok,
-                            cost_usd=cost,
-                            estimated=True,
-                            outcome="cancelled",
-                            billing="billed",
-                        )
-                    )
-                raise
-            except Exception as exc:
-                if not stream_completed:
-                    err_data = {
-                        "type": type(exc).__name__,
-                        "stage": getattr(exc, "stage", "stream"),
-                        "message": str(exc),
-                        "request_id": req_id,
-                        "usage": [u.model_dump() for u in usage_tracker.stage_usages],
-                        "usage_total": usage_tracker.total().model_dump(),
-                    }
-                    yield RAGStreamEvent(event="error", data=err_data)
-                raise
-
-        return RAGStream[MetaT](_generator(), usage_tracker=usage_tracker)
+    def _ingestion_trackers(self, request_id: str, doc_id: str) -> tuple[UsageTracker, DegradationTracker]:
+        usage = UsageTracker(request_id=request_id, doc_ids=[doc_id], profile_name=self.profile.name)
+        return usage, DegradationTracker(fallbacks=self.profile.fallbacks)
 
     def ingest_document(
         self,
-        doc: RAGDocumentInput[MetaT] | str,
+        doc: RAGDocumentInput[MetaT],
         start_section_seq: int = 0,
         on_section_complete: Callable[[IngestionProgress], None] | None = None,
-        text: str | None = None,
-        metadata: MetaT | None = None,
-        section_id: str = "main",
-        chunk_size: int = 600,
-        chunk_overlap: int = 50,
     ) -> IngestionProgress:
-        """Splits document, embeds nodes, generates summaries, and atomically upserts into persistent store.
+        """Split, summarize, embed and atomically upsert a document, one section at a time.
 
         Resumable via start_section_seq and append-only (RAG-ING-5, RAG-ING-6, AC-RAG-05).
-        Enforces atomic sections (RAG-ING-10, AC-RAG-66) and budget guard (RAG-ING-12, AC-RAG-65).
         """
-        t0 = self.clock.monotonic()
-
-        # Handle legacy string/text positional arguments
-        if isinstance(doc, str):
-            doc_id = doc
-            sec = RAGSectionInput[MetaT](
-                section_id=section_id,
-                section_seq=0,
-                text=text or "",
-                char_start=0,
-                metadata=metadata or {},  # type: ignore[arg-type]
-            )
-            doc_input = RAGDocumentInput[MetaT](doc_id=doc_id, sections=[sec])
-        else:
-            doc_input = doc
-
-        sections_to_process = [
-            s for s in sorted(doc_input.sections, key=lambda x: x.section_seq)
-            if s.section_seq >= start_section_seq
+        doc_input = doc
+        sections = [
+            s for s in sorted(doc_input.sections, key=lambda x: x.section_seq) if s.section_seq >= start_section_seq
         ]
+        last_progress: IngestionProgress | None = None
+        completed = 0
 
-        total_passages_upserted = 0
-        total_failed = 0
-        last_progress = None
-        completed_count = 0
-
-        for sec in sections_to_process:
-            tracker = UsageTracker(request_id=f"ingest-{doc_input.doc_id}-s{sec.section_seq}")
-            deg_tracker = DegradationTracker(fallbacks=self.profile.fallbacks)
-
-            # 1. Budget check before calls (RAG-ING-12, AC-RAG-65)
-            if self.budget_guard:
-                est_in_tokens = estimate_tokens(sec.text)
-                self.budget_guard.before_call(
-                    CallContext(
-                        stage="ingest_embedding",
-                        request_id=f"ingest-{doc_input.doc_id}",
-                        est_input_tokens=est_in_tokens,
-                        est_cost_usd=None,
-                        request_spent=tracker.total(),
-                    )
-                )
-
-            # 2. Summarize section (RAG-ING-3, RAG-ING-9, AC-RAG-08, AC-RAG-59)
-            sum_res = self.summarizer.summarize_section(
-                doc_id=doc_input.doc_id,
-                section_seq=sec.section_seq,
-                section_id=sec.section_id,
-                text=sec.text,
-                char_start=sec.char_start,
-                metadata=sec.metadata,
-                existing_summary=sec.existing_summary,
-                usage_tracker=tracker,
-                degradation_tracker=deg_tracker,
+        for section in sections:
+            tracker, deg_tracker = self._ingestion_trackers(
+                f"ingest-{doc_input.doc_id}-s{section.section_seq}", doc_input.doc_id
             )
-
-            # 3. Split section text into passage nodes (RAG-ING-1, RAG-ING-2, AC-RAG-01)
-            chunks = self.splitter.split(sec.text, base_offset=sec.char_start)
-            nodes: list[RAGNode[MetaT]] = []
-            for p_idx, chunk in enumerate(chunks):
-                node_id = f"{doc_input.doc_id}#s{sec.section_seq}p{p_idx}"
-                n = RAGNode[MetaT](
-                    node_id=node_id,
-                    doc_id=doc_input.doc_id,
-                    section_id=sec.section_id,
-                    section_seq=sec.section_seq,
-                    granularity="passage",
-                    text=chunk.text,
-                    span=SourceSpan(
-                        doc_id=doc_input.doc_id,
-                        section_id=sec.section_id,
-                        section_seq=sec.section_seq,
-                        section_title=sec.title,
-                        char_start=sec.char_start + chunk.local_start,
-                        char_end=sec.char_start + chunk.local_end,
-                        breadcrumb=list(sec.breadcrumb) + chunk.breadcrumb,
-                    ),
-                    metadata=sec.metadata,
-                )
-                n.token_estimate = estimate_tokens(n.text)
-                if self.store.capabilities().uses_analyzer_tokens:
-                    n.search_tokens = self.analyzer.tokenize(n.text)
-                nodes.append(n)
-
-            # 4. Batch embed nodes (RAG-ING-4, AC-RAG-04)
-            valid_pairs = self.embedder.embed_nodes(nodes, tracker, deg_tracker)
-            failed_in_sec = len(nodes) - len(valid_pairs)
-            total_failed += failed_in_sec
-
-            valid_nodes = [p[0] for p in valid_pairs]
-            valid_embeddings = [p[1] for p in valid_pairs]
-
-            # 5. Populate fingerprints on nodes
-            dims = self.store.embedding_space().dims
-            splitter_ver = self.store.embedding_space().splitter_version or getattr(self.splitter, "version", "1.0.0")
-            emb_sig = f"{self.profile.models.embedding}|{dims}|RETRIEVAL_DOCUMENT|{splitter_ver}"
-            fts_sig = f"{self.analyzer.name}|{self.analyzer.version}" if self.store.capabilities().uses_analyzer_tokens else None
-
-            for n in valid_nodes:
-                content_hash = hashlib.sha256(self.analyzer.normalize(self.renderer.embed_text(n)).encode("utf-8")).hexdigest()
-                n.content_hash = content_hash
-
-            # Also embed summary node if generated
-            summary_node = sum_res.section_summary
-            if summary_node:
-                s_pairs = self.embedder.embed_nodes([summary_node], tracker, deg_tracker, stage="summary_embedding")
-                if s_pairs:
-                    summary_node.embedding = s_pairs[0][1]
-
-            # Also add unit summaries to nodes if present
-            for u_node in sum_res.unit_summaries:
-                u_pairs = self.embedder.embed_nodes([u_node], tracker, deg_tracker, stage="summary_embedding")
-                if u_pairs:
-                    u_node.embedding = u_pairs[0][1]
-                    valid_nodes.append(u_node)
-                    valid_embeddings.append(u_pairs[0][1])
-
-            # 6. Atomic upsert to store (RAG-ING-10, AC-RAG-66)
-            written = self.store.upsert_section_nodes(
-                doc_id=doc_input.doc_id,
-                section_seq=sec.section_seq,
-                nodes=valid_nodes,
-                embeddings=valid_embeddings,
-                summary=summary_node,
-            )
-            total_passages_upserted += written
-            completed_count += 1
-
-            last_progress = IngestionProgress(
-                doc_id=doc_input.doc_id,
-                section_seq=sec.section_seq,
-                sections_completed=completed_count,
-                sections_total=len(doc_input.sections),
-                passages_upserted=written,
-                passages_skipped_unchanged=0,
-                passages_failed=failed_in_sec,
-                summary_status=sum_res.summary_status,
-                usage=tracker.stage_usages,
-                degradations=deg_tracker.degradations,
-            )
-
+            try:
+                last_progress = self._ingest_section(doc_input, section, completed + 1, tracker, deg_tracker)
+            except RAGEngineError as exc:
+                exc.request_id = exc.request_id or tracker.request_id
+                exc.degradations = deg_tracker.degradations
+                exc.usage = tracker.stage_usages
+                exc.usage_total = tracker.total()
+                raise
+            completed += 1
             if on_section_complete:
                 on_section_complete(last_progress)
 
@@ -1150,243 +713,118 @@ class RAGEngine(Generic[MetaT]):
             summary_status="skipped",
         )
 
-    def sync_document(self, doc: RAGDocumentInput[MetaT]) -> IngestionProgress:
-        """Syncs document: embeds only changed nodes, deletes vanished ones, preserves node ids (§6.6, AC-RAG-06)."""
-        stored_fps = self.store.get_fingerprints(doc.doc_id)
-        all_section_nodes: list[RAGNode[MetaT]] = []
-        for sec in sorted(doc.sections, key=lambda s: s.section_seq):
-            chunks = self.splitter.split(sec.text, base_offset=sec.char_start)
-            for p_idx, chunk in enumerate(chunks):
-                n = RAGNode[MetaT](
-                    node_id=f"{doc.doc_id}#s{sec.section_seq}p{p_idx}",
-                    doc_id=doc.doc_id,
-                    section_id=sec.section_id,
-                    section_seq=sec.section_seq,
-                    granularity="passage",
-                    text=chunk.text,
-                    span=SourceSpan(
-                        doc_id=doc.doc_id,
-                        section_id=sec.section_id,
-                        section_seq=sec.section_seq,
-                        section_title=sec.title,
-                        char_start=sec.char_start + chunk.local_start,
-                        char_end=sec.char_start + chunk.local_end,
-                        breadcrumb=list(sec.breadcrumb) + chunk.breadcrumb,
-                    ),
-                    metadata=sec.metadata,
-                )
-                all_section_nodes.append(n)
+    def _ingest_section(
+        self,
+        doc_input: RAGDocumentInput[MetaT],
+        section: RAGSectionInput[MetaT],
+        sections_completed: int,
+        tracker: UsageTracker,
+        deg_tracker: DegradationTracker,
+    ) -> IngestionProgress:
+        """Summarize, split, embed and atomically upsert one section (RAG-ING-3, RAG-ING-10, RAG-ING-12)."""
+        uses_tokens = self.store.capabilities().uses_analyzer_tokens
 
-        current_node_ids = {n.node_id for n in all_section_nodes}
-
-        # Identify vanished nodes and delete them
-        vanished_ids = [nid for nid in stored_fps.keys() if nid not in current_node_ids]
-        if vanished_ids and self.store.capabilities().supports_delete:
-            self.store.delete_nodes(vanished_ids)
-
-        # Identify changed vs unchanged nodes
-        nodes_to_embed: list[RAGNode[MetaT]] = []
-        skipped_count = 0
-        dims = self.store.embedding_space().dims
-        splitter_ver = self.store.embedding_space().splitter_version or getattr(self.splitter, "version", "1.0.0")
-        emb_sig = f"{self.profile.models.embedding}|{dims}|RETRIEVAL_DOCUMENT|{splitter_ver}"
-
-        for n in all_section_nodes:
-            embed_text = self.renderer.embed_text(n)
-            chash = hashlib.sha256(self.analyzer.normalize(embed_text).encode("utf-8")).hexdigest()
-
-            if n.node_id in stored_fps:
-                st_fp = stored_fps[n.node_id]
-                if st_fp.content_hash == chash and st_fp.embedding_signature == emb_sig:
-                    skipped_count += 1
-                    continue
-            nodes_to_embed.append(n)
-
-        # Embed changed/new nodes
-        upserted_count = 0
-        tracker = UsageTracker(request_id=f"sync-{doc.doc_id}")
-        deg_tracker = DegradationTracker(fallbacks=self.profile.fallbacks)
-
-        if nodes_to_embed:
-            pairs = self.embedder.embed_nodes(nodes_to_embed, tracker, deg_tracker)
-            by_sec: dict[int, list[tuple[RAGNode[MetaT], list[float]]]] = {}
-            for node, vec in pairs:
-                by_sec.setdefault(node.span.section_seq, []).append((node, vec))
-
-            for s_seq, s_pairs in by_sec.items():
-                s_nodes = [p[0] for p in s_pairs]
-                s_vecs = [p[1] for p in s_pairs]
-                w = self.store.upsert_section_nodes(
-                    doc_id=doc.doc_id,
-                    section_seq=s_seq,
-                    nodes=s_nodes,
-                    embeddings=s_vecs,
-                )
-                upserted_count += w
-
-        return IngestionProgress(
-            doc_id=doc.doc_id,
-            section_seq=0,
-            sections_completed=len(doc.sections),
-            sections_total=len(doc.sections),
-            passages_upserted=upserted_count,
-            passages_skipped_unchanged=skipped_count,
-            passages_failed=0,
-            summary_status="skipped",
-            usage=tracker.stage_usages,
+        result = self.summarizer.summarize_section(
+            doc_id=doc_input.doc_id,
+            section_seq=section.section_seq,
+            section_id=section.section_id,
+            text=section.text,
+            char_start=section.char_start,
+            metadata=section.metadata,
+            existing_summary=section.existing_summary,
+            usage_tracker=tracker,
+            degradation_tracker=deg_tracker,
+            budget_guard=self.budget_guard,
         )
 
-    def prepare_nodes(
-        self,
-        nodes_or_doc_id: list[RAGNode[MetaT]] | str,
-        text: str | None = None,
-        metadata: MetaT | None = None,
-        section_id: str = "main",
-        chunk_size: int = 600,
-        chunk_overlap: int = 50,
-    ) -> list[PreparedNode[MetaT]] | list[RAGNode[MetaT]]:
-        """Compute embedding, fingerprint, token_estimate, search_tokens without store write (§6.4.1, RAG-ING-13, AC-RAG-71)."""
-        if isinstance(nodes_or_doc_id, str):
-            return self._legacy_prepare_nodes(nodes_or_doc_id, text or "", metadata, section_id, chunk_size, chunk_overlap)
+        nodes = build_section_nodes(doc_input.doc_id, section, self.splitter)
+        for node in nodes:
+            finalize_node(node, self.renderer, self.analyzer, uses_tokens)
+        pairs = self.embedder.embed_nodes(nodes, tracker, deg_tracker, budget_guard=self.budget_guard)
 
-        nodes = nodes_or_doc_id
+        summaries = prepare_summaries(
+            result, self.embedder, self.renderer, self.analyzer, uses_tokens, tracker, deg_tracker, self.budget_guard
+        )
+        written = self.store.upsert_section_nodes(
+            doc_id=doc_input.doc_id,
+            section_seq=section.section_seq,
+            nodes=[p[0] for p in pairs] + summaries.unit_nodes,
+            embeddings=[p[1] for p in pairs] + summaries.unit_vectors,
+            summary=summaries.section_summary,
+        )
+        return IngestionProgress(
+            doc_id=doc_input.doc_id,
+            section_seq=section.section_seq,
+            sections_completed=sections_completed,
+            sections_total=len(doc_input.sections),
+            passages_upserted=written,
+            passages_failed=len(nodes) - len(pairs),
+            summary_status=result.summary_status,
+            usage=tracker.stage_usages,
+            degradations=deg_tracker.degradations,
+        )
+
+    def sync_document(self, doc: RAGDocumentInput[MetaT]) -> IngestionProgress:
+        """Embed only changed nodes, delete vanished ones, and preserve node ids (§6.6, AC-RAG-06)."""
+        tracker, deg_tracker = self._ingestion_trackers(f"sync-{doc.doc_id}", doc.doc_id)
+        try:
+            return self.synchronizer.sync(doc, tracker, deg_tracker)
+        except RAGEngineError as exc:
+            exc.request_id = exc.request_id or tracker.request_id
+            exc.degradations = deg_tracker.degradations
+            exc.usage = tracker.stage_usages
+            exc.usage_total = tracker.total()
+            raise
+
+    def prepare_nodes(self, nodes: list[RAGNode[MetaT]]) -> list[PreparedNode[MetaT]]:
+        """Compute embedding, fingerprint, token estimate and search tokens without writing (RAG-ING-13)."""
         if not nodes:
             return []
 
-        prepared: list[PreparedNode[MetaT]] = []
-        tracker = UsageTracker(request_id="prepare-nodes")
-        embed_texts = [self.renderer.embed_text(n) for n in nodes]
-
-        emb_res = self.gateway.embed(
-            texts=embed_texts,
+        tracker, _ = self._ingestion_trackers("prepare-nodes", nodes[0].span.doc_id)
+        vectors = self.gateway.embed(
+            texts=[self.renderer.embed_text(n) for n in nodes],
             model=self.profile.models.embedding,
             stage="prepare_embedding",
             usage_tracker=tracker,
             task_type="RETRIEVAL_DOCUMENT",
-        )
+            budget_guard=self.budget_guard,
+        ).vectors
 
-        dims = self.store.embedding_space().dims
-        splitter_ver = self.store.embedding_space().splitter_version or getattr(self.splitter, "version", "1.0.0")
+        uses_tokens = self.store.capabilities().uses_analyzer_tokens
+        emb_sig = embedding_signature(self.profile.models.embedding, self.store.embedding_space(), self.splitter)
+        fts_sig = fts_signature(self.analyzer, uses_tokens)
+        stage_usage = tracker.stage_usages[0] if tracker.stage_usages else None
 
+        prepared: list[PreparedNode[MetaT]] = []
         for idx, node in enumerate(nodes):
             node_copy = node.model_copy()
-            node_copy.token_estimate = estimate_tokens(node_copy.text)
-            if self.store.capabilities().uses_analyzer_tokens:
-                node_copy.search_tokens = self.analyzer.tokenize(node_copy.text)
-
-            embed_text = self.renderer.embed_text(node_copy)
-            content_hash = hashlib.sha256(self.analyzer.normalize(embed_text).encode("utf-8")).hexdigest()
-            node_copy.content_hash = content_hash
-
-            emb_sig = f"{self.profile.models.embedding}|{dims}|RETRIEVAL_DOCUMENT|{splitter_ver}"
-            fts_sig = f"{self.analyzer.name}|{self.analyzer.version}" if self.store.capabilities().uses_analyzer_tokens else None
-            fp = Fingerprint(
-                content_hash=content_hash,
-                embedding_signature=emb_sig,
-                fts_signature=fts_sig,
-            )
-
-            raw_vec = emb_res.vectors[idx] if idx < len(emb_res.vectors) else []
-            # Failed / zero vector rule (RAG-ING-4, AC-RAG-71): return [], never zero vector
-            if not raw_vec or all(v == 0.0 for v in raw_vec):
-                vec = []
-            else:
-                vec = raw_vec
-
-            stage_u = tracker.stage_usages[0] if tracker.stage_usages else None
+            finalize_node(node_copy, self.renderer, self.analyzer, uses_tokens)
+            vector = vectors[idx] if idx < len(vectors) else []
             prepared.append(
                 PreparedNode[MetaT](
                     node=node_copy,
-                    vector=vec,
-                    fingerprint=fp,
-                    usage=stage_u,
+                    vector=[] if is_zero_vector(vector) else vector,
+                    fingerprint=Fingerprint(
+                        content_hash=node_copy.content_hash,
+                        embedding_signature=emb_sig,
+                        fts_signature=fts_sig,
+                    ),
+                    usage=stage_usage,
                 )
             )
-
         return prepared
-
-    def _legacy_prepare_nodes(
-        self,
-        document_id: str,
-        text: str,
-        metadata: MetaT | None = None,
-        section_id: str = "main",
-        chunk_size: int = 600,
-        chunk_overlap: int = 50,
-    ) -> list[RAGNode[MetaT]]:
-        """Slice document into chunked RAGNode items with character offsets."""
-        nodes: list[RAGNode[MetaT]] = []
-        pos = 0
-        order = 0
-        length = len(text)
-
-        while pos < length:
-            end = min(pos + chunk_size, length)
-            chunk_str = text[pos:end]
-            node = RAGNode[MetaT](
-                id=f"{document_id}_{section_id}_{order}",
-                document_id=document_id,
-                section_id=section_id,
-                order_index=order,
-                text=chunk_str,
-                span=SourceSpan(
-                    char_start=pos,
-                    char_end=end,
-                    position_ratio=pos / length if length > 0 else 0.0,
-                ),
-                metadata=metadata,
-            )
-            nodes.append(node)
-            order += 1
-            if end >= length:
-                break
-            pos = end - chunk_overlap
-
-        return nodes
 
     def needs_reindex(self, doc_id: str) -> ReindexStatus:
         """Check whether stored embeddings or FTS tokens are stale (§6.6, AC-RAG-64)."""
-        stored_fps = self.store.get_fingerprints(doc_id)
-        if not stored_fps:
-            return ReindexStatus(doc_id=doc_id, embeddings_stale=False, fts_stale=False)
-
-        dims = self.store.embedding_space().dims
-        splitter_ver = self.store.embedding_space().splitter_version or getattr(self.splitter, "version", "1.0.0")
-        expected_emb_sig = f"{self.profile.models.embedding}|{dims}|RETRIEVAL_DOCUMENT|{splitter_ver}"
-        expected_fts_sig = f"{self.analyzer.name}|{self.analyzer.version}" if self.store.capabilities().uses_analyzer_tokens else None
-
-        emb_stale = False
-        fts_stale = False
-
-        for fp in stored_fps.values():
-            if fp.embedding_signature != expected_emb_sig:
-                emb_stale = True
-            if self.store.capabilities().uses_analyzer_tokens and fp.fts_signature != expected_fts_sig:
-                fts_stale = True
-
+        stored = self.store.get_fingerprints(doc_id)
+        uses_tokens = self.store.capabilities().uses_analyzer_tokens
+        expected_embedding = embedding_signature(
+            self.profile.models.embedding, self.store.embedding_space(), self.splitter
+        )
+        expected_fts = fts_signature(self.analyzer, uses_tokens)
         return ReindexStatus(
             doc_id=doc_id,
-            embeddings_stale=emb_stale,
-            fts_stale=fts_stale,
+            embeddings_stale=any(fp.embedding_signature != expected_embedding for fp in stored.values()),
+            fts_stale=uses_tokens and any(fp.fts_signature != expected_fts for fp in stored.values()),
         )
-
-    def _build_effective_filters(
-        self,
-        request: RAGQueryRequest,
-        intent: QueryIntent | None = None,
-    ) -> RAGFilterSpec:
-        """Combine request-level filters, document_id, tenant_id, and resolved temporal dates."""
-        f = request.filters.model_copy() if request.filters else RAGFilterSpec()
-        if request.tenant_id and not f.tenant_id:
-            f.tenant_id = request.tenant_id
-        if request.document_id and not f.document_ids:
-            f.document_ids = [request.document_id]
-
-        # Apply soft date window from intent if caller did not provide date_range_utc (§7.6, AC-RAG-17)
-        if intent is not None and getattr(intent, "has_time_expression", False) and f.date_range_utc is None:
-            start_dt = getattr(intent, "range_start_utc", None)
-            end_dt = getattr(intent, "range_end_utc", None)
-            if start_dt or end_dt:
-                f.date_range_utc = (start_dt, end_dt)
-
-        return f

@@ -1,13 +1,19 @@
 """Deduplication post-retrieval stages (§9.2, §9.3, AC-RAG-32, AC-RAG-33)."""
 from __future__ import annotations
 
-from typing import Any, Callable, Generic
-from ..granularity import TRAIT_OFFSET_ADDRESSABLE, has_trait
+from typing import Any, Callable, ClassVar, Generic
+from ..granularity import GRANULARITY_FULL_DOC, GRANULARITY_LOCAL_WINDOW, TRAIT_OFFSET_ADDRESSABLE, has_trait
 from ..models import MetaT, RAGNode
 
 
 class IdentityDeduplicator(Generic[MetaT]):
     """Deduplicates by key (default node id or url), preserving highest score (AC-RAG-33)."""
+    name: ClassVar[str] = "identity_dedup"
+    version: ClassVar[str] = "1.0.0"
+    accepts_score_kinds: ClassVar[frozenset[str] | None] = None
+
+    def process(self, nodes: list[RAGNode[MetaT]], ctx: Any) -> list[RAGNode[MetaT]]:
+        return self.deduplicate(nodes)
 
     def __init__(self, key: str | Callable[[RAGNode[MetaT]], Any] | None = None) -> None:
         self.key = key
@@ -16,19 +22,13 @@ class IdentityDeduplicator(Generic[MetaT]):
         if callable(self.key):
             return self.key(node)
         if isinstance(self.key, str):
-            # Try metadata attribute or dict key, fallback to node attribute
             meta = node.metadata
-            if meta is not None:
-                if isinstance(meta, dict) and self.key in meta:
-                    return meta[self.key]
-                if hasattr(meta, self.key):
-                    val = getattr(meta, self.key)
-                    if val is not None:
-                        return val
-            if hasattr(node, self.key):
-                return getattr(node, self.key)
-            return node.id
-        return node.id
+            value = meta.get(self.key) if isinstance(meta, dict) else getattr(meta, self.key, None)
+            if value is None:
+                value = (getattr(meta, "extra", None) or {}).get(self.key)
+            if value is not None:
+                return value
+        return node.node_id
 
     def deduplicate(self, nodes: list[RAGNode[MetaT]]) -> list[RAGNode[MetaT]]:
         seen: dict[Any, RAGNode[MetaT]] = {}
@@ -55,15 +55,21 @@ class OffsetDeduplicator(Generic[MetaT]):
     Removes any node at least 80% covered by an already-kept node with higher priority.
     Priority order: full_doc > local_window > higher-scored passage.
     """
+    name: ClassVar[str] = "offset_dedup"
+    version: ClassVar[str] = "1.0.0"
+    accepts_score_kinds: ClassVar[frozenset[str] | None] = None
+
+    def process(self, nodes: list[RAGNode[MetaT]], ctx: Any) -> list[RAGNode[MetaT]]:
+        return self.deduplicate(nodes)
 
     def __init__(self, threshold: float = 0.80) -> None:
         self.threshold = threshold
 
     def _priority(self, node: RAGNode[MetaT]) -> tuple[int, float]:
         gran = node.granularity
-        if gran == "full_doc":
+        if gran == GRANULARITY_FULL_DOC:
             p = 3
-        elif gran == "local_window":
+        elif gran == GRANULARITY_LOCAL_WINDOW:
             p = 2
         else:
             p = 1
@@ -97,7 +103,7 @@ class OffsetDeduplicator(Generic[MetaT]):
             covered = False
 
             for acc in accepted:
-                if acc.span and acc.document_id == cand.document_id:
+                if acc.span and acc.span.doc_id == cand.span.doc_id:
                     a_start = acc.span.char_start
                     a_end = acc.span.char_end
                     if a_start is not None and a_end is not None and a_end > a_start:
@@ -113,5 +119,5 @@ class OffsetDeduplicator(Generic[MetaT]):
                 accepted.append(cand)
 
         # Restore original input order of accepted nodes
-        accepted_ids = {n.id for n in accepted}
-        return [n for n in nodes if n.id in accepted_ids]
+        accepted_ids = {n.node_id for n in accepted}
+        return [n for n in nodes if n.node_id in accepted_ids]

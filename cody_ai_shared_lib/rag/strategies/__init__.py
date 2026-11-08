@@ -15,6 +15,7 @@ __all__ = [
     "FullContextStrategy",
     "DenseVectorStrategy",
     "HybridRRFStrategy",
+    "HierarchicalStrategy",
     "KeywordOnlyStrategy",
     "KeywordFirstStrategy",
     "AdaptiveStrategy",

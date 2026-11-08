@@ -1,74 +1,66 @@
-"""Direct single-turn stuff generation strategy (§11.1, AC-RAG-39)."""
+"""Generation strategy port and the single-call `stuff` strategy (§10.6, AC-RAG-39)."""
 from __future__ import annotations
 
-import re
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, ClassVar, Iterator, Protocol, runtime_checkable
+
+from ...llm import LLMResult
+from ..context.assembler import AssembledPrompt
 from ..degradation import DegradationTracker
 from ..gateway import ModelGateway
-from ...llm import LLMResult
 from ..profile import EngineProfile
 from ..usage import BudgetGuard, UsageTracker
 
 
+@dataclass
+class GenerationContext:
+    """Per-request collaborators for one generation call."""
+    usage_tracker: UsageTracker
+    degradation_tracker: DegradationTracker
+    budget_guard: BudgetGuard | None = None
+    request_id: str = ""
+    tenant_or_user_id: str | None = None
+    stage: str = "generation"
+
+
+@runtime_checkable
+class GenerationStrategy(Protocol):
+    name: str
+    version: str
+
+    def generate(self, prompt: AssembledPrompt[Any], ctx: GenerationContext) -> LLMResult:
+        ...
+
+    def stream(self, prompt: AssembledPrompt[Any], ctx: GenerationContext) -> Iterator[Any]:
+        ...
+
+
 class StuffStrategy:
-    """Passes full assembled context to generation model in a single call."""
+    """Passes the full assembled context to the generation models in a single call."""
+    name: ClassVar[str] = "stuff"
+    version: ClassVar[str] = "1.0.0"
 
     def __init__(self, gateway: ModelGateway, profile: EngineProfile):
         self.gateway = gateway
         self.profile = profile
 
-    def generate(
-        self,
-        system_prompt: str,
-        user_message: str,
-        usage_tracker: UsageTracker,
-        degradation_tracker: DegradationTracker,
-        budget_guard: BudgetGuard | None = None,
-        request_id: str = "",
-        tenant_or_user_id: str | None = None,
-    ) -> LLMResult:
-        """Call generation models in profile fallback order."""
-        models = self.profile.models.generation
-        temperature = self.profile.generation.temperature
+    def _call_args(self, prompt: AssembledPrompt[Any], ctx: GenerationContext) -> dict[str, Any]:
+        return {
+            "system_prompt": prompt.system_prompt,
+            "user_message": prompt.user_message,
+            "models": self.profile.models.generation,
+            "stage": ctx.stage,
+            "usage_tracker": ctx.usage_tracker,
+            "degradation_tracker": ctx.degradation_tracker,
+            "budget_guard": ctx.budget_guard,
+            "temperature": self.profile.generation.temperature,
+            "cache_breakpoints": prompt.cache_breakpoints,
+            "request_id": ctx.request_id,
+            "tenant_or_user_id": ctx.tenant_or_user_id,
+        }
 
-        return self.gateway.generate(
-            system_prompt=system_prompt,
-            user_message=user_message,
-            models=models,
-            stage="generation",
-            usage_tracker=usage_tracker,
-            degradation_tracker=degradation_tracker,
-            budget_guard=budget_guard,
-            temperature=temperature,
-            request_id=request_id,
-            tenant_or_user_id=tenant_or_user_id,
-        )
+    def generate(self, prompt: AssembledPrompt[Any], ctx: GenerationContext) -> LLMResult:
+        return self.gateway.generate(**self._call_args(prompt, ctx))
 
-    def stream(
-        self,
-        system_prompt: str,
-        user_message: str,
-        usage_tracker: UsageTracker,
-        degradation_tracker: DegradationTracker,
-        budget_guard: BudgetGuard | None = None,
-        cache_breakpoints: list[int] | None = None,
-        request_id: str = "",
-        tenant_or_user_id: str | None = None,
-    ) -> Any:
-        """Stream generation through ordered model fallback list."""
-        models = self.profile.models.generation
-        temperature = self.profile.generation.temperature
-
-        return self.gateway.stream(
-            system_prompt=system_prompt,
-            user_message=user_message,
-            models=models,
-            stage="generation",
-            usage_tracker=usage_tracker,
-            degradation_tracker=degradation_tracker,
-            budget_guard=budget_guard,
-            temperature=temperature,
-            cache_breakpoints=cache_breakpoints,
-            request_id=request_id,
-            tenant_or_user_id=tenant_or_user_id,
-        )
+    def stream(self, prompt: AssembledPrompt[Any], ctx: GenerationContext) -> Iterator[Any]:
+        return self.gateway.stream(**self._call_args(prompt, ctx))

@@ -1,4 +1,4 @@
-"""BatchEmbedder for embedding RAG nodes and text through ModelGateway.
+"""BatchEmbedder for embedding RAG nodes and text through ModelGateway (§6.4).
 
 Implements:
   - Batching and token usage tracking via ModelGateway.embed
@@ -10,23 +10,17 @@ from __future__ import annotations
 import logging
 from typing import Generic, TypeVar
 
-from .degradation import DegradationTracker
-from .errors import EmbeddingProviderError
-from .gateway import ModelGateway
-from .models import MetaT, RAGNode
-from .render import DefaultNodeRenderer, NodeRenderer
-from .usage import UsageTracker
+from ..degradation import DegradationTracker
+from ..errors import EmbeddingProviderError
+from ..gateway import ModelGateway
+from ..models import MetaT, RAGNode
+from ..render import DefaultRenderer, NodeRenderer
+from ..usage import BudgetGuard, UsageTracker
+from ..vectors import is_zero_vector
 
-logger = logging.getLogger("shared-rag.ingestion")
+logger = logging.getLogger("shared-rag")
 
 T = TypeVar("T")
-
-
-def _is_zero_vector(vec: list[float]) -> bool:
-    """Return True if all components of the vector are zero (failed embedding marker)."""
-    if not vec:
-        return True
-    return all(v == 0.0 for v in vec)
 
 
 class BatchEmbedder(Generic[MetaT]):
@@ -43,7 +37,7 @@ class BatchEmbedder(Generic[MetaT]):
         self.gateway = gateway
         self.model = model
         self.batch_size = batch_size
-        self.renderer = renderer or DefaultNodeRenderer()
+        self.renderer = renderer or DefaultRenderer()
         self.task_type = task_type
 
     def embed_nodes(
@@ -52,6 +46,7 @@ class BatchEmbedder(Generic[MetaT]):
         usage_tracker: UsageTracker,
         degradation_tracker: DegradationTracker | None = None,
         stage: str = "ingest_embedding",
+        budget_guard: BudgetGuard | None = None,
     ) -> list[tuple[RAGNode[MetaT], list[float]]]:
         """Embed nodes and return valid (node, vector) pairs.
 
@@ -65,7 +60,6 @@ class BatchEmbedder(Generic[MetaT]):
         embed_texts = [self.renderer.embed_text(n) for n in nodes]
         all_vectors: list[list[float]] = []
 
-        # Batch embed calls
         for i in range(0, len(embed_texts), self.batch_size):
             batch = embed_texts[i : i + self.batch_size]
             emb_res = self.gateway.embed(
@@ -73,22 +67,22 @@ class BatchEmbedder(Generic[MetaT]):
                 model=self.model,
                 stage=stage,
                 usage_tracker=usage_tracker,
+                degradation_tracker=degradation_tracker,
+                budget_guard=budget_guard,
                 task_type=self.task_type,
             )
             all_vectors.extend(emb_res.vectors)
 
-        # Check for zero vectors (RAG-ING-4)
         zero_indices: list[int] = []
         valid_pairs: list[tuple[RAGNode[MetaT], list[float]]] = []
 
         for idx, (node, vec) in enumerate(zip(nodes, all_vectors)):
-            if _is_zero_vector(vec):
+            if is_zero_vector(vec):
                 zero_indices.append(idx)
             else:
                 valid_pairs.append((node, vec))
 
         if len(zero_indices) == len(nodes):
-            # All nodes failed in non-empty input
             raise EmbeddingProviderError(
                 f"All {len(nodes)} embedding vectors were zero from model '{self.model}'",
                 stage=stage,

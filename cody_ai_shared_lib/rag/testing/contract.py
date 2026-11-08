@@ -7,16 +7,11 @@ Provides:
 from __future__ import annotations
 
 import concurrent.futures
-from datetime import datetime, timezone
 from typing import Any
 
 import pytest
 
-from ..errors import (
-    EmbeddingProviderError,
-    MissingRequiredScopeError,
-    UnsupportedFilterError,
-)
+from ..errors import EmbeddingProviderError, MissingRequiredScopeError
 from ..models import (
     DefaultNodeMeta,
     RAGFilterSpec,
@@ -25,9 +20,7 @@ from ..models import (
 )
 from ..ports import (
     EmbeddingSpace,
-    Fingerprint,
     RAGStore,
-    ScopeStats,
     StoreCapabilities,
 )
 from ..text.analyzer import TokenGroup
@@ -93,6 +86,28 @@ class RAGStoreContractTests:
         # sequential boundary
         res_bound = store.vector_search(vec, RAGFilterSpec(doc_ids=["doc1"], max_char_offset=0), top_k=5)
         assert len(res_bound) == 0
+
+    def test_check_1b_local_window_honours_filters_and_offsets(self):
+        store = self.make_store()
+        if not store.capabilities().supports_local_window:
+            return
+        text = "abcdefghijklmnopqrst"
+        first = RAGNode(
+            node_id="w1", text=text[:12], span=SourceSpan(doc_id="w_doc", char_start=0, char_end=12),
+            metadata=DefaultNodeMeta(extra={"tenant_id": "t1"}),
+        )
+        second = RAGNode(
+            node_id="w2", text=text[8:], span=SourceSpan(doc_id="w_doc", char_start=8, char_end=20),
+            metadata=DefaultNodeMeta(extra={"tenant_id": "t1"}),
+        )
+        store.upsert_section_nodes("w_doc", 0, [first, second], [[0.1] * 768, [0.1] * 768])
+
+        windows = store.fetch_local_window("w_doc", 10, 8, RAGFilterSpec(doc_ids=["w_doc"]))
+        assert len(windows) == 1
+        window = windows[0]
+        assert window.text == text[window.span.char_start:window.span.char_end], "overlap must not repeat text"
+
+        assert store.fetch_local_window("w_doc", 10, 8, RAGFilterSpec(tenant_or_user_id="other")) == []
 
     # ── Check 2: Required scope enforced ───────────────────────────────────────
     def test_check_2_required_scope_enforced(self):
@@ -260,6 +275,7 @@ class RAGStoreContractTests:
         res = store.keyword_search("李小明", RAGFilterSpec(), top_k=5, analyzer_tokens=[group])
         assert len(res) >= 1
         assert res[0].node_id == "full_n"
+        assert all(hit.node_id != "part_n" for hit in res), "a phrase group must not match part of the name"
 
     # ── Check 14: Snippets arrived unchanged ───────────────────────────────────
     def test_check_14_snippets_arrive_unchanged(self):

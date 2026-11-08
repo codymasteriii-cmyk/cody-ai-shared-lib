@@ -3,53 +3,17 @@
 Provides:
   - TextAnalyzer Protocol
   - CjkAwareAnalyzer default implementation (bigrams for CJK, lower-cased words for Latin)
-  - estimate_tokens: 1.0 token/CJK char, 0.25 token/other char, +10%
+  - estimate_tokens: 1.0 token/CJK char, 0.25 token/other char, +10% (from cody_ai_shared_lib.tokens)
   - TokenGroup & build_tsquery for PostgreSQL full-text search query construction
 """
 from __future__ import annotations
 
-import math
 import re
 import unicodedata
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol, Sequence, runtime_checkable
 from pydantic import BaseModel
 
-
-def is_cjk_char(ch: str) -> bool:
-    """Return True if character falls in CJK Unified Ideographs, Kana, Hangul, or related ranges."""
-    cp = ord(ch)
-    return (
-        0x4E00 <= cp <= 0x9FFF          # CJK Unified Ideographs
-        or 0x3400 <= cp <= 0x4DBF      # CJK Unified Ideographs Extension A
-        or 0x20000 <= cp <= 0x2A6DF    # Extension B
-        or 0x2A700 <= cp <= 0x2B73F    # Extension C
-        or 0x2B740 <= cp <= 0x2B81F    # Extension D
-        or 0x2B820 <= cp <= 0x2CEAF    # Extension E
-        or 0xF900 <= cp <= 0xFAFF      # CJK Compatibility Ideographs
-        or 0x2F800 <= cp <= 0x2FA1F    # Compatibility Supplement
-        or 0x3040 <= cp <= 0x309F      # Hiragana
-        or 0x30A0 <= cp <= 0x30FF      # Katakana
-        or 0xAC00 <= cp <= 0xD7AF      # Hangul Syllables
-    )
-
-
-def estimate_tokens(text: str) -> int:
-    """Estimate token count for text.
-
-    CJK characters count 1.0 token each; other characters count 0.25 each; then +10%.
-    Returns an integer ceiling.
-    """
-    if not text:
-        return 0
-    cjk_count = 0
-    other_count = 0
-    for ch in text:
-        if is_cjk_char(ch):
-            cjk_count += 1
-        else:
-            other_count += 1
-    raw = cjk_count * 1.0 + other_count * 0.25
-    return math.ceil(raw * 1.10)
+from ...tokens import estimate_tokens, is_cjk_char  # estimate_tokens is public here (§2.5)
 
 
 @runtime_checkable
@@ -264,6 +228,38 @@ class TokenGroup(BaseModel):
     tokens: list[str]
     mode: Literal["any", "all", "phrase"]
     origin: Literal["free_text", "exact_term", "entity"] = "free_text"
+
+
+def tokenize_query_groups(
+    analyzer: TextAnalyzer,
+    query: str,
+    exact_terms: Sequence[str] | None = None,
+    entity_terms: Sequence[str] | None = None,
+    entity_mode: Literal["boost", "require", "ignore"] = "boost",
+) -> list[TokenGroup]:
+    """Tokenize a query and its exact/entity terms into TokenGroups per §6.1.
+
+    - Free-text query tokens become a 'free_text' group with mode='any'.
+    - Each exact_term becomes an 'exact_term' group with mode='phrase'.
+    - Each entity_term becomes an 'entity' group: mode='phrase' when required, 'all' when boosted.
+    """
+    groups: list[TokenGroup] = []
+    if query:
+        free_tokens = analyzer.tokenize(analyzer.normalize(query))
+        if free_tokens:
+            groups.append(TokenGroup(tokens=free_tokens, mode="any", origin="free_text"))
+    for term in exact_terms or []:
+        toks = analyzer.tokenize(analyzer.normalize(term))
+        if toks:
+            groups.append(TokenGroup(tokens=toks, mode="phrase", origin="exact_term"))
+    if entity_mode == "ignore":
+        return groups
+    entity_group_mode: Literal["phrase", "all"] = "phrase" if entity_mode == "require" else "all"
+    for ent in entity_terms or []:
+        toks = analyzer.tokenize(analyzer.normalize(ent))
+        if toks:
+            groups.append(TokenGroup(tokens=toks, mode=entity_group_mode, origin="entity"))
+    return groups
 
 
 def build_tsquery(groups: list[TokenGroup]) -> str:

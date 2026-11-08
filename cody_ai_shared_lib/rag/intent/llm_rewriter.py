@@ -2,7 +2,7 @@
 
 Parses structured query intent with:
   - Robust JSON decoding with repair
-  - DG-05 validation and value clamping ([1, 3650] days, [1, 50] top_k, list capping)
+  - DG-05 validation and value clamping ([1, 3650] days, [1, 30] top_k, list capping)
   - DG-04 retry and fallback across model list on parse failure
   - Temporal integration with TemporalExtractor
 """
@@ -14,13 +14,13 @@ import re
 from typing import Any
 
 from ..degradation import DegradationTracker
-from ..errors import IntentParseError
+from ..errors import BudgetExceeded, IntentParseError
 from ..gateway import ModelGateway
-from ..models import QueryIntent
-from ..usage import UsageTracker
+from ..models import NoIntentExt, QueryIntent
+from ..usage import BudgetGuard, UsageTracker
 from .temporal import TemporalExtractor
 
-logger = logging.getLogger("rag-intent-llm")
+logger = logging.getLogger("shared-rag.router")
 
 INTENT_SYSTEM_PROMPT = """You are a query analysis assistant for a retrieval-augmented generation engine.
 Analyze the user's question and any conversation history. Return a JSON object with these exact keys:
@@ -38,13 +38,14 @@ Analyze the user's question and any conversation history. Return a JSON object w
   "entity_terms": ["<proper nouns or specialized entities>", ...],
   "entity_mode": "boost" | "require" | "ignore",
   "exact_terms": ["<quoted or exact code phrases>", ...],
+  "negation": false,
   "suggested_top_k": 8
 }
 Output strictly valid JSON and nothing else."""
 
 
 def clamp_intent(raw: dict[str, Any], tracker: DegradationTracker | None = None) -> QueryIntent:
-    """Validate and clamp intent facets into allowable ranges (§7.5, DG-05, AC-RAG-16)."""
+    """Validate and clamp intent facets into allowable ranges (§7.1, §7.5, DG-05, AC-RAG-15, AC-RAG-16)."""
     route = raw.get("route", "rag")
     if route not in ("rag", "no_retrieval"):
         if tracker:
@@ -57,7 +58,7 @@ def clamp_intent(raw: dict[str, Any], tracker: DegradationTracker | None = None)
             tracker.record("DG-05", "intent", f"Invalid scope '{scope}' clamped to 'local_lookup'", "Value clamped")
         scope = "local_lookup"
 
-    # Clamp top_k to [1, 50]
+    # Clamp suggested_top_k to [1, 30] per §7.1
     top_k = raw.get("suggested_top_k")
     if top_k is not None:
         try:
@@ -66,10 +67,10 @@ def clamp_intent(raw: dict[str, Any], tracker: DegradationTracker | None = None)
                 if tracker:
                     tracker.record("DG-05", "intent", f"suggested_top_k {top_k_int} < 1 clamped to 1", "Value clamped")
                 top_k = 1
-            elif top_k_int > 50:
+            elif top_k_int > 30:
                 if tracker:
-                    tracker.record("DG-05", "intent", f"suggested_top_k {top_k_int} > 50 clamped to 50", "Value clamped")
-                top_k = 50
+                    tracker.record("DG-05", "intent", f"suggested_top_k {top_k_int} > 30 clamped to 30", "Value clamped")
+                top_k = 30
             else:
                 top_k = top_k_int
         except (ValueError, TypeError):
@@ -112,6 +113,12 @@ def clamp_intent(raw: dict[str, Any], tracker: DegradationTracker | None = None)
             tracker.record("DG-05", "intent", f"entity_terms size {len(entities)} capped to 8", "List capped")
         entities = entities[:8]
 
+    exact_list = [str(t).strip() for t in raw.get("exact_terms") or [] if str(t).strip()]
+    if len(exact_list) > 8:
+        if tracker:
+            tracker.record("DG-05", "intent", f"exact_terms size {len(exact_list)} capped to 8", "List capped")
+        exact_list = exact_list[:8]
+
     temp_scope = raw.get("temporal_scope", "none")
     if temp_scope not in ("none", "recent", "historical", "specific_range"):
         temp_scope = "none"
@@ -119,6 +126,18 @@ def clamp_intent(raw: dict[str, Any], tracker: DegradationTracker | None = None)
     entity_mode = raw.get("entity_mode", "boost")
     if entity_mode not in ("boost", "require", "ignore"):
         entity_mode = "boost"
+
+    router_source = str(raw.get("router_source") or "llm")
+    ext_val = raw.get("ext")
+    if ext_val is None or isinstance(ext_val, dict) and not ext_val:
+        ext_obj: Any = NoIntentExt()
+    else:
+        ext_obj = ext_val
+
+    try:
+        risk = max(0.0, min(1.0, float(raw.get("beyond_boundary_risk") or 0.0)))
+    except (ValueError, TypeError):
+        risk = 0.0
 
     return QueryIntent(
         route=route,
@@ -135,23 +154,24 @@ def clamp_intent(raw: dict[str, Any], tracker: DegradationTracker | None = None)
         range_end_utc=raw.get("range_end_utc"),
         entity_terms=[str(e).strip() for e in entities if str(e).strip()],
         entity_mode=entity_mode,
-        exact_terms=[str(t).strip() for t in raw.get("exact_terms") or [] if str(t).strip()][:8],
+        exact_terms=exact_list,
+        negation=bool(raw.get("negation", False)),
         suggested_top_k=top_k,
-        router_source="llm",
+        beyond_boundary_risk=risk,
+        router_source=router_source,
+        ext=ext_obj,
     )
 
 
 def extract_json_block(text: str) -> dict[str, Any] | None:
     """Extract JSON object from markdown code fence or raw string."""
     clean = text.strip()
-    # Strip markdown code blocks ```json ... ```
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", clean, re.DOTALL)
     if match:
         clean = match.group(1)
     elif clean.startswith("{") and clean.endswith("}"):
         pass
     else:
-        # Search for first { and matching }
         start = clean.find("{")
         end = clean.rfind("}")
         if start != -1 and end != -1 and end > start:
@@ -185,11 +205,15 @@ class LLMIntentRouter:
         usage_tracker: UsageTracker,
         degradation_tracker: DegradationTracker,
         history: list[dict[str, str]] | None = None,
+        budget_guard: BudgetGuard | None = None,
     ) -> QueryIntent:
         """Route query using LLM with DG-04 retry and DG-05 clamping."""
         user_msg = f"Question: {query}"
         if history:
-            history_str = "\n".join(f"{h.get('role', 'user')}: {h.get('text', '')}" for h in history[-3:])
+            history_str = "\n".join(
+                f"{h.get('role', 'user')}: {h.get('content') or h.get('text') or ''}"
+                for h in history[-3:]
+            )
             user_msg = f"Recent conversation:\n{history_str}\n\nQuestion: {query}"
 
         last_raw_text = ""
@@ -203,12 +227,13 @@ class LLMIntentRouter:
                         stage="intent_llm",
                         usage_tracker=usage_tracker,
                         degradation_tracker=degradation_tracker,
+                        budget_guard=budget_guard,
                         temperature=0.0,
+                        optional=False,
                     )
                     last_raw_text = res.text
                     parsed = extract_json_block(res.text)
                     if parsed is not None:
-                        # Extract temporal facets if configured
                         if self.temporal_extractor and not parsed.get("range_start_utc"):
                             temp_info = self.temporal_extractor.extract(query)
                             if temp_info.get("has_time_expression"):
@@ -227,6 +252,8 @@ class LLMIntentRouter:
                         fallback_used="retry" if attempt == 0 else "next_model",
                         impact="Retrying intent parsing",
                     )
+                except BudgetExceeded:
+                    raise
                 except Exception as exc:
                     degradation_tracker.record(
                         dg_id="DG-04",

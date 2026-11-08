@@ -16,6 +16,7 @@ from cody_ai_shared_lib.rag import (
     RAGStreamEvent,
     RAGEngine,
     SourceSpan,
+    ModelGateway,
     format_event,
     long_form_reader,
 )
@@ -39,7 +40,7 @@ def _setup_streaming_engine():
         embedding_space=EmbeddingSpace(model="gemini-embedding-2", dims=768)
     )
     mock_gw = MagicMock()
-    mock_gw.embed.side_effect = lambda texts, model, stage, usage_tracker, task_type="RETRIEVAL_DOCUMENT": MagicMock(
+    mock_gw.embed.side_effect = lambda texts, model, stage, usage_tracker, task_type="RETRIEVAL_DOCUMENT", **_: MagicMock(
         vectors=[[0.05] * 768 for _ in texts],
         usage=MagicMock(input_tokens=len(texts) * 10, cost_usd=0.0001, cached_tokens=0, price_table_version="v2026-11-08", estimated=False),
     )
@@ -70,7 +71,7 @@ def test_stream_query_event_order_and_payloads():
     )
     engine.ingest_document(doc)
 
-    req = RAGQueryRequest(query="What is the text?", document_id="doc-stream-1")
+    req = RAGQueryRequest(question="What is the text?", document_id="doc-stream-1")
     stream = engine.stream_query(req)
 
     events: list[RAGStreamEvent] = list(stream)
@@ -93,7 +94,23 @@ def test_stream_query_event_order_and_payloads():
 
 def test_stream_cancel_records_usage():
     """AC-RAG-70, RAG-OPS-2: Cancelled stream records spend through RAGStream.usage_total."""
-    engine, store, mock_gw = _setup_streaming_engine()
+    def _infinite_stream(*args, **kwargs):
+        yield LLMStreamChunk(delta="Chunk 1 ", usage=None, finish_reason=None)
+        yield LLMStreamChunk(delta="Chunk 2 ", usage=None, finish_reason=None)
+        yield LLMStreamChunk(delta="Chunk 3 ", usage=None, finish_reason=None)
+
+    embedder = MagicMock()
+    embedder.embed_with_usage.side_effect = lambda texts, task_type: MagicMock(
+        vectors=[[0.05] * 768 for _ in texts] if isinstance(texts, list) else [[0.05] * 768],
+        usage=MagicMock(input_tokens=1, cost_usd=0.0, price_table_version="v", estimated=True),
+    )
+    llm = MagicMock()
+    llm.stream.side_effect = _infinite_stream
+    profile = long_form_reader(
+        models=ModelBindings(generation=["gemini-3.5-flash-lite"], summary=["gemini-3.5-flash-lite"], embedding="gemini-embedding-2"),
+    )
+    store = InMemoryRAGStore(embedding_space=EmbeddingSpace(model="gemini-embedding-2", dims=768))
+    engine = RAGEngine(profile=profile, store=store, gateway=ModelGateway(llm_client=llm, embedding_client=embedder))
 
     doc = RAGDocumentInput(
         doc_id="doc-cancel-1",
@@ -101,15 +118,7 @@ def test_stream_cancel_records_usage():
     )
     engine.ingest_document(doc)
 
-    def _infinite_stream(*args, **kwargs):
-        yield LLMStreamChunk(delta="Chunk 1 ", usage=None, finish_reason=None)
-        yield LLMStreamChunk(delta="Chunk 2 ", usage=None, finish_reason=None)
-        yield LLMStreamChunk(delta="Chunk 3 ", usage=None, finish_reason=None)
-
-    mock_gw.stream.side_effect = _infinite_stream
-    mock_gw.llm_client.stream.side_effect = _infinite_stream
-
-    req = RAGQueryRequest(query="Query", document_id="doc-cancel-1")
+    req = RAGQueryRequest(question="Query", document_id="doc-cancel-1")
     stream = engine.stream_query(req)
 
     # Consume first events including two deltas
@@ -195,7 +204,7 @@ def test_canary_sequential_boundary():
 
     boundary = 800
     req = RAGQueryRequest(
-        query="What happened?",
+        question="What happened?",
         document_id="novel-canary",
         filters=RAGFilterSpec(max_char_offset=boundary),
         guards=[SequentialBoundaryGuard(max_char_offset=boundary)],

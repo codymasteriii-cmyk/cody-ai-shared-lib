@@ -12,6 +12,10 @@ TRAIT_OFFSET_ADDRESSABLE = "offset_addressable"
 TRAIT_RERANKABLE = "rerankable"
 TRAIT_SUMMARY = "summary"
 
+# Two built-ins have identical traits, yet §9.2 and §10.1 treat them differently, so they are named.
+GRANULARITY_FULL_DOC = "full_doc"
+GRANULARITY_LOCAL_WINDOW = "local_window"
+
 # Built-in granularities and their immutable trait sets
 BUILTIN_GRANULARITIES: dict[str, set[str]] = {
     "passage": {TRAIT_OFFSET_ADDRESSABLE, TRAIT_RERANKABLE},

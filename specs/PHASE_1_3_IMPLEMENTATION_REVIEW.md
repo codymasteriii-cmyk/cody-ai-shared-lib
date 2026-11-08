@@ -14,7 +14,7 @@ The `cody_ai_shared_lib.rag` package provides a unified, object-oriented, produc
 1. **DB-Free Core with Inversion of Control (D-01, D-02)**: The engine contains zero database drivers, SQL connections, or migrations. The data access contract is defined by the `RAGStore` protocol. Apps implement adapters (or use the provided reference PostgreSQL/pgvector SQL templates in `cody_ai_shared_lib/rag/sql/`), verified against the built-in conformance suite (`InMemoryRAGStore`).
 2. **Stateless & Reentrant Facade (D-03)**: `RAGEngine` instances maintain no per-request state or cross-request session state. Turn state is encapsulated in `ConversationState`, safely passed to and from callers with size bounds and fence-checked cryptographic verification.
 3. **Hard vs. Soft Constraint Separation (D-04)**: Security boundaries (guards, tenant isolation, required scope keys, caller-specified filters) are strictly **hard** and can never be relaxed or bypassed. Inferred or intent-derived constraints (temporal windows, entity requirements, score thresholds) are **soft** and subject to the relaxation ladder.
-4. **Closed Degradation Model (DG-01 – DG-10, §13.3)**: Instead of silent degradation or unstructured exceptions, all edge-case fallbacks are governed by an agreed closed table of degradations recorded in `DegradationTracker` and surfaced in telemetry.
+4. **Closed Degradation Model (DG-01 – DG-14, §13.3)**: Instead of silent degradation or unstructured exceptions, all edge-case fallbacks are governed by an agreed closed table of degradations recorded in `DegradationTracker` and surfaced in telemetry.
 5. **Injected Runtime Determinism (RAG-EVAL-4)**: Clocks (`Clock`, `FrozenClock`), random number generators (`Rng`, `DeterministicRng`), and thread pools (`make_bounded_pool`) are strictly injected. The core never reads system time or global random state directly.
 6. **Pydantic v2 Modernization**: Fully native Pydantic v2 models with typed generics (`RAGNode[MetaT]`, `QueryIntent[ExtT]`), field validators, and explicit package discovery in `pyproject.toml`.
 
@@ -30,9 +30,9 @@ Phase P1 established the shared library-wide model infrastructure, core contract
   - Added support for multimodal input/output units: images (`/img`) and video/voice seconds (`/sec`).
   - Implemented `calculate_cost()` with estimated flags and price-table versioning.
 - **Provider Clients**:
-  - [`LLMClient`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/llm_client.py): Unified text generation client wrapping Google GenAI SDK, Anthropic API, and OpenAI API, returning structured usage (`UsageTotal`), cost in USD, and provider-normalized `finish_reason` (`"stop"`, `"length"`, `"content_filter"`).
+  - [`LLMClient`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/llm.py): Unified text generation client wrapping Google GenAI SDK, Anthropic API, and OpenAI API, returning structured usage (`UsageTotal`), cost in USD, and provider-normalized `finish_reason` (`"stop"`, `"length"`, `"safety"`, `"other"`).
   - [`JevClient`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/jev.py): Fast-path decision router with structured JSON extraction and latency tracking.
-  - [`JinaRerankerClient`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rerank.py): Isolated cross-encoder reranker calling Jina Rerank API with DG-06 degradation on network failure.
+  - [`RerankClient`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rerank.py): Isolated cross-encoder reranker calling Jina Rerank API with DG-06 degradation on network failure.
 
 ### 2.2 RAG Core Contracts & Data Models (`cody_ai_shared_lib/rag/`)
 - **Node & Metadata Models ([`models.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/models.py))**:
@@ -89,7 +89,7 @@ Phase P2 focused on long-form sequential content, audiobook chapter ingestion, a
 - **`LLMClient.stream()`**: Added native chunk streaming returning an iterator of token deltas, usage totals, and finish reason.
 - **Cache Breakpoints**: Enabled Anthropic prompt caching headers and Google GenAI cache breakpoints across long-form book system prompts.
 
-### 3.2 Text Splitters & Ingestion Lifecycle ([`text/`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/text/), [`embedder.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/embedder.py), [`summarizer.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/summarizer.py))
+### 3.2 Text Splitters & Ingestion Lifecycle ([`ingestion/`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/ingestion/), [`ingestion/splitter.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/ingestion/splitter.py), [`ingestion/embedder.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/ingestion/embedder.py), [`ingestion/summarizer.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/ingestion/summarizer.py))
 - **`SentenceSplitter`**:
   - Sentence-aligned text splitter with target chunk sizes (default 1,200 chars) and overlap (default 150 chars).
   - Preserves exact character offsets such that `original_text[chunk.local_start:chunk.local_end] == chunk.text`.
@@ -143,7 +143,7 @@ Created and verified 7 production PostgreSQL/pgvector reference SQL templates:
 
 Phase P3 migrated the high-throughput, dated news corpus capabilities: temporal intent resolution, soft-constraint relaxation ladders, comparative query fan-out, recency score boosting, multi-signal score fusion, snippet extraction, and 2,000-result feed search sizing.
 
-### 4.1 Pass-Through Splitter ([`splitter.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/text/splitter.py#L155), AC-RAG-03)
+### 4.1 Pass-Through Splitter ([`ingestion/splitter.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/ingestion/splitter.py), AC-RAG-03)
 - `PassThroughSplitter`: Ingests pre-chunked news articles or standalone paragraphs where each input unit corresponds to exactly one retrievable node, preserving exact offsets `[0, len(text)]`.
 
 ### 4.2 Temporal Query Extraction & Resolution ([`temporal.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/intent/temporal.py), AC-RAG-17)
@@ -163,7 +163,7 @@ Phase P3 migrated the high-throughput, dated news corpus capabilities: temporal 
   2. `drop_time_window`: If widened search still yields zero results, drops the temporal constraint entirely.
   3. Records all triggered relaxation steps in `retrieval.relaxations` (`["widen_time_window(x2)"]` or `["drop_time_window"]`).
 
-### 4.4 Secondary Query Fan-Out & Fair Interleaving ([`fanout.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/strategies/fanout.py), AC-RAG-19)
+### 4.4 Secondary Query Fan-Out & Fair Interleaving ([`strategies/transforms.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/strategies/transforms.py), AC-RAG-19)
 - For comparison queries (e.g. *"Compare Apple and Microsoft financials"*), `SecondaryQueryFanOut` extracts secondary query variants:
   - Variant 1: `Apple financial results` (weight 1.0)
   - Variant 2: `Microsoft financial results` (weight 1.0)
@@ -228,10 +228,11 @@ Verified build integrity in an isolated temp directory using `git archive`:
 
 ## 6. Complete Verification Matrix & Test Mapping
 
-The test suite contains **160 tests** across 16 test modules. All pass with **100% pass rate and 0 warnings** in ~4.4 seconds.
+The test suite contains **171 tests** across 17 test modules. All pass with **100% pass rate and 0 warnings** in ~4.5 seconds.
 
 | Test Module | Tests | Scope & Acceptance Criteria Covered |
 | :--- | :---: | :--- |
+| [`test_code_review_fixes.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/tests/rag/test_code_review_fixes.py) | 11 | Multi-turn conversation assembly & routing, scope_stats token estimation, parameterized built-in guards, pre-store filter validation, fencer zero-width/U+2039 scrubbing, unverified citation filtering/flagging, QuoteVerifier fabricated quote detection, OutputSanitizer host allowlist, `generate_from_nodes`/`verify_answer`/`with_profile`, JSONL snapshots, `diff_retrievals`, `InMemoryLRUCache` & query embedding cache, `tokenize_query_groups`, and `RecencyBooster` renderer metadata contract. |
 | [`test_contracts_and_models.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/tests/rag/test_contracts_and_models.py) | 10 | AC-RAG-40, 41, 46, 55, 56. Immutability, Pydantic v2 generics, Granularity registry. |
 | [`test_engine_pipeline.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/tests/rag/test_engine_pipeline.py) | 17 | AC-RAG-20, 25, 27, 28, 31, 32, 33, 34, 36, 37, 39, 43, 44, 47, 51. End-to-end query, dedup, rerank, hydration, grounding modes. |
 | [`test_gateway_profile_runtime.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/tests/rag/test_gateway_profile_runtime.py) | 16 | AC-RAG-26, 49, 50, 53, 57, 61, 62, 68, 69. Profile validation, budget guards, deadline enforcement, traces, clock/RNG determinism. |
@@ -248,7 +249,7 @@ The test suite contains **160 tests** across 16 test modules. All pass with **10
 | [`test_model_prerequisites.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/tests/test_model_prerequisites.py) | 16 | Existing model prerequisites and API key validation tests. |
 | [`test_pdf_text.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/tests/test_pdf_text.py) | 13 | Existing PDF text extraction tests. |
 | [`test_pricing.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/tests/test_pricing.py) | 13 | Central pricing catalog calculations, token counts, multimodal units, and overrides. |
-| **Total** | **160** | **All passing (100% pass rate, 0 failures, 0 warnings)** |
+| **Total** | **171** | **All passing (100% pass rate, 0 failures, 0 warnings)** |
 
 ---
 
@@ -271,9 +272,9 @@ The test suite contains **160 tests** across 16 test modules. All pass with **10
 3. **Retrieval Strategies**:
    - Tier 0 & Tier 1: [`strategies/dense_vector.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/strategies/dense_vector.py) and [`strategies/full_context.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/strategies/full_context.py).
    - Tier 2 & Tier 3: [`strategies/hybrid_rrf.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/strategies/hybrid_rrf.py) and [`strategies/hierarchical.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/strategies/hierarchical.py).
-   - Fan-Out & Comparison: [`strategies/fanout.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/strategies/fanout.py).
+   - Fan-Out & Comparison: [`strategies/transforms.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/strategies/transforms.py).
 4. **Post-Retrieval Boosters & Fusion**: [`postretrieval/boosters.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/postretrieval/boosters.py) and [`postretrieval/threshold.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/postretrieval/threshold.py).
-5. **Ingestion & Text Processing**: [`text/splitter.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/text/splitter.py), [`embedder.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/embedder.py), and [`summarizer.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/summarizer.py).
+5. **Ingestion & Text Processing**: [`ingestion/splitter.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/ingestion/splitter.py), [`ingestion/embedder.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/ingestion/embedder.py), and [`ingestion/summarizer.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/ingestion/summarizer.py).
 6. **Streaming & SSE**: [`engine.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/engine.py#L650) (`stream_query`), flag detection buffer, and [`integrations/sse.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/integrations/sse.py).
 7. **Reference SQL**: [`cody_ai_shared_lib/rag/sql/`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/cody_ai_shared_lib/rag/sql/).
 8. **Phase Tests**: [`tests/rag/test_news_migration.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/tests/rag/test_news_migration.py), [`test_streaming_and_canary.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/tests/rag/test_streaming_and_canary.py), and [`test_tier0_tier3_plan_conversation.py`](file:///c:/Users/minfa/AI%20Test/cody-ai-shared-lib/tests/rag/test_tier0_tier3_plan_conversation.py).

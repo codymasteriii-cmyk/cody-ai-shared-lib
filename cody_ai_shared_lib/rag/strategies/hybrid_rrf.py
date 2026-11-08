@@ -1,13 +1,17 @@
 """Tier 2 HybridRRFStrategy (§8.5, AC-RAG-20).
 
-Combines dense vector search and keyword full-text search with Reciprocal Rank Fusion.
+Combines dense vector and keyword search with Reciprocal Rank Fusion, through the store's native
+hybrid search (Path A) or by fusing the two legs in the engine (Path B).
 """
 from __future__ import annotations
 
-from typing import ClassVar, Generic
+from typing import Any, ClassVar, Generic
+
 from ..errors import StoreCapabilityError
 from ..models import MetaT, RAGNode
+from ..vectors import is_zero_vector
 from .context import RetrievalContext, RetrievalStrategy
+from .shared import embed_query, keyword_fallback, query_text, query_token_groups, with_local_window
 
 
 class HybridRRFStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
@@ -15,61 +19,98 @@ class HybridRRFStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
     version: ClassVar[str] = "1.0.0"
     requires: ClassVar[frozenset[str]] = frozenset(["supports_vector_search", "supports_keyword_fts"])
 
+    @classmethod
+    def is_runnable(cls, capabilities: Any) -> bool:
+        return capabilities.supports_vector_search and (
+            capabilities.supports_keyword_fts or capabilities.supports_native_hybrid_rpc
+        )
+
+    @staticmethod
+    def _fusion_weights(ctx: RetrievalContext[MetaT]) -> tuple[float, float]:
+        """The first intent facet with a table row wins (§8.5)."""
+        weights = ctx.profile.retrieval.fusion_weights
+        if ctx.intent.exact_terms:
+            return weights.get("exact_terms", (0.7, 1.3))
+        if ctx.intent.negation:
+            return weights.get("negation", (0.7, 1.3))
+        if ctx.intent.entity_terms:
+            return weights.get("entity_terms", (0.9, 1.1))
+        return weights.get("default", (1.0, 1.0))
+
     def retrieve(self, ctx: RetrievalContext[MetaT]) -> list[RAGNode[MetaT]]:
-        query_text = ctx.intent.search_query or ctx.request.query
-        target_limit = (
-            ctx.request.top_k_override
-            or ctx.intent.suggested_top_k
-            or ctx.profile.retrieval.retrieve_max_results
-            or ctx.profile.retrieval.top_k
-        )
-        top_k = target_limit + 1
-        rrf_k = ctx.profile.retrieval.rrf_k
+        caps = ctx.store.capabilities()
+        if not self.is_runnable(caps):
+            raise StoreCapabilityError(
+                "HybridRRFStrategy requires 'supports_vector_search' and keyword or native hybrid search"
+            )
 
-        # 1. Embed query
-        emb_res = ctx.gateway.embed(
-            texts=query_text,
-            model=ctx.profile.models.embedding,
-            stage="retrieval_embedding",
-            usage_tracker=ctx.usage_tracker,
-            task_type="RETRIEVAL_QUERY",
-        )
-        query_vector = emb_res.vectors[0]
+        top_k = ctx.target_limit() + 1
+        query_vector = embed_query(ctx)
+        if is_zero_vector(query_vector):
+            return keyword_fallback(ctx, top_k)
 
-        caps = ctx.store.capabilities() if callable(ctx.store.capabilities) else ctx.store.capabilities
-        # 2. Native hybrid if supported
-        if caps.supports_native_hybrid:
-            return ctx.store.hybrid_search(
-                query_text=query_text,
+        if caps.supports_native_hybrid_rpc:
+            w_vec, w_fts = self._fusion_weights(ctx)
+            results = ctx.store.hybrid_search(
+                query_text=query_text(ctx),
                 query_vector=query_vector,
                 top_k=top_k,
                 filters=ctx.filters,
-                rrf_k=rrf_k,
+                rrf_k=ctx.profile.retrieval.rrf_k,
+                w_vec=w_vec,
+                w_fts=w_fts,
+                analyzer_tokens=query_token_groups(ctx),
+            )
+        else:
+            results = self._fuse_in_engine(ctx, query_vector, top_k)
+        return with_local_window(ctx, results)
+
+    def _fuse_in_engine(
+        self,
+        ctx: RetrievalContext[MetaT],
+        query_vector: list[float],
+        top_k: int,
+    ) -> list[RAGNode[MetaT]]:
+        """Path B: run both legs, in parallel when a pool is available, then apply RRF."""
+        def vector_leg() -> list[RAGNode[MetaT]]:
+            return ctx.store.vector_search(query_vector, top_k=top_k * 2, filters=ctx.filters)
+
+        def keyword_leg() -> list[RAGNode[MetaT]]:
+            return ctx.store.keyword_search(
+                query_text(ctx),
+                top_k=top_k * 2,
+                filters=ctx.filters,
+                analyzer_tokens=query_token_groups(ctx),
             )
 
-        # 3. Client-side RRF fusion
-        vec_nodes = ctx.store.vector_search(query_vector, top_k=top_k * 2, filters=ctx.filters)
-        text_nodes = ctx.store.keyword_search(query_text, top_k=top_k * 2, filters=ctx.filters)
+        if ctx.pool is not None:
+            vector_future = ctx.pool.submit(vector_leg)
+            keyword_future = ctx.pool.submit(keyword_leg)
+            vector_nodes, keyword_nodes = vector_future.result(), keyword_future.result()
+        else:
+            vector_nodes, keyword_nodes = vector_leg(), keyword_leg()
 
-        rrf_scores: dict[str, float] = {}
-        node_map: dict[str, RAGNode[MetaT]] = {}
+        rrf_k = ctx.profile.retrieval.rrf_k
+        w_vec, w_fts = self._fusion_weights(ctx)
+        scores: dict[str, float] = {}
+        nodes: dict[str, RAGNode[MetaT]] = {}
 
-        for rank, node in enumerate(vec_nodes):
-            rrf_scores[node.id] = rrf_scores.get(node.id, 0.0) + (1.0 / (rrf_k + rank + 1))
-            node_map[node.id] = node
+        for rank, node in enumerate(vector_nodes, start=1):
+            scores[node.node_id] = scores.get(node.node_id, 0.0) + w_vec / (rrf_k + rank)
+            nodes[node.node_id] = node
+        for rank, node in enumerate(keyword_nodes, start=1):
+            scores[node.node_id] = scores.get(node.node_id, 0.0) + w_fts / (rrf_k + rank)
+            if node.node_id not in nodes:
+                nodes[node.node_id] = node
+            else:
+                nodes[node.node_id].keyword_score = node.keyword_score
+                nodes[node.node_id].keyword_rank = node.keyword_rank
 
-        for rank, node in enumerate(text_nodes):
-            rrf_scores[node.id] = rrf_scores.get(node.id, 0.0) + (1.0 / (rrf_k + rank + 1))
-            if node.id not in node_map:
-                node_map[node.id] = node
-
-        # Sort by merged RRF score descending
-        sorted_ids = sorted(rrf_scores.keys(), key=lambda nid: rrf_scores[nid], reverse=True)
-        results: list[RAGNode[MetaT]] = []
-        for nid in sorted_ids[:top_k]:
-            n = node_map[nid]
-            n.score = rrf_scores[nid]
-            n.score_kind = "hybrid_rrf"
-            results.append(n)
-
+        ranked = sorted(scores, key=lambda node_id: (-scores[node_id], node_id))
+        results = []
+        for node_id in ranked[:top_k]:
+            node = nodes[node_id]
+            node.score = scores[node_id]
+            node.score_kind = "rrf"
+            results.append(node)
         return results

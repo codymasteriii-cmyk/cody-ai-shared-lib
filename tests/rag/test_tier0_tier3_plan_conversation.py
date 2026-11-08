@@ -31,7 +31,7 @@ def _setup_engine(mock_store=None):
         embedding_space=EmbeddingSpace(model="gemini-embedding-2", dims=768)
     )
     mock_gw = MagicMock()
-    mock_gw.embed.side_effect = lambda texts, model, stage, usage_tracker, task_type="RETRIEVAL_DOCUMENT": MagicMock(
+    mock_gw.embed.side_effect = lambda texts, model, stage, usage_tracker, task_type="RETRIEVAL_DOCUMENT", **_: MagicMock(
         vectors=[[0.05] * 768 for _ in texts],
         usage=MagicMock(input_tokens=len(texts) * 10, cost_usd=0.0001, cached_tokens=0, price_table_version="v2026-11-08", estimated=False),
     )
@@ -53,7 +53,7 @@ def test_tier0_token_gate():
         est_tokens=440_000,
         revision="rev_1",
     ))
-    plan_large = engine.plan(RAGQueryRequest(query="summary of the book"))
+    plan_large = engine.plan(RAGQueryRequest(question="summary of the book"))
     assert plan_large.strategy != "full_context"
     assert plan_large.requires_index is True
 
@@ -66,10 +66,10 @@ def test_tier0_token_gate():
         revision="rev_2",
     ))
     mock_gw.embed.reset_mock()
-    plan_small = engine.plan(RAGQueryRequest(query="who is character X"))
+    plan_small = engine.plan(RAGQueryRequest(question="who is character X"))
     assert plan_small.strategy == "full_context"
     assert plan_small.requires_index is False
-    assert "full_context: 41000 <= 120000 tokens" in plan_small.tier_decision_reason
+    assert "scope 41000 tokens, Tier 0 gate 120000" in plan_small.tier_decision_reason
 
 
 def test_plan_cjk_document_boundary_inspection():
@@ -78,7 +78,7 @@ def test_plan_cjk_document_boundary_inspection():
 
     # At position 30,000 (tokens ~33,000 < 120k gate):
     req_30k = RAGQueryRequest(
-        query="what happened so far?",
+        question="what happened so far?",
         filters=RAGFilterSpec(max_char_offset=30_000),
     )
     # Dynamic scope stats based on max_char_offset
@@ -102,7 +102,7 @@ def test_plan_cjk_document_boundary_inspection():
 
     # At position 400,000 (tokens ~440,000 > 120k gate):
     req_400k = RAGQueryRequest(
-        query="what happened so far?",
+        question="what happened so far?",
         filters=RAGFilterSpec(max_char_offset=400_000),
     )
     plan_400k = engine.plan(req_400k)
@@ -127,7 +127,7 @@ def test_tier3_hierarchical_strategy_boundary_summary():
 
     # Query with boundary B = 1500 (inside section 1)
     req = RAGQueryRequest(
-        query="Give me a recap",
+        question="Give me a recap",
         document_id="novel-1",
         strategy_override="hierarchical",
         filters=RAGFilterSpec(max_char_offset=1500),
@@ -171,15 +171,15 @@ def test_conversation_followup_and_rewind():
 
     # Reader rewinds to boundary B = 500 (inside section 0, before section 1)
     req_rewound = RAGQueryRequest(
-        query="what about Fact A?",
+        question="what about Fact A?",
         document_id="novel-2",
         filters=RAGFilterSpec(max_char_offset=500),
-        conversation=conv,
+        state=conv,
         guards=[SequentialBoundaryGuard(max_char_offset=500)],
     )
 
     ret = engine.retrieve(req_rewound)
-    ret_ids = [n.id for n in ret.nodes]
+    ret_ids = [n.node_id for n in ret.nodes]
 
     # s0_node survives
     assert s0_node in ret_ids
@@ -201,15 +201,15 @@ def test_conversation_state_tamper_resilience():
     )
 
     req = RAGQueryRequest(
-        query="innocent question",
-        conversation=tampered_conv,
+        question="innocent question",
+        state=tampered_conv,
     )
 
     # Must complete safely without error
     resp = engine.query(req)
     assert resp.answer_found is not None
     # No non-existent nodes in retrieved
-    assert not any(n.id == "non-existent-id" for n in resp.retrieved.nodes)
+    assert not any(n.node_id == "non-existent-id" for n in resp.retrieved.nodes)
 
 
 def test_bounded_conversation_state_200_turns():

@@ -48,9 +48,6 @@ class SourceSpan(BaseModel):
     position_ratio: float = 0.0
 
 
-RAGNodeSpan = SourceSpan
-
-
 class RAGNode(BaseModel, Generic[MetaT]):
     """A retrievable, traceable unit of content with provenance and scores."""
     node_id: str
@@ -86,37 +83,10 @@ class RAGNode(BaseModel, Generic[MetaT]):
 
     @model_validator(mode="before")
     @classmethod
-    def _populate_aliases(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            if "node_id" not in data and "id" in data:
-                data["node_id"] = data["id"]
-            if "span" not in data or data["span"] is None:
-                doc_id = data.get("document_id", "")
-                sec_id = data.get("section_id", "")
-                seq = data.get("order_index", 0)
-                data["span"] = SourceSpan(doc_id=doc_id, section_id=sec_id, section_seq=seq)
-            elif isinstance(data["span"], dict):
-                if "doc_id" not in data["span"] and "document_id" in data:
-                    data["span"]["doc_id"] = data["document_id"]
-            elif hasattr(data["span"], "doc_id") and not data["span"].doc_id and "document_id" in data:
-                data["span"] = data["span"].model_copy(update={"doc_id": data["document_id"]})
+    def _mark_summaries(cls, data: Any) -> Any:
+        if isinstance(data, dict) and data.get("granularity") == "parent_summary" and "is_summary" not in data:
+            return {**data, "is_summary": True}
         return data
-
-    @property
-    def id(self) -> str:
-        return self.node_id
-
-    @property
-    def document_id(self) -> str:
-        return self.span.doc_id
-
-    @property
-    def section_id(self) -> str | None:
-        return self.span.section_id
-
-    @property
-    def order_index(self) -> int:
-        return self.span.section_seq
 
 
 # ── Filters (§3.6) ─────────────────────────────────────────────────────────────
@@ -161,46 +131,72 @@ class RAGFilterSpec(BaseModel):
     def document_ids(self, val: list[str] | None) -> None:
         self.doc_ids = val
 
+    @property
+    def is_empty_scope(self) -> bool:
+        """True when the filters can match nothing, such as after a hard conflict (§5.5)."""
+        return self.doc_ids is not None and not self.doc_ids
+
     def patch(self, patch: Any) -> RAGFilterSpec:
-        """Combine patches by narrowing only (§5.5)."""
+        """Combine a patch by narrowing only; a conflict yields an empty scope (§5.5)."""
         fields = patch.fields if hasattr(patch, "fields") else patch
         if not isinstance(fields, dict):
             return self
         copied = self.model_copy(deep=True)
         for k, v in fields.items():
             if v is not None:
-                if k in ("tenant_id", "tenant_or_user_id"):
-                    copied.tenant_or_user_id = v
-                elif k in ("doc_ids", "document_ids"):
-                    if copied.doc_ids is not None:
-                        copied.doc_ids = [d for d in copied.doc_ids if d in v]
-                    else:
-                        copied.doc_ids = list(v)
-                elif k == "max_char_offset":
-                    if copied.max_char_offset is not None:
-                        copied.max_char_offset = min(copied.max_char_offset, v)
-                    else:
-                        copied.max_char_offset = v
-                elif k == "max_char_offset_by_doc":
-                    if copied.max_char_offset_by_doc is not None:
-                        for doc, off in v.items():
-                            cur = copied.max_char_offset_by_doc.get(doc)
-                            copied.max_char_offset_by_doc[doc] = min(cur, off) if cur is not None else off
-                    else:
-                        copied.max_char_offset_by_doc = dict(v)
-                elif k == "min_char_offset":
-                    if copied.min_char_offset is not None:
-                        copied.min_char_offset = max(copied.min_char_offset, v)
-                    else:
-                        copied.min_char_offset = v
-                elif k == "date_range_utc":
-                    copied.date_range_utc = v
-                else:
-                    if hasattr(copied, k):
-                        setattr(copied, k, v)
-                    else:
-                        copied.custom[k] = v
+                copied._narrow(k, v)
         return copied
+
+    def _narrow(self, key: str, value: Any) -> None:
+        if key in ("tenant_id", "tenant_or_user_id", "domain_id", "date_field"):
+            attr = "tenant_or_user_id" if key == "tenant_id" else key
+            current = getattr(self, attr)
+            if current is None:
+                setattr(self, attr, value)
+            elif current != value:
+                self.doc_ids = []
+        elif key in ("doc_ids", "document_ids"):
+            self.doc_ids = list(value) if self.doc_ids is None else [d for d in self.doc_ids if d in value]
+        elif key == "categories":
+            self.categories = list(value) if self.categories is None else [c for c in self.categories if c in value]
+            if not self.categories:
+                self.doc_ids = []
+        elif key == "max_char_offset":
+            self.max_char_offset = value if self.max_char_offset is None else min(self.max_char_offset, value)
+        elif key == "max_char_offset_by_doc":
+            merged = dict(self.max_char_offset_by_doc or {})
+            for doc, offset in value.items():
+                merged[doc] = min(merged[doc], offset) if doc in merged else offset
+            self.max_char_offset_by_doc = merged
+        elif key == "min_char_offset":
+            self.min_char_offset = value if self.min_char_offset is None else max(self.min_char_offset, value)
+        elif key == "min_similarity":
+            self.min_similarity = value if self.min_similarity is None else max(self.min_similarity, value)
+        elif key == "date_range_utc":
+            self._narrow_date_range(value)
+        elif key == "custom":
+            for custom_key, custom_value in value.items():
+                self._narrow_custom(custom_key, custom_value)
+        else:
+            self._narrow_custom(key, value)
+
+    def _narrow_date_range(self, value: tuple[datetime | None, datetime | None]) -> None:
+        if self.date_range_utc is None:
+            self.date_range_utc = value
+            return
+        old_start, old_end = self.date_range_utc
+        new_start, new_end = value
+        start = max(old_start, new_start) if (old_start and new_start) else (old_start or new_start)
+        end = min(old_end, new_end) if (old_end and new_end) else (old_end or new_end)
+        self.date_range_utc = (start, end)
+        if start and end and start > end:
+            self.doc_ids = []
+
+    def _narrow_custom(self, key: str, value: Any) -> None:
+        if key in self.custom and self.custom[key] != value:
+            self.doc_ids = []
+        else:
+            self.custom[key] = value
 
 
 # ── Conversation State & History (§3.7, §7.7) ─────────────────────────────────
@@ -216,6 +212,7 @@ class NodeRef(BaseModel):
     """Lightweight reference to a node retrieved in a prior turn."""
     node_id: str
     revision: str | None = None
+    turn: int = 0
 
 
 class ConversationState(BaseModel):
@@ -304,22 +301,6 @@ class CitationCoverage(BaseModel):
     total_citations: int = 0
     verified_citations: int = 0
 
-    @model_validator(mode="before")
-    @classmethod
-    def _populate_coverage_defaults(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            if "total_citations" in data and "sentences_total" not in data:
-                data["sentences_total"] = data["total_citations"]
-            if "verified_citations" in data and "sentences_cited" not in data:
-                data["sentences_cited"] = data["verified_citations"]
-            if "coverage_ratio" in data and "ratio" not in data:
-                data["ratio"] = data["coverage_ratio"]
-        return data
-
-    @property
-    def coverage_ratio(self) -> float:
-        return self.ratio
-
 
 # ── Query Intent (§7.1) ────────────────────────────────────────────────────────
 
@@ -378,22 +359,6 @@ class RAGQueryRequest(BaseModel):
     trace_level: Literal["light", "verbose"] | None = None
     system_prompt_variables: dict[str, str] = Field(default_factory=dict)
 
-    @model_validator(mode="before")
-    @classmethod
-    def _populate_question(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            if "question" not in data and "query" in data:
-                data["question"] = data["query"]
-        return data
-
-    @property
-    def query(self) -> str:
-        return self.question
-
-    @property
-    def conversation(self) -> ConversationState | None:
-        return self.state
-
 
 class RAGRetrievalResult(BaseModel, Generic[MetaT]):
     """Result of candidate retrieval, filtering, and scoring before generation."""
@@ -429,11 +394,6 @@ class RAGResponse(BaseModel, Generic[MetaT]):
     degradations: list[Degradation] = Field(default_factory=list)
     latency_ms: float = 0.0
     trace: Any | None = None
-
-    @property
-    def retrieval(self) -> RAGRetrievalResult[MetaT]:
-        """Convenience alias for self.retrieved."""
-        return self.retrieved
 
 
 class RAGStreamEvent(BaseModel):
@@ -488,7 +448,8 @@ class IngestionProgress(BaseModel):
 
 
 class ReindexStatus(BaseModel):
-    """Index staleness status for a document."""
+    """Index staleness status for a document (§6.6)."""
+    doc_id: str | None = None
     embeddings_stale: bool = False
     fts_stale: bool = False
 
@@ -502,3 +463,16 @@ class QueryPlan(BaseModel):
     reads: frozenset[str] = Field(default_factory=frozenset)
     applied_filters: RAGFilterSpec = Field(default_factory=RAGFilterSpec)
     scope: Any | None = None
+
+
+class RetrievalDiff(BaseModel):
+    """Comparison of two retrieval results (§14.2)."""
+    k: int = 10
+    overlap_at_k: float = 1.0
+    rank_correlation: float = 1.0
+    only_in_a: list[str] = Field(default_factory=list)
+    only_in_b: list[str] = Field(default_factory=list)
+    rank_deltas: dict[str, tuple[int, int]] = Field(default_factory=dict)
+    added_ids: list[str] = Field(default_factory=list)
+    removed_ids: list[str] = Field(default_factory=list)
+    rank_shifts: dict[str, int] = Field(default_factory=dict)

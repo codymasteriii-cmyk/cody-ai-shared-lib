@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from cody_ai_shared_lib.rag import (
+    ModelGateway,
     BudgetExceeded,
     EmbeddingSignatureMismatch,
     EngineProfile,
@@ -37,7 +38,7 @@ def _make_engine_and_store():
     )
     mock_gw = MagicMock()
     # Mock embedding: returns 768-dim mock vector for each text
-    mock_gw.embed.side_effect = lambda texts, model, stage, usage_tracker, task_type="RETRIEVAL_DOCUMENT": MagicMock(
+    mock_gw.embed.side_effect = lambda texts, model, stage, usage_tracker, task_type="RETRIEVAL_DOCUMENT", **_: MagicMock(
         vectors=[[0.05] * 768 for _ in texts],
         usage=MagicMock(input_tokens=len(texts) * 10, cost_usd=0.0001, cached_tokens=0, price_table_version="v2026-11-08", estimated=False),
     )
@@ -140,6 +141,7 @@ def test_embedding_space_mismatch():
     """AC-RAG-07: Store embedding space mismatch fails validate() and raises EmbeddingSignatureMismatch on query."""
     bindings = ModelBindings(
         generation=["gemini-3.5-flash-lite"],
+        summary=["gemini-3.5-flash-lite"],
         embedding="gemini-embedding-2",
     )
     profile = long_form_reader(models=bindings)
@@ -150,20 +152,23 @@ def test_embedding_space_mismatch():
             dims=768,
         )
     )
-    engine = RAGEngine(profile=profile, store=mismatched_store)
-
-    # validate() raises ProfileConfigError
+    # The constructor reports the mismatch at startup
     with pytest.raises(ProfileConfigError):
-        engine.validate()
+        RAGEngine(profile=profile, store=mismatched_store)
 
-    # retrieve() raises EmbeddingSignatureMismatch
+    # validate() reports it without raising, and a later mismatch fails at query time
+    matching_store = InMemoryRAGStore(embedding_space=EmbeddingSpace(model="gemini-embedding-2", dims=768))
+    engine = RAGEngine(profile=profile, store=matching_store)
+    matching_store._embedding_space = EmbeddingSpace(model="text-embedding-004", dims=768)
+    assert engine.validate().valid is False
     with pytest.raises(EmbeddingSignatureMismatch):
-        engine.retrieve(RAGQueryRequest(query="test query"))
+        engine.retrieve(RAGQueryRequest(question="test query"))
 
 
 def test_ingestion_budget_guard():
     """AC-RAG-65: BudgetGuard halts during ingestion: earlier sections stored, current section aborted, error propagates."""
     bindings = ModelBindings(
+        summary=["gemini-3.5-flash-lite"],
         generation=["gemini-3.5-flash-lite"],
         embedding="gemini-embedding-2",
     )
@@ -171,8 +176,8 @@ def test_ingestion_budget_guard():
     store = InMemoryRAGStore(
         embedding_space=EmbeddingSpace(model="gemini-embedding-2", dims=768)
     )
-    mock_gw = MagicMock()
-    mock_gw.embed.return_value = MagicMock(
+    embedding_client = MagicMock()
+    embedding_client.embed_with_usage.return_value = MagicMock(
         vectors=[[0.05] * 768 for _ in range(10)],
         usage=MagicMock(input_tokens=10, cost_usd=0.001, cached_tokens=0, price_table_version="v2026-11-08", estimated=False),
     )
@@ -180,17 +185,17 @@ def test_ingestion_budget_guard():
     budget_calls = 0
 
     class MockBudgetGuard:
-        def before_call(self, ctx):
+        def before_call(self, stage, model, est_input_tokens, optional, ctx):
             nonlocal budget_calls
             budget_calls += 1
             if budget_calls == 3:  # Raise on third section
                 raise BudgetExceeded("Daily dollar limit exceeded", limit_usd=5.0, spent_usd=5.01)
-            return "proceed"
+            return "allow"
 
     engine = RAGEngine(
         profile=profile,
         store=store,
-        gateway=mock_gw,
+        gateway=ModelGateway(llm_client=MagicMock(), embedding_client=embedding_client),
         budget_guard=MockBudgetGuard(),
     )
 
@@ -221,17 +226,15 @@ def test_prepare_nodes_parity():
     nodes = [
         RAGNode(
             node_id="prep-1",
-            doc_id="d1",
             text="Text for node one.",
             granularity="passage",
-            span=SourceSpan(char_start=0, char_end=18),
+            span=SourceSpan(char_start=0, char_end=18, doc_id="d1"),
         ),
         RAGNode(
             node_id="prep-2",
-            doc_id="d1",
             text="Text for node two (failed).",
             granularity="passage",
-            span=SourceSpan(char_start=19, char_end=45),
+            span=SourceSpan(char_start=19, char_end=45, doc_id="d1"),
         ),
     ]
 

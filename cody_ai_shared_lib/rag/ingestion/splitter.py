@@ -1,4 +1,4 @@
-"""Text splitters for RAG ingestion.
+"""Text splitters for RAG ingestion (§6.2).
 
 Implements:
   - TextSplitter protocol
@@ -7,11 +7,10 @@ Implements:
 """
 from __future__ import annotations
 
-import re
 from typing import Protocol, runtime_checkable
 from pydantic import BaseModel, Field
 
-from .analyzer import CjkAwareAnalyzer, TextAnalyzer
+from ..text.analyzer import CjkAwareAnalyzer, TextAnalyzer
 
 
 class SplitChunk(BaseModel):
@@ -59,7 +58,6 @@ class SentenceSplitter:
 
         sentences = self.analyzer.sentences(text)
         if not sentences:
-            # If text had no sentence punctuation, treat non-empty stripped text as a single chunk
             stripped = text.strip()
             if not stripped:
                 return []
@@ -67,7 +65,6 @@ class SentenceSplitter:
             end = start + len(stripped)
             return [SplitChunk(text=text[start:end], local_start=start, local_end=end)]
 
-        # Pre-split any sentences that are oversized (> 1.5 * target_size)
         effective_sentences: list[tuple[int, int]] = []
         max_sentence_len = int(self.target_size * 1.5)
 
@@ -76,7 +73,6 @@ class SentenceSplitter:
             if s_len <= max_sentence_len:
                 effective_sentences.append((s_start, s_end))
             else:
-                # Split oversized sentence at clause punctuation: , ; ， 、 ；
                 clause_ranges = self._split_clauses(text, s_start, s_end, max_len=self.target_size)
                 effective_sentences.extend(clause_ranges)
 
@@ -93,7 +89,6 @@ class SentenceSplitter:
                 end_char = effective_sentences[curr_sent][1]
                 curr_len = end_char - chunk_start_char
                 if curr_len > self.target_size and curr_sent > chunk_start_sent:
-                    # Target size reached and we have at least one sentence
                     break
                 curr_sent += 1
 
@@ -110,8 +105,6 @@ class SentenceSplitter:
             if curr_sent >= n_sents:
                 break
 
-            # Calculate overlap: rewind from curr_sent towards chunk_start_sent + 1
-            # so the shared tail length is as close to self.overlap as possible without exceeding it by too much
             next_start_sent = curr_sent
             while next_start_sent > chunk_start_sent + 1:
                 overlap_len = chunk_end_char - effective_sentences[next_start_sent - 1][0]
@@ -141,7 +134,6 @@ class SentenceSplitter:
                     sub_ranges.append((curr_start, clause_end))
                     curr_start = clause_end
             elif (i - curr_start) >= max_len * 2:
-                # Hard fallback cut if no clause punctuation found
                 sub_ranges.append((curr_start, i))
                 curr_start = i
             i += 1
@@ -156,6 +148,14 @@ class PassThroughSplitter:
     """Pass-through splitter: one input text unit yields exactly one node (AC-RAG-03)."""
     name: str = "pass_through"
     version: str = "1.0.0"
+
+    def __init__(
+        self,
+        target_size: int | None = None,
+        overlap: int | None = None,
+        analyzer: TextAnalyzer | None = None,
+    ):
+        """Takes the arguments every splitter is built with; none apply to one chunk per unit."""
 
     def split(self, text: str, base_offset: int = 0) -> list[SplitChunk]:
         """Wrap entire text as a single chunk."""

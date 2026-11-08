@@ -1,4 +1,8 @@
 """Cody AI Shared RAG Engine package."""
+from .cache import Cache, InMemoryLRUCache, make_embedding_cache_key
+from .context import ContextAssembler, ContextFencer, ConversationManager, TokenBudgeter
+from .degradation import AGREED_DEGRADATIONS, DegradationTracker
+from .engine import RAGEngine, RAGStream
 from .errors import (
     BudgetExceeded,
     DeadlineExceeded,
@@ -14,10 +18,8 @@ from .errors import (
     StoreCapabilityError,
     UnsupportedFilterError,
 )
-from .degradation import AGREED_DEGRADATIONS, DegradationTracker
-from .engine import RAGEngine, RAGStream
 from .gateway import ModelGateway
-from .integrations.sse import format_event
+from .generation import StuffStrategy
 from .granularity import (
     BUILTIN_GRANULARITIES,
     TRAIT_ATOMIC,
@@ -35,7 +37,18 @@ from .guards import (
     SequentialBoundaryGuard,
     TemporalGuard,
     TenantGuard,
+    build_turn_guards,
 )
+from .ingestion import (
+    BatchEmbedder,
+    PassThroughSplitter,
+    SectionSummarizer,
+    SentenceSplitter,
+    SplitChunk,
+    SummarizerResult,
+    TextSplitter,
+)
+from .integrations.sse import format_event
 from .intent import (
     AutoRouter,
     HeuristicIntentRouter,
@@ -74,6 +87,7 @@ from .models import (
     RAGSectionInput,
     RAGStreamEvent,
     ReindexStatus,
+    RetrievalDiff,
     ScoreKind,
     SourceSpan,
     StageUsage,
@@ -87,7 +101,18 @@ from .ports import (
     ScopeStats,
     StoreCapabilities,
 )
+from .postgen import CitationExtractor, OutputSanitizer, QuoteVerifier
+from .postretrieval import (
+    IdentityDeduplicator,
+    JinaCrossEncoderReranker,
+    OffsetDeduplicator,
+    RecencyBooster,
+    ScoreFusionStage,
+    ThresholdFilter,
+)
 from .profile import (
+    CacheConfig,
+    CitationConfig,
     ContextConfig,
     EngineProfile,
     GenerationConfig,
@@ -96,13 +121,14 @@ from .profile import (
     RetrievalConfig,
     RouterConfig,
     RuntimeConfig,
+    ValidationReport,
     knowledge_base,
     long_form_reader,
     news_chat,
     news_intelligence,
     news_search,
 )
-from .registry import ComponentRegistry, create_default_registry
+from .registry import ComponentDeps, ComponentRegistry, create_default_registry
 from .render import DefaultRenderer, NodeRenderer
 from .runtime import (
     Clock,
@@ -114,23 +140,11 @@ from .runtime import (
     SystemRng,
     make_bounded_pool,
 )
-from .trace import ObserverDispatcher, RAGObserver, RAGTrace, StageRecord
-from .usage import BudgetGuard, CallContext, UsageTracker
-from .context import ContextAssembler, ContextFencer, ConversationManager
-from .generation import StuffStrategy
-from .postgen import CitationExtractor, OutputSanitizer, QuoteVerifier
-from .postretrieval import (
-    IdentityDeduplicator,
-    JinaCrossEncoderReranker,
-    OffsetDeduplicator,
-    RecencyBooster,
-    ScoreFusionStage,
-    ThresholdFilter,
-)
 from .strategies import (
     AdaptiveStrategy,
     DenseVectorStrategy,
     FullContextStrategy,
+    HierarchicalStrategy,
     HybridRRFStrategy,
     KeywordFirstStrategy,
     KeywordOnlyStrategy,
@@ -140,7 +154,12 @@ from .strategies import (
     SecondaryQueryFanOut,
     fair_interleave,
 )
-from .text.splitter import PassThroughSplitter, SentenceSplitter
+from .text.analyzer import CjkAwareAnalyzer, TextAnalyzer, estimate_tokens, is_cjk_char, tokenize_query_groups
+from .trace import ObserverDispatcher, RAGObserver, RAGTrace, StageRecord
+from .usage import BudgetGuard, CallContext, UsageTracker
+
+# The built-in components, for apps that share one registry (§8.8)
+default_registry = create_default_registry()
 
 __all__ = [
     # Errors
@@ -190,8 +209,12 @@ __all__ = [
     "RAGRetrievalResult",
     "RAGResponse",
     "RAGStreamEvent",
+    "RAGDocumentInput",
+    "RAGSectionInput",
+    "PreparedNode",
     "IngestionProgress",
     "ReindexStatus",
+    "RetrievalDiff",
     # Ports & Renderer
     "EmbeddingSpace",
     "ScopeStats",
@@ -205,8 +228,13 @@ __all__ = [
     "TemporalGuard",
     "TenantGuard",
     "ScopeGuard",
+    "build_turn_guards",
     "NodeRenderer",
     "DefaultRenderer",
+    # Cache
+    "Cache",
+    "InMemoryLRUCache",
+    "make_embedding_cache_key",
     # Degradation
     "AGREED_DEGRADATIONS",
     "DegradationTracker",
@@ -223,12 +251,17 @@ __all__ = [
     # Registry & Profile
     "ComponentRegistry",
     "create_default_registry",
+    "default_registry",
+    "ComponentDeps",
     "ModelBindings",
     "EngineProfile",
+    "ValidationReport",
     "RouterConfig",
     "RetrievalConfig",
     "ContextConfig",
     "GenerationConfig",
+    "CitationConfig",
+    "CacheConfig",
     "IngestionConfig",
     "RuntimeConfig",
     "long_form_reader",
@@ -260,10 +293,11 @@ __all__ = [
     "PassthroughRouter",
     "HeuristicIntentRouter",
     "AutoRouter",
-    # Context, Generation, Postgen, Postretrieval, Strategies
+    # Context, Generation, Postgen, Postretrieval, Strategies, Ingestion, Testing
     "ContextAssembler",
     "ContextFencer",
     "ConversationManager",
+    "TokenBudgeter",
     "StuffStrategy",
     "CitationExtractor",
     "QuoteVerifier",
@@ -280,6 +314,7 @@ __all__ = [
     "FullContextStrategy",
     "DenseVectorStrategy",
     "HybridRRFStrategy",
+    "HierarchicalStrategy",
     "KeywordOnlyStrategy",
     "KeywordFirstStrategy",
     "AdaptiveStrategy",
@@ -287,4 +322,14 @@ __all__ = [
     "fair_interleave",
     "PassThroughSplitter",
     "SentenceSplitter",
+    "SplitChunk",
+    "TextSplitter",
+    "BatchEmbedder",
+    "SectionSummarizer",
+    "SummarizerResult",
+    "TextAnalyzer",
+    "CjkAwareAnalyzer",
+    "is_cjk_char",
+    "estimate_tokens",
+    "tokenize_query_groups",
 ]

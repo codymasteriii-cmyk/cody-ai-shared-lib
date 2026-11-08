@@ -1,4 +1,4 @@
-"""Text analysis, query building, and splitters for RAG."""
+"""Text analysis and query building for RAG."""
 from .analyzer import (
     CjkAwareAnalyzer,
     TextAnalyzer,
@@ -6,12 +6,6 @@ from .analyzer import (
     build_tsquery,
     estimate_tokens,
     is_cjk_char,
-)
-from .splitter import (
-    PassThroughSplitter,
-    SentenceSplitter,
-    SplitChunk,
-    TextSplitter,
 )
 
 __all__ = [
@@ -21,8 +15,4 @@ __all__ = [
     "TokenGroup",
     "build_tsquery",
     "is_cjk_char",
-    "TextSplitter",
-    "SentenceSplitter",
-    "PassThroughSplitter",
-    "SplitChunk",
 ]

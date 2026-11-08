@@ -70,7 +70,7 @@ def _make_dummy_embedding(val: float = 0.5) -> list[float]:
 def test_tier0_gate_decision_and_full_scope():
     """AC-RAG-10 / AC-RAG-11: 41k token scope fits 120k token gate and uses Tier 0 without embed."""
     store = InMemoryRAGStore[dict]()
-    models = ModelBindings(generation=["gemini-3.8-flash"], embedding="gemini-embedding-2")
+    models = ModelBindings(summary=["gemini-3.5-flash-lite"], generation=["gemini-3.8-flash"], embedding="gemini-embedding-2")
     profile = long_form_reader(
         models,
         router=RouterConfig(name="none"),
@@ -83,17 +83,14 @@ def test_tier0_gate_decision_and_full_scope():
     # Ingest nodes into store: small corpus (41k chars / tokens)
     nodes = [
         RAGNode[dict](
-            id=f"node_{i}",
-            document_id="book_1",
-            section_id="sec_1",
-            order_index=i,
+            node_id=f"node_{i}",
             text=f"Paragraph {i} of the novel.",
-            span=SourceSpan(char_start=i * 30, char_end=(i + 1) * 30),
+            span=SourceSpan(char_start=i * 30, char_end=(i + 1) * 30, doc_id="book_1", section_id="sec_1", section_seq=i),
             metadata={"tenant_id": "tenant_a"},
         )
         for i in range(10)
     ]
-    store.upsert_section(document_id="book_1", section_id="sec_1", nodes=nodes)
+    store.upsert_section_nodes("book_1", 0, nodes)
 
     mock_llm = MagicMock()
     mock_llm.generate_with_usage.return_value = LLMResult(
@@ -108,7 +105,7 @@ def test_tier0_gate_decision_and_full_scope():
     engine = RAGEngine(profile=profile, store=store, gateway=mock_gw)
 
     req = RAGQueryRequest(
-        query="What happened in the novel?",
+        question="What happened in the novel?",
         filters=RAGFilterSpec(tenant_id="tenant_a"),
     )
     resp = engine.query(req)
@@ -118,13 +115,13 @@ def test_tier0_gate_decision_and_full_scope():
     assert resp.retrieved.strategy_used == "full_context"
     assert "full_context" in resp.retrieved.tier_decision_reason
     assert len(resp.retrieved.nodes) == 10
-    assert resp.answer_found == "yes"
+    assert resp.answer_found is None  # the fake model gave no flag, and the engine never guesses
 
 
 def test_tier0_gate_exceeded_switches_to_retrieval():
     """AC-RAG-10: When corpus exceeds full_context_max_tokens, adaptive strategy switches tier."""
     store = InMemoryRAGStore[dict]()
-    models = ModelBindings(generation=["gemini-3.8-flash"], embedding="gemini-embedding-2")
+    models = ModelBindings(summary=["gemini-3.5-flash-lite"], generation=["gemini-3.8-flash"], embedding="gemini-embedding-2")
     # Low gate: 50 tokens
     profile = long_form_reader(
         models,
@@ -138,17 +135,14 @@ def test_tier0_gate_exceeded_switches_to_retrieval():
     # Ingest 10 nodes (total tokens > 50)
     nodes = [
         RAGNode[dict](
-            id=f"node_{i}",
-            document_id="book_large",
-            section_id="sec_1",
-            order_index=i,
+            node_id=f"node_{i}",
             text=f"This is a longer paragraph {i} containing more words and content.",
             embedding=_make_dummy_embedding(0.9),
-            metadata={"tenant_id": "tenant_a"},
+            metadata={"tenant_id": "tenant_a"}, span=SourceSpan(doc_id="book_large", section_id="sec_1", section_seq=i),
         )
         for i in range(10)
     ]
-    store.upsert_section(document_id="book_large", section_id="sec_1", nodes=nodes)
+    store.upsert_section_nodes("book_large", 0, nodes)
 
     mock_llm = MagicMock()
     mock_llm.generate_with_usage.return_value = LLMResult(
@@ -167,7 +161,7 @@ def test_tier0_gate_exceeded_switches_to_retrieval():
     engine = RAGEngine(profile=profile, store=store, gateway=mock_gw)
 
     req = RAGQueryRequest(
-        query="What is this about?",
+        question="What is this about?",
         filters=RAGFilterSpec(tenant_id="tenant_a"),
     )
     resp = engine.query(req)
@@ -187,7 +181,7 @@ def test_no_retrieval_route_skips_store_reads():
     store.text_search = MagicMock()
     store.fetch_full_scope = MagicMock()
 
-    models = ModelBindings(generation=["gemini-3.8-flash"])
+    models = ModelBindings(summary=["gemini-3.5-flash-lite"], generation=["gemini-3.8-flash"], embedding="gemini-embedding-2")
     profile = long_form_reader(models)
 
     mock_llm = MagicMock()
@@ -200,7 +194,7 @@ def test_no_retrieval_route_skips_store_reads():
 
     engine = RAGEngine(profile=profile, store=store, gateway=mock_gw)
 
-    req = RAGQueryRequest(query="Good morning!")
+    req = RAGQueryRequest(question="Good morning!")
     resp = engine.query(req)
 
     assert resp.answer == "Hello! How can I assist you today?"
@@ -217,16 +211,16 @@ def test_no_retrieval_route_skips_store_reads():
 def test_multi_variant_fair_interleave():
     """AC-RAG-19: Comparison query returns candidates for both subjects with fair interleave."""
     nodes_subj_a = [
-        RAGNode[dict](id=f"a_{i}", text=f"Subject A detail {i}", score=0.9 - (i * 0.05))
+        RAGNode[dict](node_id=f"a_{i}", text=f"Subject A detail {i}", score=0.9 - (i * 0.05))
         for i in range(5)
     ]
     nodes_subj_b = [
-        RAGNode[dict](id=f"b_{i}", text=f"Subject B detail {i}", score=0.85 - (i * 0.05))
+        RAGNode[dict](node_id=f"b_{i}", text=f"Subject B detail {i}", score=0.85 - (i * 0.05))
         for i in range(5)
     ]
 
     merged = fair_interleave([nodes_subj_a, nodes_subj_b], top_k=6)
-    merged_ids = [n.id for n in merged]
+    merged_ids = [n.node_id for n in merged]
 
     # Both subjects represented
     a_count = sum(1 for nid in merged_ids if nid.startswith("a_"))
@@ -242,13 +236,13 @@ def test_threshold_filter_drops_below_min_similarity():
     """AC-RAG-31: Nodes below min_similarity are dropped."""
     filter_stage = ThresholdFilter[dict](min_similarity=0.75)
     nodes = [
-        RAGNode[dict](id="1", text="High match", score=0.88),
-        RAGNode[dict](id="2", text="Low match", score=0.62),
-        RAGNode[dict](id="3", text="Borderline match", score=0.75),
+        RAGNode[dict](node_id="1", text="High match", score=0.88, score_kind="cosine"),
+        RAGNode[dict](node_id="2", text="Low match", score=0.62, score_kind="cosine"),
+        RAGNode[dict](node_id="3", text="Borderline match", score=0.75, score_kind="cosine"),
     ]
 
     passed = filter_stage.filter(nodes)
-    assert [n.id for n in passed] == ["1", "3"]
+    assert [n.node_id for n in passed] == ["1", "3"]
 
 
 # ── AC-RAG-32 & AC-RAG-33: Deduplication ───────────────────────────────────────
@@ -258,45 +252,39 @@ def test_identity_and_offset_deduplication():
     # Identity dedup
     id_dedup = IdentityDeduplicator[dict]()
     dup_nodes = [
-        RAGNode[dict](id="dup", text="First occurrence", score=0.5),
-        RAGNode[dict](id="unique", text="Unique", score=0.8),
-        RAGNode[dict](id="dup", text="Second occurrence higher score", score=0.9),
+        RAGNode[dict](node_id="dup", text="First occurrence", score=0.5),
+        RAGNode[dict](node_id="unique", text="Unique", score=0.8),
+        RAGNode[dict](node_id="dup", text="Second occurrence higher score", score=0.9),
     ]
     deduped = id_dedup.deduplicate(dup_nodes)
     assert len(deduped) == 2
-    assert deduped[0].id == "dup" and deduped[0].score == 0.9
-    assert deduped[1].id == "unique"
+    assert deduped[0].node_id == "dup" and deduped[0].score == 0.9
+    assert deduped[1].node_id == "unique"
 
     # Offset dedup
     off_dedup = OffsetDeduplicator[dict]()
     overlapping_nodes = [
         RAGNode[dict](
-            id="span_1",
-            document_id="doc1",
-            section_id="sec1",
+            node_id="span_1",
             text="Span 0 to 100",
             score=0.95,
-            span=SourceSpan(char_start=0, char_end=100),
+            span=SourceSpan(char_start=0, char_end=100, doc_id="doc1", section_id="sec1"),
         ),
         RAGNode[dict](
-            id="span_2_overlap",
-            document_id="doc1",
-            section_id="sec1",
+            node_id="span_2_overlap",
             text="Span 15 to 95",
             score=0.70,
-            span=SourceSpan(char_start=15, char_end=95),
+            span=SourceSpan(char_start=15, char_end=95, doc_id="doc1", section_id="sec1"),
         ),
         RAGNode[dict](
-            id="span_3_nonoverlap",
-            document_id="doc1",
-            section_id="sec1",
+            node_id="span_3_nonoverlap",
             text="Span 200 to 300",
             score=0.80,
-            span=SourceSpan(char_start=200, char_end=300),
+            span=SourceSpan(char_start=200, char_end=300, doc_id="doc1", section_id="sec1"),
         ),
     ]
     res = off_dedup.deduplicate(overlapping_nodes)
-    res_ids = [n.id for n in res]
+    res_ids = [n.node_id for n in res]
     assert "span_1" in res_ids
     assert "span_3_nonoverlap" in res_ids
     assert "span_2_overlap" not in res_ids
@@ -312,14 +300,14 @@ def test_jina_reranker_and_dg06_fallback():
     degradations = DegradationTracker()
 
     nodes = [
-        RAGNode[dict](id="node_1", text="Doc 1 text"),
-        RAGNode[dict](id="node_2", text="Doc 2 text"),
+        RAGNode[dict](node_id="node_1", text="Doc 1 text"),
+        RAGNode[dict](node_id="node_2", text="Doc 2 text"),
     ]
 
     # Error case -> DG-06 fallback
     mock_gw.rerank.return_value = None
-    res = reranker.rerank("query", nodes, tracker, degradations)
-    assert [n.id for n in res] == ["node_1", "node_2"]
+    res = reranker.rerank_nodes("query", nodes, tracker, degradations)
+    assert [n.node_id for n in res] == ["node_1", "node_2"]
     assert any(d.id == "DG-06" for d in degradations.degradations)
 
 
@@ -343,8 +331,8 @@ def test_context_fencer_isolation_and_sanitization():
 def test_citation_extraction_and_quote_verification():
     """AC-RAG-41 / AC-RAG-42: Citations extracted and verified against source nodes."""
     nodes = [
-        RAGNode[dict](id="n1", text="The capital of France is Paris.", span=SourceSpan(char_start=0, char_end=31)),
-        RAGNode[dict](id="n2", text="The population of Tokyo is 14 million.", span=SourceSpan(char_start=0, char_end=38)),
+        RAGNode[dict](node_id="n1", text="The capital of France is Paris.", span=SourceSpan(char_start=0, char_end=31)),
+        RAGNode[dict](node_id="n2", text="The population of Tokyo is 14 million.", span=SourceSpan(char_start=0, char_end=38)),
     ]
 
     extractor = CitationExtractor[dict]()
@@ -357,7 +345,7 @@ def test_citation_extraction_and_quote_verification():
 
     verifier = QuoteVerifier[dict]()
     verified_cites, coverage = verifier.verify(cites, nodes)
-    assert coverage.coverage_ratio == 1.0
+    assert coverage.ratio == 1.0
 
 
 def test_output_sanitizer_strips_markdown_images_and_fences():
@@ -370,7 +358,7 @@ def test_output_sanitizer_strips_markdown_images_and_fences():
     clean = sanitizer.sanitize(leaking_output)
 
     assert "https://attacker.com" not in clean
-    assert "[image omitted:" in clean
+    assert "tracker" in clean
     assert "<data-" not in clean
     assert "</data-" not in clean
 
@@ -380,20 +368,20 @@ def test_output_sanitizer_strips_markdown_images_and_fences():
 def test_engine_retrieve_ranked_list_mode_without_generation():
     """AC-RAG-51: retrieve() runs routing, transforms, strategy, and guards without generating."""
     store = InMemoryRAGStore[dict]()
-    models = ModelBindings(generation=["gemini-3.8-flash"])
+    models = ModelBindings(summary=["gemini-3.5-flash-lite"], generation=["gemini-3.8-flash"], embedding="gemini-embedding-2")
     profile = long_form_reader(models, router=RouterConfig(name="none"))
 
     nodes = [
-        RAGNode[dict](id=f"doc_{i}", text=f"Document snippet {i}", metadata={"tenant_id": "tenant_1"})
+        RAGNode[dict](node_id=f"doc_{i}", text=f"Document snippet {i}", metadata={"tenant_id": "tenant_1"})
         for i in range(5)
     ]
-    store.upsert_section(document_id="doc_corpus", section_id="main", nodes=nodes)
+    store.upsert_section_nodes("doc_corpus", 0, nodes)
 
     mock_llm = MagicMock()
     mock_gw = ModelGateway(llm_client=mock_llm)
     engine = RAGEngine(profile=profile, store=store, gateway=mock_gw)
 
-    req = RAGQueryRequest(query="Find snippets", filters=RAGFilterSpec(tenant_id="tenant_1"))
+    req = RAGQueryRequest(question="Find snippets", filters=RAGFilterSpec(tenant_id="tenant_1"))
     ret_res = engine.retrieve(req)
 
     # Retrieval results returned
@@ -429,43 +417,39 @@ def test_offset_deduplicator_80_percent_overlap():
 
     # Local window spanning char 100 to 500
     win = RAGNode[dict](
-        id="win_1",
+        node_id="win_1",
         granularity="local_window",
-        document_id="doc_1",
         span=SourceSpan(doc_id="doc_1", char_start=100, char_end=500),
         score=0.95,
         text="window context",
     )
     # Passage A: char 150 to 350 (200 chars). 100% inside window -> should be removed
     pass_a = RAGNode[dict](
-        id="pass_a",
+        node_id="pass_a",
         granularity="passage",
-        document_id="doc_1",
         span=SourceSpan(doc_id="doc_1", char_start=150, char_end=350),
         score=0.90,
         text="inner passage",
     )
     # Passage B: char 450 to 750 (300 chars). Overlap with window is 50 chars = 16.7% -> should be kept
     pass_b = RAGNode[dict](
-        id="pass_b",
+        node_id="pass_b",
         granularity="passage",
-        document_id="doc_1",
         span=SourceSpan(doc_id="doc_1", char_start=450, char_end=750),
         score=0.85,
         text="edge passage",
     )
     # Passage C: in a different document -> should be kept
     pass_c = RAGNode[dict](
-        id="pass_c",
+        node_id="pass_c",
         granularity="passage",
-        document_id="doc_2",
         span=SourceSpan(doc_id="doc_2", char_start=150, char_end=350),
         score=0.80,
         text="other doc passage",
     )
 
     result = dedup.deduplicate([win, pass_a, pass_b, pass_c])
-    result_ids = [n.id for n in result]
+    result_ids = [n.node_id for n in result]
 
     assert "win_1" in result_ids
     assert "pass_a" not in result_ids  # Removed because 100% >= 80% covered
@@ -479,16 +463,16 @@ def test_identity_deduplicator_by_url():
     """AC-RAG-33: IdentityDeduplicator(url) keeps one node per URL, the highest scored."""
     dedup = IdentityDeduplicator[dict](key="url")
 
-    n1 = RAGNode[dict](id="n1", text="Copy 1", score=0.6, metadata={"url": "https://news.com/a1"})
-    n2 = RAGNode[dict](id="n2", text="Copy 2", score=0.9, metadata={"url": "https://news.com/a1"})
-    n3 = RAGNode[dict](id="n3", text="Article 2", score=0.8, metadata={"url": "https://news.com/a2"})
+    n1 = RAGNode[dict](node_id="n1", text="Copy 1", score=0.6, metadata={"url": "https://news.com/a1"})
+    n2 = RAGNode[dict](node_id="n2", text="Copy 2", score=0.9, metadata={"url": "https://news.com/a1"})
+    n3 = RAGNode[dict](node_id="n3", text="Article 2", score=0.8, metadata={"url": "https://news.com/a2"})
 
     result = dedup.deduplicate([n1, n2, n3])
     assert len(result) == 2
     by_url = {n.metadata["url"]: n for n in result}
-    assert by_url["https://news.com/a1"].id == "n2"
+    assert by_url["https://news.com/a1"].node_id == "n2"
     assert by_url["https://news.com/a1"].score == 0.9
-    assert by_url["https://news.com/a2"].id == "n3"
+    assert by_url["https://news.com/a2"].node_id == "n3"
 
 
 # ── AC-RAG-40: Empty Results Handling ──────────────────────────────────────────
@@ -496,7 +480,7 @@ def test_identity_deduplicator_by_url():
 def test_empty_results_no_citations():
     """AC-RAG-40: Empty retrieval returns answer_found='no', no citations, and no fabricated sources."""
     store = InMemoryRAGStore[dict]()
-    models = ModelBindings(generation=["gemini-3.8-flash"])
+    models = ModelBindings(summary=["gemini-3.5-flash-lite"], generation=["gemini-3.8-flash"], embedding="gemini-embedding-2")
     profile = long_form_reader(models, router=RouterConfig(name="none"))
 
     mock_llm = MagicMock()
@@ -513,12 +497,12 @@ def test_empty_results_no_citations():
     )
     engine = RAGEngine(profile=profile, store=store, gateway=mock_gw)
 
-    req = RAGQueryRequest(query="Non-existent topic", filters=RAGFilterSpec(tenant_id="tenant_x"))
+    req = RAGQueryRequest(question="Non-existent topic", filters=RAGFilterSpec(tenant_id="tenant_x"))
     resp = engine.query(req)
 
     assert resp.answer_found == "no"
     assert len(resp.citations) == 0
-    assert len(resp.retrieval.nodes) == 0
+    assert len(resp.retrieved.nodes) == 0
 
 
 # ── AC-RAG-51: Reentrancy (Parallel Queries) ───────────────────────────────────
@@ -529,10 +513,10 @@ def test_reentrancy_16_parallel_queries():
 
     store = InMemoryRAGStore[dict]()
     nodes = [
-        RAGNode[dict](id=f"doc_{i}", text=f"Document text {i}", metadata={"tenant_id": "t1"})
+        RAGNode[dict](node_id=f"doc_{i}", text=f"Document text {i}", metadata={"tenant_id": "t1"})
         for i in range(10)
     ]
-    store.upsert_section(document_id="doc_par", section_id="main", nodes=nodes)
+    store.upsert_section_nodes("doc_par", 0, nodes)
 
     mock_llm = MagicMock()
     mock_llm.generate_with_usage.return_value = LLMResult(
@@ -546,12 +530,12 @@ def test_reentrancy_16_parallel_queries():
             usage=EmbeddingUsage(input_tokens=5),
         )
     )
-    models = ModelBindings(generation=["gemini-3.8-flash"])
+    models = ModelBindings(summary=["gemini-3.5-flash-lite"], generation=["gemini-3.8-flash"], embedding="gemini-embedding-2")
     profile = long_form_reader(models, router=RouterConfig(name="none"))
     engine = RAGEngine(profile=profile, store=store, gateway=mock_gw)
 
     def execute_query(idx: int):
-        req = RAGQueryRequest(query=f"Question {idx}", filters=RAGFilterSpec(tenant_id="t1"))
+        req = RAGQueryRequest(question=f"Question {idx}", filters=RAGFilterSpec(tenant_id="t1"))
         return engine.query(req)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
@@ -560,7 +544,7 @@ def test_reentrancy_16_parallel_queries():
 
     assert len(results) == 16
     for r in results:
-        assert len(r.retrieval.nodes) > 0
+        assert len(r.retrieved.nodes) > 0
         assert r.answer != ""
 
 
