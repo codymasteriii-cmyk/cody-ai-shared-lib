@@ -23,3 +23,6 @@ dependencies = [
 [project.optional-dependencies]
 # Only the tests build fixture PDFs with pymupdf; the library itself reads PDFs with pdfminer.six.
 test = ["pymupdf>=2.0,<2.1"]
+
+[tool.setuptools.packages.find]
+include = ["cody_ai_shared_lib*"]
