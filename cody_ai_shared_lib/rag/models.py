@@ -21,6 +21,11 @@ class NoIntentExt(BaseModel):
     pass
 
 
+class FilterPatch(BaseModel):
+    """A partial RAGFilterSpec. Patches combine by narrowing only (§5.5)."""
+    fields: dict[str, Any] = Field(default_factory=dict)
+
+
 MetaT = TypeVar("MetaT", bound=BaseModel)
 ExtT = TypeVar("ExtT", bound=BaseModel)
 
@@ -55,6 +60,7 @@ class RAGNode(BaseModel, Generic[MetaT]):
     parent_id: str | None = None
     parent_kind: str | None = None
     level: int | None = None
+    is_summary: bool = False
 
     # Scoring
     score: float = 0.0

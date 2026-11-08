@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Generic, Protocol, runtime_checkable
 from pydantic import BaseModel, Field
 
-from .models import MetaT, RAGFilterSpec, RAGNode
+from .models import FilterPatch, MetaT, RAGFilterSpec, RAGNode
 from .text.analyzer import TokenGroup
 
 
@@ -211,25 +211,28 @@ class RAGStore(ABC, Generic[MetaT]):
 
 @runtime_checkable
 class Guard(Protocol):
-    """Enforces boundaries, tenant isolation, or custom visibility rules.
+    """Enforces boundaries, tenant isolation, or custom visibility rules (§5.1).
 
     Guards are evaluated in two phases:
-      1. push_down(): translates guard into RAGFilterSpec predicates for store-side filtering.
-      2. verify_node() / transform_node(): verifies or shortens retrieved nodes in-memory (defense in depth).
+      1. to_filter(): translates guard into FilterPatch for store-side filtering.
+      2. verify(): verifies, truncates (with flag 'truncated_by_guard') or drops node in-memory.
     """
     name: str
+    hard: bool = True
+    forces_strict_grounding: bool = False
 
-    def push_down(self, filters: RAGFilterSpec) -> RAGFilterSpec:
+    def to_filter(self) -> FilterPatch:
         """Narrow filter predicates before query execution. MUST NOT widen filters."""
         ...
 
-    def verify_node(self, node: RAGNode[Any], filters: RAGFilterSpec) -> bool:
-        """Return True if node is permitted to be included in candidate set."""
+    def verify(self, node: RAGNode[Any]) -> RAGNode[Any] | None:
+        """Return the node (possibly truncated) or None to drop."""
         ...
 
-    def transform_node(self, node: RAGNode[Any], filters: RAGFilterSpec) -> RAGNode[Any] | None:
-        """Optionally shorten or sanitize node (e.g. cut at sequential boundary).
+    def verify_citation(self, citation: Any) -> bool:
+        """Return True if citation is permitted under guard."""
+        ...
 
-        Returns transformed node, or None if node should be omitted.
-        """
+    def prompt_rules(self) -> list[str]:
+        """Directives appended to system prompt (e.g. spoiler warning)."""
         ...
