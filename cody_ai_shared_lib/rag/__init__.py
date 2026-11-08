@@ -26,6 +26,12 @@ from .granularity import (
     has_trait,
     register_granularity,
 )
+from .guards import (
+    ScopeGuard,
+    SequentialBoundaryGuard,
+    TemporalGuard,
+    TenantGuard,
+)
 from .models import (
     ChatTurn,
     CitationCoverage,
@@ -33,6 +39,7 @@ from .models import (
     DefaultNodeMeta,
     Degradation,
     ExtT,
+    FilterPatch,
     IngestionProgress,
     MetaT,
     NodeRef,
@@ -118,6 +125,11 @@ __all__ = [
     "Fingerprint",
     "RAGStore",
     "Guard",
+    "FilterPatch",
+    "SequentialBoundaryGuard",
+    "TemporalGuard",
+    "TenantGuard",
+    "ScopeGuard",
     "NodeRenderer",
     "DefaultRenderer",
 ]
