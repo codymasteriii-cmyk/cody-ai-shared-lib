@@ -15,7 +15,7 @@ from typing import Any
 
 from ..embedding import EmbeddingResult, generate_embedding_with_usage
 from ..jev import JevClient, JevResult
-from ..llm import LLMClient, LLMResult, LLMUsage, ModelCallError
+from ..llm import LLMClient, LLMResult, LLMStreamChunk, LLMUsage, ModelCallError
 from ..pricing import compute_cost
 from ..rerank import RerankClient, RerankResult
 from .degradation import DegradationTracker
@@ -296,3 +296,104 @@ class ModelGateway:
                 error_type=type(exc).__name__,
             )
             return None
+
+    def stream(
+        self,
+        system_prompt: str,
+        user_message: str,
+        models: list[str],
+        stage: str,
+        usage_tracker: UsageTracker,
+        degradation_tracker: DegradationTracker,
+        budget_guard: BudgetGuard | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        cache_breakpoints: list[int] | None = None,
+        request_id: str = "",
+        tenant_or_user_id: str | None = None,
+    ) -> Any:
+        """Stream generation through ordered model fallback list (§10.8, AC-RAG-44, AC-RAG-70)."""
+        last_exc: Exception | None = None
+
+        for model_idx, model in enumerate(models):
+            if budget_guard is not None:
+                spent = usage_tracker.total()
+                est_cost = compute_cost(model, input_tokens=1000, output_tokens=max_tokens or 500)
+                ctx = CallContext(
+                    stage=stage,
+                    request_id=request_id,
+                    tenant_or_user_id=tenant_or_user_id,
+                    est_input_tokens=1000,
+                    est_cost_usd=est_cost,
+                    request_spent=spent,
+                )
+                decision = budget_guard.before_call(ctx)
+                if decision == "skip":
+                    degradation_tracker.record(
+                        dg_id="DG-11",
+                        stage=stage,
+                        reason="BudgetGuard returned skip",
+                        impact="Generation streaming stage skipped",
+                    )
+                    return
+
+            t0 = time.perf_counter()
+            emitted_any = False
+            try:
+                chunk_iter = self.llm_client.stream(
+                    system_prompt=system_prompt,
+                    user_message=user_message,
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    cache_breakpoints=cache_breakpoints,
+                )
+                for chunk in chunk_iter:
+                    emitted_any = True
+                    if chunk.usage is not None:
+                        lat_ms = (time.perf_counter() - t0) * 1000.0
+                        usage_tracker.record(
+                            StageUsage(
+                                stage=stage,
+                                model=model,
+                                input_tokens=chunk.usage.input_tokens,
+                                output_tokens=chunk.usage.output_tokens,
+                                cached_tokens=chunk.usage.cached_tokens,
+                                latency_ms=lat_ms,
+                                cost_usd=chunk.usage.cost_usd,
+                                price_table_version=chunk.usage.price_table_version,
+                                estimated=chunk.usage.estimated,
+                                billing="billed",
+                                outcome="ok",
+                            )
+                        )
+                    if chunk.finish_reason == "safety":
+                        raise GenerationError(
+                            f"Generation blocked by safety filters on model '{model}'",
+                            reason="blocked",
+                            stage=stage,
+                        )
+                    yield chunk
+                return
+            except GenerationError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if emitted_any:
+                    raise
+                degradation_tracker.record(
+                    dg_id="DG-02",
+                    stage=stage,
+                    reason=f"Model '{model}' failed before streaming: {exc}",
+                    fallback_used="Next model in fallback list",
+                    impact=f"Switched from '{model}' to backup model",
+                    error_type=type(exc).__name__,
+                )
+                continue
+
+        raise GenerationError(
+            f"All models failed for streaming stage '{stage}': {last_exc}",
+            reason="all_models_failed",
+            stage=stage,
+            cause=last_exc,
+        )

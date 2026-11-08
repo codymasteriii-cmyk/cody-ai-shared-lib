@@ -23,7 +23,9 @@ from .errors import (
     ProfileConfigError,
     StoreCapabilityError,
 )
+from ..pricing import compute_cost
 from .gateway import ModelGateway
+from .generation.flag_buffer import FlagStreamBuffer
 from .generation.stuff import StuffStrategy
 from .guards import ScopeGuard, SequentialBoundaryGuard, TemporalGuard, TenantGuard
 from .intent.heuristic import HeuristicRouter
@@ -47,9 +49,11 @@ from .models import (
     RAGResponse,
     RAGRetrievalResult,
     RAGSectionInput,
+    RAGStreamEvent,
     ReindexStatus,
     SourceSpan,
     StageUsage,
+    UsageTotal,
 )
 from .ports import Fingerprint, Guard, NodeRenderer, RAGStore
 from .postgen.citations import CitationExtractor
@@ -75,6 +79,31 @@ from .strategies.keyword import KeywordFirstStrategy, KeywordOnlyStrategy
 from .strategies.transforms import SecondaryQueryFanOut, fair_interleave
 from .trace import ObserverDispatcher, RAGObserver, RAGTrace, StageRecord
 from .usage import BudgetGuard, CallContext, UsageTracker
+from typing import Iterator
+
+
+class RAGStream(Generic[MetaT]):
+    """Iterator yielding RAGStreamEvent for stream_query (§3.11, §10.8, RAG-RES-5)."""
+
+    def __init__(self, gen: Iterator[RAGStreamEvent], usage_tracker: UsageTracker):
+        self._gen = gen
+        self._usage_tracker = usage_tracker
+
+    def __iter__(self) -> "RAGStream[MetaT]":
+        return self
+
+    def __next__(self) -> RAGStreamEvent:
+        return next(self._gen)
+
+    def close(self) -> None:
+        """Close the stream, stopping generation and recording cancelled usage if needed."""
+        if hasattr(self._gen, "close"):
+            self._gen.close()
+
+    @property
+    def usage_total(self) -> UsageTotal:
+        """Report total spend and tokens, readable at any time and after close (AC-RAG-70, RAG-OPS-2)."""
+        return self._usage_tracker.total()
 
 
 class RAGEngine(Generic[MetaT]):
@@ -554,17 +583,26 @@ class RAGEngine(Generic[MetaT]):
                 coverage_ratio=1.0,
             )
 
-        final_answer = self.sanitizer.sanitize(clean_text)
+        flag_buf = FlagStreamBuffer()
+        stripped_deltas = flag_buf.feed(clean_text) + flag_buf.finalize()
+        final_answer = self.sanitizer.sanitize("".join(stripped_deltas))
 
-        # Answer found classification
-        if not nodes:
-            answer_found = "no"
-            citations = []
-        else:
-            answer_found = "yes"
-            not_found_phrases = ["cannot be found", "not found in the provided", "not enough information"]
-            if any(p in final_answer.lower() for p in not_found_phrases):
+        # Answer found classification (§10.5)
+        answer_found = flag_buf.answer_found
+        if answer_found is None:
+            if not nodes:
                 answer_found = "no"
+                citations = []
+            else:
+                answer_found = "yes"
+                not_found_phrases = ["cannot be found", "not found in the provided", "not enough information"]
+                if any(p in final_answer.lower() for p in not_found_phrases):
+                    answer_found = "no"
+
+        all_guards = list(self.guards) + list(request.guards)
+        forces_strict = any(getattr(g, "forces_strict_grounding", False) for g in all_guards)
+        is_strict = (self.profile.generation.grounding_mode == "strict" or forces_strict)
+        abstained = (answer_found == "no") if is_strict else False
 
         # Update conversation state
         conv_state = request.conversation or ConversationState(fence_id=active_fence_id)
@@ -593,6 +631,7 @@ class RAGEngine(Generic[MetaT]):
             retrieved=ret_result,
             grounded=True,
             answer_found=answer_found,
+            abstained=abstained,
             citation_coverage=coverage,
             state=conv_state,
             usage=usage_tracker.stage_usages,
@@ -604,6 +643,288 @@ class RAGEngine(Generic[MetaT]):
 
         self.dispatcher.notify_complete(trace, resp)
         return resp
+
+    def stream_query(
+        self,
+        request: RAGQueryRequest,
+        intent: QueryIntent | None = None,
+    ) -> RAGStream[MetaT]:
+        """Event streaming RAG query pipeline (§10.8, AC-RAG-45, RAG-OPS-1, RAG-OPS-2)."""
+        t0 = self.clock.monotonic()
+        req_id = f"req-{uuid.uuid4().hex[:12]}"
+        usage_tracker = UsageTracker(request_id=req_id, tenant_or_user_id=request.tenant_id)
+        degradations = DegradationTracker(fallbacks=self.profile.fallbacks)
+        deadline = Deadline(deadline_seconds=self.profile.runtime.deadline_seconds, clock=self.clock)
+        all_guards = list(self.guards) + list(request.guards)
+
+        def _generator() -> Iterator[RAGStreamEvent]:
+            stream_completed = False
+            active_model = self.profile.models.generation[0] if self.profile.models.generation else "gemini-3.5-flash-lite"
+            est_in_tokens = 1000
+            emitted_deltas: list[str] = []
+
+            try:
+                # 1. Routing
+                resolved_intent = intent or self.route(request)
+                if intent is not None:
+                    resolved_intent = clamp_intent(intent.model_dump(), degradations)
+
+                yield RAGStreamEvent(
+                    event="intent",
+                    data={
+                        "route": resolved_intent.route,
+                        "scope": resolved_intent.scope,
+                        "search_query": resolved_intent.search_query,
+                        "router_source": resolved_intent.router_source,
+                    },
+                )
+
+                # Emit any degradations that fired during routing
+                for d in degradations.degradations:
+                    yield RAGStreamEvent(event="degradation", data=d.model_dump())
+
+                # 2. Check no-retrieval route
+                if resolved_intent.route == "no_retrieval":
+                    yield RAGStreamEvent(event="status", data={"stage": "generating"})
+                    flag_buf = FlagStreamBuffer()
+                    accumulated_text: list[str] = []
+
+                    chunk_iter = self.gateway.stream(
+                        system_prompt="You are a helpful, polite assistant. Respond warmly to the user.",
+                        user_message=request.query,
+                        models=self.profile.models.generation,
+                        stage="generation_no_retrieval",
+                        usage_tracker=usage_tracker,
+                        degradation_tracker=degradations,
+                        budget_guard=self.budget_guard,
+                        request_id=req_id,
+                        tenant_or_user_id=request.tenant_id,
+                    )
+                    for chunk in chunk_iter:
+                        if chunk.delta:
+                            deltas = flag_buf.feed(chunk.delta)
+                            for d in deltas:
+                                emitted_deltas.append(d)
+                                accumulated_text.append(d)
+                                yield RAGStreamEvent(event="delta", data={"text": d})
+
+                    final_deltas = flag_buf.finalize()
+                    for d in final_deltas:
+                        emitted_deltas.append(d)
+                        accumulated_text.append(d)
+                        yield RAGStreamEvent(event="delta", data={"text": d})
+
+                    full_text = "".join(accumulated_text)
+                    clean_text, citations = self.citation_extractor.extract(full_text, [])
+                    final_answer = self.sanitizer.sanitize(clean_text)
+
+                    yield RAGStreamEvent(
+                        event="citations",
+                        data={"citations": [], "sources": [], "citation_coverage": 1.0},
+                    )
+
+                    total_u = usage_tracker.total()
+                    stream_completed = True
+                    yield RAGStreamEvent(
+                        event="done",
+                        data={
+                            "answer_id": f"ans-{uuid.uuid4().hex[:12]}",
+                            "answer_final": final_answer,
+                            "citations": [],
+                            "sources": [],
+                            "usage": [u.model_dump() for u in usage_tracker.stage_usages],
+                            "usage_total": total_u.model_dump(),
+                            "degradations": [d.model_dump() for d in degradations.degradations],
+                            "state": (request.conversation or ConversationState()).model_dump(),
+                            "grounded": True,
+                            "answer_found": flag_buf.answer_found or "yes",
+                            "abstained": False,
+                            "message_id": getattr(request, "message_id", None),
+                        },
+                    )
+                    return
+
+                # 3. Candidate Retrieval
+                yield RAGStreamEvent(event="status", data={"stage": "retrieving"})
+                ret_result = self.retrieve(request, intent=resolved_intent)
+
+                for d in ret_result.degradations:
+                    degradations.record(d.id, d.stage, d.reason, d.impact, d.fallback_used)
+                    yield RAGStreamEvent(event="degradation", data=d.model_dump())
+                for u in ret_result.usage:
+                    usage_tracker.record(u)
+
+                nodes = ret_result.nodes
+                yield RAGStreamEvent(
+                    event="retrieval",
+                    data={
+                        "nodes": [n.id for n in nodes],
+                        "node_count": len(nodes),
+                        "strategy_used": ret_result.strategy_used,
+                        "applied_filters": ret_result.applied_filters.model_dump() if ret_result.applied_filters else {},
+                    },
+                )
+
+                # 4. Context Assembly & Fencing
+                state_fence_id = request.conversation.fence_id if request.conversation else None
+                sys_prompt, user_msg, active_fence_id = self.assembler.assemble(
+                    request=request,
+                    nodes=nodes,
+                    fence_id=state_fence_id,
+                )
+                est_in_tokens = estimate_tokens(sys_prompt + "\n" + user_msg)
+
+                # 5. Generation
+                yield RAGStreamEvent(event="status", data={"stage": "generating"})
+                flag_buf = FlagStreamBuffer()
+                accumulated_text: list[str] = []
+
+                if self.profile.generation.stream_mode == "buffered":
+                    gen_res = self.generator.generate(
+                        system_prompt=sys_prompt,
+                        user_message=user_msg,
+                        usage_tracker=usage_tracker,
+                        degradation_tracker=degradations,
+                        budget_guard=self.budget_guard,
+                        request_id=req_id,
+                        tenant_or_user_id=request.tenant_id,
+                    )
+                    deltas = flag_buf.feed(gen_res.text) + flag_buf.finalize()
+                    for d in deltas:
+                        emitted_deltas.append(d)
+                        accumulated_text.append(d)
+                        yield RAGStreamEvent(event="delta", data={"text": d})
+                else:
+                    chunk_iter = self.generator.stream(
+                        system_prompt=sys_prompt,
+                        user_message=user_msg,
+                        usage_tracker=usage_tracker,
+                        degradation_tracker=degradations,
+                        budget_guard=self.budget_guard,
+                        request_id=req_id,
+                        tenant_or_user_id=request.tenant_id,
+                    )
+                    for chunk in chunk_iter:
+                        if chunk.delta:
+                            deltas = flag_buf.feed(chunk.delta)
+                            for d in deltas:
+                                emitted_deltas.append(d)
+                                accumulated_text.append(d)
+                                yield RAGStreamEvent(event="delta", data={"text": d})
+
+                    final_deltas = flag_buf.finalize()
+                    for d in final_deltas:
+                        emitted_deltas.append(d)
+                        accumulated_text.append(d)
+                        yield RAGStreamEvent(event="delta", data={"text": d})
+
+                full_text = "".join(accumulated_text)
+
+                # 6. Post-generation: citation extraction, verification, sanitization
+                clean_text, citations = self.citation_extractor.extract(full_text, nodes)
+                if self.profile.citations.verify_quotes:
+                    citations, coverage = self.quote_verifier.verify(citations, nodes)
+                else:
+                    coverage = CitationCoverage(
+                        total_citations=len(citations),
+                        verified_citations=len(citations),
+                        coverage_ratio=1.0,
+                    )
+
+                verified_cites = [c for c in citations if c.verified]
+                seen_sources: set[str] = set()
+                sources: list[SourceSpan] = []
+                for c in verified_cites:
+                    if c.node_id not in seen_sources:
+                        seen_sources.add(c.node_id)
+                        matching_node = next((n for n in nodes if n.id == c.node_id), None)
+                        if matching_node and matching_node.span:
+                            sources.append(matching_node.span)
+
+                yield RAGStreamEvent(
+                    event="citations",
+                    data={
+                        "citations": [c.model_dump() for c in citations],
+                        "sources": [s.model_dump() for s in sources],
+                        "citation_coverage": coverage.coverage_ratio if coverage else 1.0,
+                    },
+                )
+
+                final_answer = self.sanitizer.sanitize(clean_text)
+
+                # Answer found determination (§10.5)
+                answer_found = flag_buf.answer_found
+                if answer_found is None:
+                    if not nodes:
+                        answer_found = "no"
+                    else:
+                        answer_found = "yes"
+                        not_found_phrases = ["cannot be found", "not found in the provided", "not enough information"]
+                        if any(p in final_answer.lower() for p in not_found_phrases):
+                            answer_found = "no"
+
+                forces_strict = any(getattr(g, "forces_strict_grounding", False) for g in all_guards)
+                is_strict = (self.profile.generation.grounding_mode == "strict" or forces_strict)
+                abstained = (answer_found == "no") if is_strict else False
+
+                # Update conversation state
+                conv_state = request.conversation or ConversationState(fence_id=active_fence_id)
+                conv_state.fence_id = active_fence_id
+                for n in nodes:
+                    conv_state.prior_nodes.append(NodeRef(node_id=n.id))
+                conv_state = self.conversation_manager.prune_state(conv_state)
+
+                total_u = usage_tracker.total()
+                stream_completed = True
+                yield RAGStreamEvent(
+                    event="done",
+                    data={
+                        "answer_id": f"ans-{uuid.uuid4().hex[:12]}",
+                        "answer_final": final_answer,
+                        "citations": [c.model_dump() for c in citations],
+                        "sources": [s.model_dump() for s in sources],
+                        "usage": [u.model_dump() for u in usage_tracker.stage_usages],
+                        "usage_total": total_u.model_dump(),
+                        "degradations": [d.model_dump() for d in degradations.degradations],
+                        "state": conv_state.model_dump(),
+                        "grounded": True,
+                        "answer_found": answer_found,
+                        "abstained": abstained,
+                        "message_id": getattr(request, "message_id", None),
+                    },
+                )
+
+            except GeneratorExit:
+                if not stream_completed and emitted_deltas:
+                    out_tok = estimate_tokens("".join(emitted_deltas))
+                    cost = compute_cost(active_model, input_tokens=est_in_tokens, output_tokens=out_tok)
+                    usage_tracker.record(
+                        StageUsage(
+                            stage="generation",
+                            model=active_model,
+                            input_tokens=est_in_tokens,
+                            output_tokens=out_tok,
+                            cost_usd=cost,
+                            estimated=True,
+                            outcome="cancelled",
+                            billing="billed",
+                        )
+                    )
+                raise
+            except Exception as exc:
+                if not stream_completed:
+                    err_data = {
+                        "type": type(exc).__name__,
+                        "stage": getattr(exc, "stage", "stream"),
+                        "message": str(exc),
+                        "request_id": req_id,
+                        "usage": [u.model_dump() for u in usage_tracker.stage_usages],
+                        "usage_total": usage_tracker.total().model_dump(),
+                    }
+                    yield RAGStreamEvent(event="error", data=err_data)
+                raise
+
+        return RAGStream[MetaT](_generator(), usage_tracker=usage_tracker)
 
     def ingest_document(
         self,

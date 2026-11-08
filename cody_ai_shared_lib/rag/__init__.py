@@ -15,8 +15,9 @@ from .errors import (
     UnsupportedFilterError,
 )
 from .degradation import AGREED_DEGRADATIONS, DegradationTracker
-from .engine import RAGEngine
+from .engine import RAGEngine, RAGStream
 from .gateway import ModelGateway
+from .integrations.sse import format_event
 from .granularity import (
     BUILTIN_GRANULARITIES,
     TRAIT_ATOMIC,
@@ -239,6 +240,8 @@ __all__ = [
     "make_bounded_pool",
     # Facade & Intent
     "RAGEngine",
+    "RAGStream",
+    "format_event",
     "QueryPlan",
     "TemporalExtractor",
     "HeuristicRouter",

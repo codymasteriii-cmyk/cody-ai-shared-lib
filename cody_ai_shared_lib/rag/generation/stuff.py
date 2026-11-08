@@ -43,3 +43,32 @@ class StuffStrategy:
             request_id=request_id,
             tenant_or_user_id=tenant_or_user_id,
         )
+
+    def stream(
+        self,
+        system_prompt: str,
+        user_message: str,
+        usage_tracker: UsageTracker,
+        degradation_tracker: DegradationTracker,
+        budget_guard: BudgetGuard | None = None,
+        cache_breakpoints: list[int] | None = None,
+        request_id: str = "",
+        tenant_or_user_id: str | None = None,
+    ) -> Any:
+        """Stream generation through ordered model fallback list."""
+        models = self.profile.models.generation
+        temperature = self.profile.generation.temperature
+
+        return self.gateway.stream(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            models=models,
+            stage="generation",
+            usage_tracker=usage_tracker,
+            degradation_tracker=degradation_tracker,
+            budget_guard=budget_guard,
+            temperature=temperature,
+            cache_breakpoints=cache_breakpoints,
+            request_id=request_id,
+            tenant_or_user_id=tenant_or_user_id,
+        )

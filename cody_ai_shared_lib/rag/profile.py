@@ -190,7 +190,7 @@ def long_form_reader(models: ModelBindings, **overrides: Any) -> EngineProfile:
         ),
         "post_stages": ["offset_dedup", "top_k"],
         "context": ContextConfig(max_context_tokens=160_000),
-        "generation": GenerationConfig(grounding_mode="strict"),
+        "generation": GenerationConfig(grounding_mode="strict", stream_mode="native"),
         "guards": ["sequential_boundary"],
     }
     cfg.update(overrides)
