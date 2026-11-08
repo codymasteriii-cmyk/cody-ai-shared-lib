@@ -2211,7 +2211,8 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | :--- | :--- | :--- |
 | `LLMResult.finish_reason: str \| None` (normalized: `"stop"`, `"length"`, `"safety"`, `"other"`) | §10.7 truncation handling | P1 |
 | `LLMUsage` gains `cached_tokens`, `cost_usd`, `price_table_version`, `estimated` | §13.1, §15.4 | P1 |
-| Provider output-limit policy (e.g. do not send `max_tokens` to Gemini where KB found it harmful) as `LLMClient` behaviour, not a RAG rule | R-11b | P1 |
+| Provider output-limit policy (e.g. do not send `max_tokens` to Gemini where KB found it harmful; use `max_completion_tokens` for GPT reasoning models) as `LLMClient` behaviour, not a RAG rule | R-11b | P1 |
+| Provider routing expanded: direct Google GenAI (`gemini-*`), direct Anthropic (`claude-*`, with `ThinkingBlock` extraction), direct OpenAI (`gpt-*` using `OPENAI_API_KEY`), and Vercel AI Gateway for namespaced models (`moonshotai/*`, `minimax/*` via OpenAI-compatible endpoint with `VERCEL_API_KEY`) | Ecosystem-wide LLM access | P1 |
 | `LLMClient.stream(...) -> Iterator[LLMStreamChunk]` (text deltas, then a final chunk with usage, cost and `finish_reason`) | §10.8 native streaming; a profile asking for native streaming without it fails at startup | P2 |
 | Cache breakpoint pass-through (`cache_breakpoints` → Anthropic `cache_control`; Gemini context caching where available) | §10.3; without it the layout still applies, with no explicit cache controls | P2 |
 
@@ -2219,11 +2220,49 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 - **Errors after a billed response (all model modules).** When a module raises after the provider has returned a billed response (for example `LLMClient` failing to parse structured output, or a response blocked after generation), the exception carries the `usage` of that call (`ModelCallError.usage`, with cost). A call that fails without a response (a timeout, a dropped connection) is reported with the estimated input tokens, zero output and `billing="unknown"`, so the caller decides whether to count it. This gives direct callers the same failure-path accounting as RAG (RAG-OPS-1).
 - **`jev.py`:** `JevResult` gains `usage` (tokens or per-call units) with `cost_usd`, `price_table_version` and `estimated`.
 - **`embedding.py`:** a new `generate_embedding_with_usage(texts, task_type) -> EmbeddingResult(vectors, usage)`. Tokens are estimated with `estimate_tokens` and flagged `estimated=True` unless the provider reports them. The existing `generate_embedding` keeps its signature and behaviour (zero vectors for failed items), so current callers such as NewsIntelligence's ingestion are unaffected.
-- **`rerank.py` (new):** the Jina rerank HTTP client moves here from the RAG package, so it records usage and cost like the other modules and apps can call it directly (NewsIntelligence calls Jina itself today). The RAG reranker stage (§9.3) becomes a thin stage over it.
+- **`rerank.py` (new):** the Jina rerank HTTP client moves here from the RAG package ($0.05 / 1M tokens), so it records usage and cost like the other modules and apps can call it directly (NewsIntelligence calls Jina itself today). The RAG reranker stage (§9.3) becomes a thin stage over it.
+- **Generalized Multimodal Modules (new, for Cody AI ecosystem):**
+  - **`image_gen.py` (`ImageGenClient`):** Generates 2D images routing to Google GenAI (`gemini-3-pro-image`, `gemini-nano-banana-2.1`) or Vercel Gateway (`bytedance/seedream-*`). Returns `ImageGenResult` with `ImageUsage` ($0.04/img for Seedream).
+  - **`video_gen.py` (`VideoGenClient`):** Generates AI video routing to Vercel Video Gateway (`/v3/ai/video-model`) for `minimax/minimax-h3*` ($0.08/sec) and `bytedance/seedance-*`. Returns `VideoGenResult` with `VideoUsage`.
+  - *Reporting note:* Vercel AI Gateway reports real token/cost metadata for text models (`moonshotai/*`, `minimax/*`), but returns zero tokens for image and video endpoints; image and video modules compute cost client-side using `pricing.py` unit rates with `estimated=True`.
 
 ### 15.3 Central price table (`pricing.py`, new)
 - **Data in one place:** for each model id, input, output and cached-input price per million tokens, price per call where applicable, and `effective_from`. The table has a `price_table_version`. A lib release updates it once for every app.
 - **It is data, not a model choice.** The table lists prices for models; it never selects one. D-12 (no model ids chosen by the lib) is unchanged.
+- **Supported model pricing catalog:**
+  - `gemini-3.8-flash`: $1.50 in / $7.50 out per 1M
+  - `gemini-3.5-flash-lite`: $0.30 in / $2.50 out per 1M
+  - `gemini-4-argon`: $4.00 in / $20.00 out per 1M
+  - `gemini-omni-1.2-flash`: $1.50 in / $12.00 out per 1M (Interactions API)
+  - `gemini-nano-banana-2.1`: $1.50 in / $30.00 out per 1M
+  - `gemini-3.8-flash-tts`: $1.00 in / $18.00 out per 1M
+  - `gemini-3-pro-image`: $2.00 in / $120.00 out per 1M
+  - `gemini-embedding-2`: $0.20 in per 1M (embedding only)
+  - `gpt-6-luna`: $0.10 in / $0.50 out per 1M
+  - `gpt-6.1-terra`: $1.00 in / $5.00 out per 1M
+  - `gpt-6.1-sol`: $2.00 in / $10.00 out per 1M
+  - `gpt-6-astra`: $10.00 in / $50.00 out per 1M
+  - `claude-fable-5-1`: $10.00 in / $50.00 out per 1M
+  - `claude-opus-5-5`: $4.00 in / $20.00 out per 1M
+  - `claude-sonnet-5-5`: $2.00 in / $10.00 out per 1M
+  - `claude-haiku-5-5`: $0.10 in / $0.50 out per 1M
+  - `claude-opus-5`: $5.00 in / $25.00 out per 1M
+  - `claude-sonnet-5`: $2.00 in / $10.00 out per 1M
+  - `claude-haiku-4-5-20251001`: $1.00 in / $5.00 out per 1M
+  - `jev`: $0.04 in per 1M
+  - `moonshotai/kimi-k3.1-pro`: $0.29 in / $8.14 out per 1M
+  - `moonshotai/kimi-k3.1-pro-highspeed`: $4.00 in / $20.00 out per 1M
+  - `minimax/minimax-m3.1-flash`: $0.10 in / $0.45 out per 1M
+  - `bytedance/seedream-5.0-pro`: $0.003 in per 1M, $0.04 per image
+  - `bytedance/seedream-5.0-lite`: $0.04 per image
+  - `bytedance/seedream-4.5`: $0.04 per image
+  - `minimax/minimax-h3`: $0.04 per image input, $0.08 per second output
+  - `minimax/minimax-h3-max`: $0.05 per second output
+  - `bytedance/seedance-2.5`: $10.70 out per 1M
+  - `bytedance/seedance-2.0-mini`: $3.50 out per 1M
+  - `bytedance/seedance-2.0`: $7.00 out per 1M
+  - `bytedance/seedance-2.0-fast`: $5.60 out per 1M
+  - `jina-reranker`: $0.05 per 1M tokens
 - **`compute_cost(model, usage) -> float | None`** is used by the model modules. A model not in the table gives `None`; the lib never guesses.
 - **`estimate_cost(model, est_input_tokens, est_output_tokens) -> float | None`** lets any caller, and the RAG gateway, check a dollar limit **before** a call.
 - **Overrides:** `set_price_override(model, price)`, or the same mapping from settings, for negotiated rates and models not yet in the table. Precedence: override, then table, then `None`.
