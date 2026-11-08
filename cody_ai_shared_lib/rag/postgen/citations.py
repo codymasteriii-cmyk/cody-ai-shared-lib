@@ -45,7 +45,42 @@ class CitationExtractor(Generic[MetaT]):
         # Match [1], [2], [1, 2]
         processed_text = re.sub(r"\[([0-9,\s]+)\]", replace_numeric, text)
 
-        # 2. Look for ref citations [ref:node-id]
+        # 2. Look for offset citations [c{seq}:{start}-{end}] (AC-RAG-30, §11.2)
+        def replace_offset(match: re.Match) -> str:
+            seq = int(match.group(1))
+            start = int(match.group(2))
+            end = int(match.group(3))
+            # Match containing node in the fence
+            matching_node = next(
+                (n for n in nodes if n.span.section_seq == seq and n.span.char_start <= start and n.span.char_end >= end),
+                None,
+            )
+            if not matching_node:
+                # Search for any overlapping node in that section
+                matching_node = next(
+                    (n for n in nodes if n.span.section_seq == seq and n.span.char_end > start and n.span.char_start < end),
+                    None,
+                )
+            if matching_node:
+                cite = RAGCitation(
+                    index=len(citations) + 1,
+                    node_id=matching_node.id,
+                    document_id=matching_node.document_id,
+                    section_id=matching_node.section_id,
+                    span=matching_node.span.model_copy(update={
+                        "char_start": matching_node.span.char_start,
+                        "char_end": matching_node.span.char_end,
+                    }),
+                    quote=matching_node.text[:200],
+                    verified=True,
+                )
+                citations.append(cite)
+                return f"[{cite.index}]"
+            return match.group(0)
+
+        processed_text = re.sub(r"\[c(\d+):(\d+)-(\d+)\]", replace_offset, processed_text)
+
+        # 3. Look for ref citations [ref:node-id]
         def replace_ref(match: re.Match) -> str:
             nid = match.group(1).strip()
             if nid in node_map_by_id:

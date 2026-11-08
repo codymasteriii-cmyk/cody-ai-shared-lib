@@ -31,11 +31,11 @@ class RetrievalContext(BaseModel, Generic[MetaT]):
     intent: QueryIntent
     variants: list[QueryVariant] = Field(default_factory=list)
     filters: RAGFilterSpec
-    store: RAGStore[MetaT]
+    store: Any
     profile: EngineProfile
-    analyzer: TextAnalyzer
-    renderer: NodeRenderer[MetaT]
-    gateway: ModelGateway
+    analyzer: Any
+    renderer: Any
+    gateway: Any
     deadline: Deadline
     usage_tracker: UsageTracker
     degradation_tracker: DegradationTracker

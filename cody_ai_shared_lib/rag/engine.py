@@ -69,6 +69,7 @@ from .strategies.adaptive import AdaptiveStrategy
 from .strategies.context import QueryVariant, RetrievalContext, RetrievalStrategy
 from .strategies.dense_vector import DenseVectorStrategy
 from .strategies.full_context import FullContextStrategy
+from .strategies.hierarchical import HierarchicalStrategy
 from .strategies.hybrid_rrf import HybridRRFStrategy
 from .strategies.keyword import KeywordFirstStrategy, KeywordOnlyStrategy
 from .strategies.transforms import SecondaryQueryFanOut, fair_interleave
@@ -224,7 +225,7 @@ class RAGEngine(Generic[MetaT]):
         return self.router.route(request, request.conversation, ctx)
 
     def plan(self, request: RAGQueryRequest, intent: QueryIntent | None = None) -> QueryPlan:
-        """Evaluates adaptive strategy rules without retrieval or generation (§8.12)."""
+        """Evaluates adaptive strategy rules without retrieval or generation (§8.12, AC-RAG-48, AC-RAG-58)."""
         resolved_intent = intent or QueryIntent(
             route="rag",
             scope="local_lookup",
@@ -232,11 +233,22 @@ class RAGEngine(Generic[MetaT]):
             router_source="passthrough",
         )
         effective_filters = self._build_effective_filters(request)
+        for g in self.guards + list(request.guards):
+            patch = g.to_filter()
+            if patch is not None:
+                effective_filters = effective_filters.patch(patch)
+
         stats = self.store.scope_stats(effective_filters)
         max_t0 = self.profile.retrieval.full_context_max_tokens
+        caps = self.store.capabilities() if callable(self.store.capabilities) else self.store.capabilities
 
-        # Rule evaluation
-        if max_t0 > 0 and stats.total_tokens > 0 and stats.total_tokens <= max_t0:
+        # Rule evaluation matching §8.9 Adaptive Rules
+        if (
+            max_t0 > 0
+            and stats.total_tokens > 0
+            and stats.total_tokens <= max_t0
+            and caps.supports_full_scope_fetch
+        ):
             return QueryPlan(
                 strategy="full_context",
                 tier_decision_reason=f"full_context: {stats.total_tokens} <= {max_t0} tokens",
@@ -247,18 +259,21 @@ class RAGEngine(Generic[MetaT]):
                 scope=stats,
             )
 
-        if resolved_intent.scope == "document_overview" and self.profile.retrieval.always_include_summaries:
+        if (
+            (resolved_intent.scope == "document_overview" or self.profile.retrieval.always_include_summaries)
+            and caps.supports_parent_summaries
+        ):
             return QueryPlan(
                 strategy="hierarchical",
-                tier_decision_reason="summaries: document overview query",
+                tier_decision_reason="hierarchical: document overview query or always_include_summaries",
                 rule=2,
-                requires_index=False,
-                reads=frozenset(["fetch_summaries"]),
+                requires_index=True,
+                reads=frozenset(["supports_parent_summaries", "supports_vector_search"]),
                 applied_filters=effective_filters,
                 scope=stats,
             )
 
-        if resolved_intent.exact_terms and self.store.capabilities.supports_keyword_fts:
+        if resolved_intent.exact_terms and caps.supports_keyword_fts:
             return QueryPlan(
                 strategy="keyword_first",
                 tier_decision_reason="keyword_first: exact terms in query",
@@ -269,9 +284,10 @@ class RAGEngine(Generic[MetaT]):
                 scope=stats,
             )
 
+        strat_name = "hybrid_rrf" if caps.supports_native_hybrid else "dense_vector"
         return QueryPlan(
-            strategy="hybrid_rrf" if self.store.capabilities.supports_native_hybrid else "dense_vector",
-            tier_decision_reason=f"hybrid_rrf: scope {stats.total_tokens} tokens exceeded Tier 0 gate {max_t0}",
+            strategy=strat_name,
+            tier_decision_reason=f"{strat_name}: scope {stats.total_tokens} tokens exceeded Tier 0 gate {max_t0}",
             rule=4,
             requires_index=True,
             reads=frozenset(["supports_vector_search"]),
@@ -314,9 +330,10 @@ class RAGEngine(Generic[MetaT]):
             resolved_intent = clamp_intent(intent.model_dump(), degradations)
 
         effective_filters = self._build_effective_filters(request)
+        all_guards = list(self.guards) + list(request.guards)
 
         # 2. Run guards before_retrieval
-        for guard in self.guards:
+        for guard in all_guards:
             patch = guard.to_filter()
             if patch is not None:
                 effective_filters = effective_filters.patch(patch)
@@ -342,9 +359,11 @@ class RAGEngine(Generic[MetaT]):
         ret_ctx.variants = fanout.transform(request, resolved_intent)
 
         # 5. Execute Strategy
-        strat_name = self.profile.retrieval.default_strategy
+        strat_name = request.strategy_override or self.profile.retrieval.default_strategy
         if strat_name == "adaptive":
             strategy: RetrievalStrategy[MetaT] = AdaptiveStrategy()
+        elif strat_name == "hierarchical":
+            strategy = HierarchicalStrategy()
         elif strat_name == "full_context":
             strategy = FullContextStrategy()
         elif strat_name == "hybrid_rrf":
@@ -369,8 +388,23 @@ class RAGEngine(Generic[MetaT]):
         else:
             nodes = strategy.retrieve(ret_ctx)
 
+        # Follow-up node reuse (§7.7, AC-RAG-29, AC-RAG-30)
+        caps = self.store.capabilities() if callable(self.store.capabilities) else self.store.capabilities
+        if request.conversation and request.conversation.prior_nodes and caps.supports_fetch_nodes:
+            prior_ids = [ref.node_id for ref in request.conversation.prior_nodes]
+            reused = self.store.fetch_nodes(prior_ids, effective_filters)
+            guarded_reused: list[RAGNode[MetaT]] = []
+            for rn in reused:
+                passed = rn
+                for g in all_guards:
+                    passed = g.verify(passed) if passed is not None else None
+                if passed is not None:
+                    guarded_reused.append(passed)
+            seen_ids = {n.id for n in nodes}
+            nodes = [rn for rn in guarded_reused if rn.id not in seen_ids] + nodes
+
         # 6. Apply post-retrieval guards
-        for guard in self.guards:
+        for guard in all_guards:
             verified_nodes: list[RAGNode[MetaT]] = []
             for n in nodes:
                 res = guard.verify(n)

@@ -178,6 +178,9 @@ def long_form_reader(models: ModelBindings, **overrides: Any) -> EngineProfile:
     cfg: dict[str, Any] = {
         "name": "long_form_reader",
         "models": models,
+        "ingestion": IngestionConfig(
+            summaries=SummariesConfig(enabled=True),
+        ),
         "retrieval": RetrievalConfig(
             default_strategy="adaptive",
             top_k=8,

@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from .degradation import DegradationTracker
 from .errors import RAGStageError
 from .gateway import ModelGateway
-from .models import MetaT, RAGNode, RAGNodeSpan
+from .models import DefaultNodeMeta, MetaT, RAGNode, RAGNodeSpan
 from .text.analyzer import CjkAwareAnalyzer, TextAnalyzer
 from .usage import UsageTracker
 
@@ -65,28 +65,32 @@ class SectionSummarizer(Generic[MetaT]):
         stage: str = "summarizer",
     ) -> SummarizerResult[MetaT]:
         """Summarize a section, generating section summary and summary units."""
-        if not self.enabled:
-            return SummarizerResult(summary_status="skipped")
-
-        # 1. Check existing summary
+        # 1. Check existing summary (usable even if LLM summarizer is disabled)
         if existing_summary:
             sec_node = RAGNode[MetaT](
                 node_id=f"{doc_id}#s{section_seq}_sum",
-                doc_id=doc_id,
-                section_id=section_id,
-                section_seq=section_seq,
+                is_summary=True,
                 granularity="parent_summary",
                 parent_kind="section",
                 parent_id=section_id or doc_id,
                 level=1,
                 text=existing_summary,
-                span=RAGNodeSpan(char_start=char_start, char_end=char_start + len(text)),
-                metadata=metadata,
+                span=RAGNodeSpan(
+                    doc_id=doc_id,
+                    section_id=section_id,
+                    section_seq=section_seq,
+                    char_start=char_start,
+                    char_end=char_start + len(text),
+                ),
+                metadata=metadata if isinstance(metadata, BaseModel) else DefaultNodeMeta(),
             )
             return SummarizerResult(
                 section_summary=sec_node,
                 summary_status="provided",
             )
+
+        if not self.enabled:
+            return SummarizerResult(summary_status="skipped")
 
         if len(text) < self.min_chars_for_summary:
             return SummarizerResult(summary_status="skipped")
@@ -114,16 +118,20 @@ class SectionSummarizer(Generic[MetaT]):
             )
             section_summary_node = RAGNode[MetaT](
                 node_id=f"{doc_id}#s{section_seq}_sum",
-                doc_id=doc_id,
-                section_id=section_id,
-                section_seq=section_seq,
+                is_summary=True,
                 granularity="parent_summary",
                 parent_kind="section",
                 parent_id=section_id or doc_id,
                 level=1,
                 text=res.text.strip(),
-                span=RAGNodeSpan(char_start=char_start, char_end=char_start + len(text)),
-                metadata=metadata,
+                span=RAGNodeSpan(
+                    doc_id=doc_id,
+                    section_id=section_id,
+                    section_seq=section_seq,
+                    char_start=char_start,
+                    char_end=char_start + len(text),
+                ),
+                metadata=metadata if isinstance(metadata, BaseModel) else DefaultNodeMeta(),
             )
             status = "generated"
         except Exception as exc:
@@ -164,16 +172,20 @@ class SectionSummarizer(Generic[MetaT]):
                         doc_id=doc_id,
                         section_id=section_id,
                         section_seq=section_seq,
+                        is_summary=True,
                         granularity="parent_summary",
                         parent_kind="section_unit",
                         parent_id=section_id or doc_id,
                         level=0,
                         text=u_res.text.strip(),
                         span=RAGNodeSpan(
+                            doc_id=doc_id,
+                            section_id=section_id,
+                            section_seq=section_seq,
                             char_start=char_start + u_start,
                             char_end=char_start + u_end,
                         ),
-                        metadata=metadata,
+                        metadata=metadata if isinstance(metadata, BaseModel) else DefaultNodeMeta(),
                     )
                     unit_summaries.append(unit_node)
                 except Exception as exc:
