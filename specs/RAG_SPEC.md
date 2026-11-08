@@ -2,13 +2,13 @@
 
 | | |
 | :--- | :--- |
-| **Document Version** | 1.1.10-draft |
+| **Document Version** | 1.1.11-draft |
 | **Status** | Draft, design agreed. Sibling feedback (AUD-01..26, NF-01..40, KB-01..23) was consolidated into C-01..C-39 and folded in; owner decisions Q-01..Q-08, the failure model and the pushbacks (Appendix C) are settled, and all three app agents (AudioReading, NewsIntelligence, KnowledgeBase) agreed through 1.1.8. This file is the only record of the design and its reasoning; the round's working files were removed on 2026-11-08. |
 | **Package Namespace** | `cody_ai_shared_lib.rag` (`cody-ai-shared-lib >= 0.8.0`) |
 | **Target Runtime** | Python 3.11+, synchronous core (matching the rest of `cody_ai_shared_lib`) with a bounded thread pool for independent calls |
 | **Primary Consumers** | **AudioReading** (`audiolib.codymasterai.com`), **NewsIntelligence / Pulse Nexus** (`ai.codymasterai.com`), **KnowledgeBase** |
 | **Owner** | Cody (`codymasteriii@gmail.com`) / Cody AI Engineering Team |
-| **Last Updated** | 2026-11-07 |
+| **Last Updated** | 2026-11-08 |
 | **Previous version** | `specs/archive/RAG_SPEC_1.0.0-draft.md` |
 
 ---
@@ -790,7 +790,7 @@ The kit also ships:
 > - Audio's self-declared "recall verified" flag was replaced by this test (R-02).
 
 ### 4.7 Reference SQL (documentation, not code) **[v1, written in P2]**
-The lib ships `specs/sql/` alongside this spec. These are **templates to copy**, written against placeholder names (`{table}`, `{embedding}`, `{fts}`, filter columns). The lib never imports or runs them. Each app copies a template into its own migrations, renames tables and columns to its schema, and proves the result with the conformance kit (§4.6).
+The lib ships `cody_ai_shared_lib/rag/sql/` inside the package as data files to copy. These are **templates to copy**, written against placeholder names (`{table}`, `{embedding}`, `{fts}`, filter columns). The lib never imports or runs them (Q-01 still holds). Each app copies a template into its own migrations, renames tables and columns to its schema, and proves the result with the conformance kit (§4.6).
 
 | File | Pattern it captures |
 | :--- | :--- |
@@ -2380,7 +2380,7 @@ Delivery follows production need: first what both production apps share, then Au
 **P2 · AudioReading adoption**
 - `LLMClient.stream()` and cache-breakpoint pass-through (§15).
 - Build: sentence splitter, summarizer, `BatchEmbedder`, resumable and append-only `ingest_document`, fingerprints and `sync_document`, `prepare_nodes`; Tier 0 with the token gate; `engine.plan()`; summary units; analyzer tokens with `build_tsquery` and the CJK measurement with AudioReading (§12.3); atomic section writes and budget-aware ingestion; bounded conversation state; Tier 3 with local window; sequential boundary end-to-end (canary); conversation state and follow-up reuse; native `stream_query`; cache-friendly layout and embedding cache; `offset` formatter snapping; SSE helper.
-- Reference SQL templates in `specs/sql/` (§4.7), written alongside Audio's migrations.
+- Reference SQL templates in `cody_ai_shared_lib/rag/sql/` (§4.7), written alongside Audio's migrations.
 - Audio builds its adapter and runs the contract kit in its CI.
 - Tests: AC-RAG-01, 04–08, 10, 22–24, 29, 30, 38, 45, 48, 54, 58, 59, 64–67, 71–73.
 
@@ -2583,6 +2583,7 @@ Each entry: the decision, the alternative rejected, and why. Sections refer here
 | **1.1.8-draft** | 2026-11-08 | cody-ai-shared-lib agent | `engine.prepare_nodes()` (§6.4.1, RAG-ING-13), from KnowledgeBase's closing reply: apps that insert their own rows get the vector, fingerprint, token estimate and search tokens exactly as the engine computes them, so `sync_document` and `reconcile` stay consistent. Kit check 15 (fingerprint parity), AC-RAG-71. Passing app columns through `upsert_section_nodes` rejected (D-01). |
 | **1.1.9-draft** | 2026-11-08 | cody-ai-shared-lib agent | Design round closed: all three app agents agreed. Removed the round's working files (feedback, review, pushback, response, closing and reply notes); status line and Appendix C intro updated so this spec stands alone. No design change. |
 | **1.1.10-draft** | 2026-11-08 | cody-ai-shared-lib agent | Implementation clarifications. §10.5: exact rules for detecting the `[[answer_found=…]]` flag while streaming (release at the first character that rules a flag out). §5.2 rule 2: the sequential guard cuts at a sentence end for English and Chinese, within `max_snap_back_chars` (D-24), with `TextAnalyzer.last_sentence_end` and RAG-ING-2 terminator rules. §8.2: standard string assembly with no memory guard (D-25). `answer_found` changed from `bool | None` to `Literal["yes", "no", "partial"] | None` (owner decision), which also makes the `abstained` rule correct. AC-RAG-72, 73. |
+| **1.1.11-draft** | 2026-11-08 | cody-ai-shared-lib agent | Moved reference SQL templates from `specs/sql/` to package data files in `cody_ai_shared_lib/rag/sql/` (§4.7, §16.2), shipping them inside the package as data files to copy while resolving flat-layout package discovery (Q-01 still holds). Added `[tool.setuptools.package-data]` and updated AC-RAG-67. Marked `specs/archive/RAG_SPEC_1.0.0-draft.md` as superseded. |
 
 ## Appendix C. Requests kept in the apps (pushbacks)
 

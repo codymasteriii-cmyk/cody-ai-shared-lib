@@ -1,3 +1,5 @@
+> **Superseded. Historical record only; do not implement from this file. The current spec is `specs/RAG_SPEC.md`.**
+
 # Technical Specification: Shared OOP RAG Engine (`cody_ai_shared_lib.rag`)
 
 | | |

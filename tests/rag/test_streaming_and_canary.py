@@ -209,8 +209,8 @@ def test_canary_sequential_boundary():
 
 
 def test_reference_sql_templates():
-    """AC-RAG-67: Reference SQL templates exist in specs/sql/ and contain required clauses (§4.7)."""
-    sql_dir = Path(__file__).resolve().parents[2] / "specs" / "sql"
+    """AC-RAG-67: Reference SQL templates exist in cody_ai_shared_lib/rag/sql/ and contain required clauses (§4.7)."""
+    sql_dir = Path(__file__).resolve().parents[2] / "cody_ai_shared_lib" / "rag" / "sql"
     assert sql_dir.exists(), f"Directory {sql_dir} must exist"
 
     expected_files = [
