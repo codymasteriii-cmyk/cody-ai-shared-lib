@@ -15,6 +15,7 @@ from .errors import (
     UnsupportedFilterError,
 )
 from .degradation import AGREED_DEGRADATIONS, DegradationTracker
+from .engine import RAGEngine
 from .gateway import ModelGateway
 from .granularity import (
     BUILTIN_GRANULARITIES,
@@ -34,6 +35,19 @@ from .guards import (
     TemporalGuard,
     TenantGuard,
 )
+from .intent import (
+    AutoRouter,
+    HeuristicIntentRouter,
+    HeuristicRouter,
+    IntentRouter,
+    JevGateRouter,
+    LLMIntentRouter,
+    PassthroughRouter,
+    RouterContext,
+    TemporalExtractor,
+    clamp_intent,
+)
+from .memory_store import InMemoryRAGStore
 from .models import (
     ChatTurn,
     CitationCoverage,
@@ -47,6 +61,7 @@ from .models import (
     NodeRef,
     NoIntentExt,
     QueryIntent,
+    QueryPlan,
     RAGCitation,
     RAGFilterSpec,
     RAGNode,
@@ -95,6 +110,28 @@ from .runtime import (
 )
 from .trace import ObserverDispatcher, RAGObserver, RAGTrace, StageRecord
 from .usage import BudgetGuard, CallContext, UsageTracker
+from .context import ContextAssembler, ContextFencer, ConversationManager
+from .generation import StuffStrategy
+from .postgen import CitationExtractor, OutputSanitizer, QuoteVerifier
+from .postretrieval import (
+    IdentityDeduplicator,
+    JinaCrossEncoderReranker,
+    OffsetDeduplicator,
+    ThresholdFilter,
+)
+from .strategies import (
+    AdaptiveStrategy,
+    DenseVectorStrategy,
+    FullContextStrategy,
+    HybridRRFStrategy,
+    KeywordFirstStrategy,
+    KeywordOnlyStrategy,
+    QueryVariant,
+    RetrievalContext,
+    RetrievalStrategy,
+    SecondaryQueryFanOut,
+    fair_interleave,
+)
 
 __all__ = [
     # Errors
@@ -152,6 +189,7 @@ __all__ = [
     "StoreCapabilities",
     "Fingerprint",
     "RAGStore",
+    "InMemoryRAGStore",
     "Guard",
     "FilterPatch",
     "SequentialBoundaryGuard",
@@ -196,4 +234,40 @@ __all__ = [
     "DeterministicRng",
     "Deadline",
     "make_bounded_pool",
+    # Facade & Intent
+    "RAGEngine",
+    "QueryPlan",
+    "TemporalExtractor",
+    "HeuristicRouter",
+    "JevGateRouter",
+    "LLMIntentRouter",
+    "clamp_intent",
+    "IntentRouter",
+    "RouterContext",
+    "PassthroughRouter",
+    "HeuristicIntentRouter",
+    "AutoRouter",
+    # Context, Generation, Postgen, Postretrieval, Strategies
+    "ContextAssembler",
+    "ContextFencer",
+    "ConversationManager",
+    "StuffStrategy",
+    "CitationExtractor",
+    "QuoteVerifier",
+    "OutputSanitizer",
+    "ThresholdFilter",
+    "IdentityDeduplicator",
+    "OffsetDeduplicator",
+    "JinaCrossEncoderReranker",
+    "QueryVariant",
+    "RetrievalContext",
+    "RetrievalStrategy",
+    "FullContextStrategy",
+    "DenseVectorStrategy",
+    "HybridRRFStrategy",
+    "KeywordOnlyStrategy",
+    "KeywordFirstStrategy",
+    "AdaptiveStrategy",
+    "SecondaryQueryFanOut",
+    "fair_interleave",
 ]

@@ -467,13 +467,16 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         doc_id: str,
         section_seq: int,
         nodes: list[RAGNode[MetaT]],
-        embeddings: list[list[float]],
+        embeddings: list[list[float]] | None = None,
         summary: RAGNode[MetaT] | None = None,
     ) -> int:
         """Atomic upsert of section passages and summary (RAG-ING-10)."""
         with self._lock:
             written_ids: list[str] = []
             doc_fprints = self._fingerprints.setdefault(doc_id, {})
+
+            if embeddings is None:
+                embeddings = [n.embedding or [0.0] * self._embedding_space.dims for n in nodes]
 
             # Prepare all passage nodes with embeddings and signatures
             for node, emb in zip(nodes, embeddings):
@@ -554,3 +557,21 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                 for nid in node_ids
                 if nid in self._nodes
             }
+
+    def upsert_section(
+        self,
+        document_id: str,
+        section_id: str | int = 0,
+        nodes: Sequence[RAGNode[MetaT]] = (),
+        embeddings: list[list[float]] | None = None,
+        metadata: MetaT | None = None,
+        summary: RAGNode[MetaT] | None = None,
+    ) -> int:
+        seq = int(section_id) if isinstance(section_id, int) or str(section_id).isdigit() else 0
+        return self.upsert_section_nodes(
+            doc_id=document_id,
+            section_seq=seq,
+            nodes=list(nodes),
+            embeddings=embeddings,
+            summary=summary,
+        )

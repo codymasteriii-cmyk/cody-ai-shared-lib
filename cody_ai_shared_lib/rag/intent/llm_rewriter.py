@@ -1,0 +1,244 @@
+"""LLM structured query intent analysis and rewriting (§7.5, AC-RAG-15, AC-RAG-16).
+
+Parses structured query intent with:
+  - Robust JSON decoding with repair
+  - DG-05 validation and value clamping ([1, 3650] days, [1, 50] top_k, list capping)
+  - DG-04 retry and fallback across model list on parse failure
+  - Temporal integration with TemporalExtractor
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+from typing import Any
+
+from ..degradation import DegradationTracker
+from ..errors import IntentParseError
+from ..gateway import ModelGateway
+from ..models import QueryIntent
+from ..usage import UsageTracker
+from .temporal import TemporalExtractor
+
+logger = logging.getLogger("rag-intent-llm")
+
+INTENT_SYSTEM_PROMPT = """You are a query analysis assistant for a retrieval-augmented generation engine.
+Analyze the user's question and any conversation history. Return a JSON object with these exact keys:
+{
+  "route": "rag" | "no_retrieval",
+  "scope": "local_lookup" | "document_overview",
+  "search_query": "<focused search keywords or canonical question>",
+  "secondary_queries": ["<alternative phrasing or second comparison subject>", ...],
+  "sub_questions": ["<sub question if complex>", ...],
+  "is_comparison": false,
+  "is_followup": false,
+  "has_time_expression": false,
+  "temporal_scope": "none" | "recent" | "historical" | "specific_range",
+  "date_window_days": null,
+  "entity_terms": ["<proper nouns or specialized entities>", ...],
+  "entity_mode": "boost" | "require" | "ignore",
+  "exact_terms": ["<quoted or exact code phrases>", ...],
+  "suggested_top_k": 8
+}
+Output strictly valid JSON and nothing else."""
+
+
+def clamp_intent(raw: dict[str, Any], tracker: DegradationTracker | None = None) -> QueryIntent:
+    """Validate and clamp intent facets into allowable ranges (§7.5, DG-05, AC-RAG-16)."""
+    route = raw.get("route", "rag")
+    if route not in ("rag", "no_retrieval"):
+        if tracker:
+            tracker.record("DG-05", "intent", f"Invalid route '{route}' clamped to 'rag'", "Value clamped")
+        route = "rag"
+
+    scope = raw.get("scope", "local_lookup")
+    if scope not in ("local_lookup", "document_overview"):
+        if tracker:
+            tracker.record("DG-05", "intent", f"Invalid scope '{scope}' clamped to 'local_lookup'", "Value clamped")
+        scope = "local_lookup"
+
+    # Clamp top_k to [1, 50]
+    top_k = raw.get("suggested_top_k")
+    if top_k is not None:
+        try:
+            top_k_int = int(top_k)
+            if top_k_int < 1:
+                if tracker:
+                    tracker.record("DG-05", "intent", f"suggested_top_k {top_k_int} < 1 clamped to 1", "Value clamped")
+                top_k = 1
+            elif top_k_int > 50:
+                if tracker:
+                    tracker.record("DG-05", "intent", f"suggested_top_k {top_k_int} > 50 clamped to 50", "Value clamped")
+                top_k = 50
+            else:
+                top_k = top_k_int
+        except (ValueError, TypeError):
+            top_k = None
+
+    # Clamp date_window_days to [1, 3650]
+    date_win = raw.get("date_window_days")
+    if date_win is not None:
+        try:
+            dw_int = int(date_win)
+            if dw_int < 1:
+                if tracker:
+                    tracker.record("DG-05", "intent", f"date_window_days {dw_int} < 1 clamped to 1", "Value clamped")
+                date_win = 1
+            elif dw_int > 3650:
+                if tracker:
+                    tracker.record("DG-05", "intent", f"date_window_days {dw_int} > 3650 clamped to 3650", "Value clamped")
+                date_win = 3650
+            else:
+                date_win = dw_int
+        except (ValueError, TypeError):
+            date_win = None
+
+    # Cap list sizes
+    sec_q = list(raw.get("secondary_queries") or [])
+    if len(sec_q) > 4:
+        if tracker:
+            tracker.record("DG-05", "intent", f"secondary_queries size {len(sec_q)} capped to 4", "List capped")
+        sec_q = sec_q[:4]
+
+    sub_q = list(raw.get("sub_questions") or [])
+    if len(sub_q) > 4:
+        if tracker:
+            tracker.record("DG-05", "intent", f"sub_questions size {len(sub_q)} capped to 4", "List capped")
+        sub_q = sub_q[:4]
+
+    entities = list(raw.get("entity_terms") or [])
+    if len(entities) > 8:
+        if tracker:
+            tracker.record("DG-05", "intent", f"entity_terms size {len(entities)} capped to 8", "List capped")
+        entities = entities[:8]
+
+    temp_scope = raw.get("temporal_scope", "none")
+    if temp_scope not in ("none", "recent", "historical", "specific_range"):
+        temp_scope = "none"
+
+    entity_mode = raw.get("entity_mode", "boost")
+    if entity_mode not in ("boost", "require", "ignore"):
+        entity_mode = "boost"
+
+    return QueryIntent(
+        route=route,
+        scope=scope,
+        search_query=str(raw.get("search_query") or "").strip(),
+        secondary_queries=[str(q).strip() for q in sec_q if str(q).strip()],
+        sub_questions=[str(q).strip() for q in sub_q if str(q).strip()],
+        is_comparison=bool(raw.get("is_comparison", False)),
+        is_followup=bool(raw.get("is_followup", False)),
+        has_time_expression=bool(raw.get("has_time_expression", False)),
+        temporal_scope=temp_scope,
+        date_window_days=date_win,
+        range_start_utc=raw.get("range_start_utc"),
+        range_end_utc=raw.get("range_end_utc"),
+        entity_terms=[str(e).strip() for e in entities if str(e).strip()],
+        entity_mode=entity_mode,
+        exact_terms=[str(t).strip() for t in raw.get("exact_terms") or [] if str(t).strip()][:8],
+        suggested_top_k=top_k,
+        router_source="llm",
+    )
+
+
+def extract_json_block(text: str) -> dict[str, Any] | None:
+    """Extract JSON object from markdown code fence or raw string."""
+    clean = text.strip()
+    # Strip markdown code blocks ```json ... ```
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", clean, re.DOTALL)
+    if match:
+        clean = match.group(1)
+    elif clean.startswith("{") and clean.endswith("}"):
+        pass
+    else:
+        # Search for first { and matching }
+        start = clean.find("{")
+        end = clean.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            clean = clean[start : end + 1]
+
+    try:
+        data = json.loads(clean)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+class LLMIntentRouter:
+    """Parses user questions via LLM into structured QueryIntent."""
+
+    def __init__(
+        self,
+        gateway: ModelGateway,
+        models: list[str],
+        temporal_extractor: TemporalExtractor | None = None,
+    ):
+        self.gateway = gateway
+        self.models = models
+        self.temporal_extractor = temporal_extractor
+
+    def route(
+        self,
+        query: str,
+        usage_tracker: UsageTracker,
+        degradation_tracker: DegradationTracker,
+        history: list[dict[str, str]] | None = None,
+    ) -> QueryIntent:
+        """Route query using LLM with DG-04 retry and DG-05 clamping."""
+        user_msg = f"Question: {query}"
+        if history:
+            history_str = "\n".join(f"{h.get('role', 'user')}: {h.get('text', '')}" for h in history[-3:])
+            user_msg = f"Recent conversation:\n{history_str}\n\nQuestion: {query}"
+
+        last_raw_text = ""
+        for model in self.models:
+            for attempt in range(2):
+                try:
+                    res = self.gateway.generate(
+                        system_prompt=INTENT_SYSTEM_PROMPT,
+                        user_message=user_msg,
+                        models=[model],
+                        stage="intent_llm",
+                        usage_tracker=usage_tracker,
+                        degradation_tracker=degradation_tracker,
+                        temperature=0.0,
+                    )
+                    last_raw_text = res.text
+                    parsed = extract_json_block(res.text)
+                    if parsed is not None:
+                        # Extract temporal facets if configured
+                        if self.temporal_extractor and not parsed.get("range_start_utc"):
+                            temp_info = self.temporal_extractor.extract(query)
+                            if temp_info.get("has_time_expression"):
+                                parsed.update(temp_info)
+
+                        intent = clamp_intent(parsed, degradation_tracker)
+                        if not intent.search_query:
+                            intent.search_query = query
+                        return intent
+
+                    # JSON parse failure: record DG-04 and retry
+                    degradation_tracker.record(
+                        dg_id="DG-04",
+                        stage="intent",
+                        reason=f"Failed to parse JSON from {model} (attempt {attempt + 1})",
+                        fallback_used="retry" if attempt == 0 else "next_model",
+                        impact="Retrying intent parsing",
+                    )
+                except Exception as exc:
+                    degradation_tracker.record(
+                        dg_id="DG-04",
+                        stage="intent",
+                        reason=f"Model call failed during intent parsing: {exc}",
+                        fallback_used="next_model",
+                        impact="Skipping to next intent model",
+                        error_type=type(exc).__name__,
+                    )
+                    break  # Move to next model
+
+        raise IntentParseError(
+            f"All intent models failed to produce valid JSON. Last output: {last_raw_text[:200]}",
+            stage="intent",
+        )

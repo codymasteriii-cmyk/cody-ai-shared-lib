@@ -27,6 +27,10 @@ class NodeRenderer(Protocol[MetaT]):
         """Text inserted into context fence for model generation."""
         ...
 
+    def render(self, node: RAGNode[MetaT]) -> str:
+        """Render node text for generation prompt."""
+        ...
+
     def citation_label(self, node: RAGNode[MetaT]) -> str:
         """Display label used for citations (e.g. section title or doc id)."""
         ...
@@ -63,6 +67,9 @@ class DefaultRenderer(Generic[MetaT]):
 
     def prompt_text(self, node: RAGNode[MetaT]) -> str:
         return node.text
+
+    def render(self, node: RAGNode[MetaT]) -> str:
+        return self.prompt_text(node)
 
     def citation_label(self, node: RAGNode[MetaT]) -> str:
         return node.span.section_title or node.span.doc_id

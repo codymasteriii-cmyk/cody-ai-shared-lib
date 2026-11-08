@@ -10,6 +10,7 @@ from typing import Any, Generic, Protocol, runtime_checkable
 from pydantic import BaseModel, Field
 
 from .models import FilterPatch, MetaT, RAGFilterSpec, RAGNode
+from .render import NodeRenderer
 from .text.analyzer import TokenGroup
 
 
@@ -30,6 +31,11 @@ class ScopeStats(BaseModel):
     char_count: int
     est_tokens: int | None = None
     revision: str
+    has_summaries: bool = False
+
+    @property
+    def total_tokens(self) -> int:
+        return self.est_tokens if self.est_tokens is not None else self.char_count
 
 
 class StoreCapabilities(BaseModel):
@@ -60,6 +66,10 @@ class StoreCapabilities(BaseModel):
     supported_date_fields: frozenset[str] = frozenset()
     time_basis: str | None = None
     max_top_k: int = 200
+
+    @property
+    def supports_native_hybrid(self) -> bool:
+        return self.supports_native_hybrid_rpc
 
 
 class Fingerprint(BaseModel):
