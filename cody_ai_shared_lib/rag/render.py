@@ -88,3 +88,6 @@ class DefaultRenderer(Generic[MetaT]):
 
     def flags(self, meta: MetaT) -> list[str]:
         return []
+
+
+DefaultNodeRenderer = DefaultRenderer

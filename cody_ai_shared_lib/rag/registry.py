@@ -60,4 +60,9 @@ def create_default_registry() -> ComponentRegistry:
     for r in ["auto", "none", "heuristic", "llm"]:
         reg.register("router", r, r)
 
+    # Standard splitters
+    from .text.splitter import PassThroughSplitter, SentenceSplitter
+    reg.register("splitter", "sentence", SentenceSplitter)
+    reg.register("splitter", "pass_through", PassThroughSplitter)
+
     return reg

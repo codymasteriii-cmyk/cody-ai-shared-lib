@@ -47,6 +47,9 @@ class SourceSpan(BaseModel):
     position_ratio: float = 0.0
 
 
+RAGNodeSpan = SourceSpan
+
+
 class RAGNode(BaseModel, Generic[MetaT]):
     """A retrievable, traceable unit of content with provenance and scores."""
     node_id: str
