@@ -2212,7 +2212,7 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | `LLMResult.finish_reason: str \| None` (normalized: `"stop"`, `"length"`, `"safety"`, `"other"`) | §10.7 truncation handling | P1 |
 | `LLMUsage` gains `cached_tokens`, `cost_usd`, `price_table_version`, `estimated` | §13.1, §15.4 | P1 |
 | Provider output-limit policy (e.g. do not send `max_tokens` to Gemini where KB found it harmful; use `max_completion_tokens` for GPT reasoning models) as `LLMClient` behaviour, not a RAG rule | R-11b | P1 |
-| Provider routing expanded: direct Google GenAI (`gemini-*`), direct Anthropic (`claude-*`, with `ThinkingBlock` extraction), direct OpenAI (`gpt-*` using `OPENAI_API_KEY`), and Vercel AI Gateway for namespaced models (`moonshotai/*`, `minimax/*` via OpenAI-compatible endpoint with `VERCEL_API_KEY`) | Ecosystem-wide LLM access | P1 |
+| Provider routing for text: direct Google GenAI (`gemini-*`), direct Anthropic (`claude-*`, with `ThinkingBlock` extraction), and direct OpenAI (`gpt-*` using `OPENAI_API_KEY`). Text generation strictly uses these three standard providers; image/video/multimodal models are handled by dedicated modules (§15.2). | Ecosystem-wide LLM access | P1 |
 | `LLMClient.stream(...) -> Iterator[LLMStreamChunk]` (text deltas, then a final chunk with usage, cost and `finish_reason`) | §10.8 native streaming; a profile asking for native streaming without it fails at startup | P2 |
 | Cache breakpoint pass-through (`cache_breakpoints` → Anthropic `cache_control`; Gemini context caching where available) | §10.3; without it the layout still applies, with no explicit cache controls | P2 |
 
