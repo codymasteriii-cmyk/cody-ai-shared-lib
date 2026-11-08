@@ -15,6 +15,7 @@ venv/
 dist/
 build/
 .deepeval/
+.pytest_cache/
 
 # ===== Node / Next.js =====
 node_modules/
