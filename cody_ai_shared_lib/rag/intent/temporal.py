@@ -157,3 +157,11 @@ class TemporalExtractor:
         if start is not None and end is not None and start > end:
             return end, start
         return start, end
+
+    def resolve_range(
+        self,
+        start: datetime | None,
+        end: datetime | None,
+    ) -> tuple[datetime | None, datetime | None]:
+        """Resolve and validate a temporal range, repairing reversed bounds."""
+        return self.repair_range(start, end)

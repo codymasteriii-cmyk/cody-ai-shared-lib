@@ -124,7 +124,7 @@ class AutoRouter:
                 return j_intent
 
         # Layer 3: LLM Intent Router (if models configured)
-        intent_models = ctx.profile.models.intent or ctx.profile.models.generation
+        intent_models = ctx.profile.models.intent
         if self.llm_router is not None and intent_models:
             try:
                 history_turns = []
@@ -139,16 +139,22 @@ class AutoRouter:
                     history=history_turns,
                 )
             except Exception:
-                # If LLM routing fails, fall back to heuristic or passthrough
-                if h_intent is not None:
-                    return h_intent
+                pass
 
-        if h_intent is not None:
-            return h_intent
-
-        return QueryIntent(
+        intent = h_intent if h_intent is not None else QueryIntent(
             route="rag",
             scope="local_lookup",
             search_query=request.query,
             router_source="passthrough",
         )
+
+        if ctx.profile.router.enable_temporal_extraction and self.temporal_extractor and not intent.has_time_expression:
+            temp_info = self.temporal_extractor.extract(request.query)
+            if temp_info.get("has_time_expression"):
+                intent.has_time_expression = True
+                intent.temporal_scope = temp_info.get("temporal_scope", "recent")
+                intent.date_window_days = temp_info.get("date_window_days")
+                intent.range_start_utc = temp_info.get("range_start_utc")
+                intent.range_end_utc = temp_info.get("range_end_utc")
+
+        return intent

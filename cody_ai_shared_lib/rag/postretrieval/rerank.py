@@ -27,15 +27,18 @@ class JinaCrossEncoderReranker(Generic[MetaT]):
             return []
 
         doc_texts = [n.text for n in nodes]
-        res = self.gateway.rerank(
-            query=query,
-            documents=doc_texts,
-            model=self.model,
-            stage="post_retrieval_rerank",
-            usage_tracker=usage_tracker,
-            degradation_tracker=degradation_tracker,
-            top_n=top_n or len(nodes),
-        )
+        try:
+            res = self.gateway.rerank(
+                query=query,
+                documents=doc_texts,
+                model=self.model,
+                stage="post_retrieval_rerank",
+                usage_tracker=usage_tracker,
+                degradation_tracker=degradation_tracker,
+                top_n=top_n or len(nodes),
+            )
+        except Exception:
+            res = None
 
         if res is None:
             # DG-06 fallback: keep incoming order

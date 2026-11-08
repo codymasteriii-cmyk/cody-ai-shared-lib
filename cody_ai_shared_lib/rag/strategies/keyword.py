@@ -19,8 +19,13 @@ class KeywordOnlyStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
                 "KeywordOnlyStrategy requires store capability 'supports_keyword_fts'"
             )
         query_text = ctx.intent.search_query or ctx.request.query
-        top_k = ctx.intent.suggested_top_k or ctx.profile.retrieval.top_k
-        return ctx.store.text_search(query_text, top_k=top_k, filters=ctx.filters)
+        target_limit = (
+            ctx.request.top_k_override
+            or ctx.intent.suggested_top_k
+            or ctx.profile.retrieval.retrieve_max_results
+            or ctx.profile.retrieval.top_k
+        )
+        return ctx.store.keyword_search(query_text, top_k=target_limit + 1, filters=ctx.filters)
 
 
 class KeywordFirstStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
@@ -34,7 +39,7 @@ class KeywordFirstStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
     def retrieve(self, ctx: RetrievalContext[MetaT]) -> list[RAGNode[MetaT]]:
         query_text = ctx.intent.search_query or ctx.request.query
         top_k = ctx.intent.suggested_top_k or ctx.profile.retrieval.top_k
-        hits = ctx.store.text_search(query_text, top_k=top_k, filters=ctx.filters)
+        hits = ctx.store.keyword_search(query_text, top_k=top_k, filters=ctx.filters)
         if len(hits) >= self.min_hits:
             return hits
 

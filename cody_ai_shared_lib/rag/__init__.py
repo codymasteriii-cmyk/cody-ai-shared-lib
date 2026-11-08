@@ -98,7 +98,9 @@ from .profile import (
     RuntimeConfig,
     knowledge_base,
     long_form_reader,
+    news_chat,
     news_intelligence,
+    news_search,
 )
 from .registry import ComponentRegistry, create_default_registry
 from .render import DefaultRenderer, NodeRenderer
@@ -121,6 +123,8 @@ from .postretrieval import (
     IdentityDeduplicator,
     JinaCrossEncoderReranker,
     OffsetDeduplicator,
+    RecencyBooster,
+    ScoreFusionStage,
     ThresholdFilter,
 )
 from .strategies import (
@@ -136,6 +140,7 @@ from .strategies import (
     SecondaryQueryFanOut,
     fair_interleave,
 )
+from .text.splitter import PassThroughSplitter, SentenceSplitter
 
 __all__ = [
     # Errors
@@ -228,6 +233,8 @@ __all__ = [
     "RuntimeConfig",
     "long_form_reader",
     "news_intelligence",
+    "news_chat",
+    "news_search",
     "knowledge_base",
     # Runtime determinism
     "Clock",
@@ -265,6 +272,8 @@ __all__ = [
     "IdentityDeduplicator",
     "OffsetDeduplicator",
     "JinaCrossEncoderReranker",
+    "RecencyBooster",
+    "ScoreFusionStage",
     "QueryVariant",
     "RetrievalContext",
     "RetrievalStrategy",
@@ -276,4 +285,6 @@ __all__ = [
     "AdaptiveStrategy",
     "SecondaryQueryFanOut",
     "fair_interleave",
+    "PassThroughSplitter",
+    "SentenceSplitter",
 ]

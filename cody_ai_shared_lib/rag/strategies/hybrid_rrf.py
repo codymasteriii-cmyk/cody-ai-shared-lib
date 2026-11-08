@@ -17,7 +17,13 @@ class HybridRRFStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
 
     def retrieve(self, ctx: RetrievalContext[MetaT]) -> list[RAGNode[MetaT]]:
         query_text = ctx.intent.search_query or ctx.request.query
-        top_k = ctx.intent.suggested_top_k or ctx.profile.retrieval.top_k
+        target_limit = (
+            ctx.request.top_k_override
+            or ctx.intent.suggested_top_k
+            or ctx.profile.retrieval.retrieve_max_results
+            or ctx.profile.retrieval.top_k
+        )
+        top_k = target_limit + 1
         rrf_k = ctx.profile.retrieval.rrf_k
 
         # 1. Embed query
@@ -43,7 +49,7 @@ class HybridRRFStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
 
         # 3. Client-side RRF fusion
         vec_nodes = ctx.store.vector_search(query_vector, top_k=top_k * 2, filters=ctx.filters)
-        text_nodes = ctx.store.text_search(query_text, top_k=top_k * 2, filters=ctx.filters)
+        text_nodes = ctx.store.keyword_search(query_text, top_k=top_k * 2, filters=ctx.filters)
 
         rrf_scores: dict[str, float] = {}
         node_map: dict[str, RAGNode[MetaT]] = {}

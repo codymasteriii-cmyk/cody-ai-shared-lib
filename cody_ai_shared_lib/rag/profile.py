@@ -36,6 +36,7 @@ class RetrievalConfig(BaseModel):
     model_config = {"frozen": True}
     default_strategy: str = "dense_vector"
     top_k: int = 8
+    retrieve_max_results: int = 100
     full_context_max_tokens: int = 120_000
     local_window_radius_chars: int = 6000
     always_include_summaries: bool = False
@@ -116,11 +117,39 @@ class EngineProfile(BaseModel):
     observer_errors: Literal["log", "raise"] = "log"
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     trace_level: Literal["light", "verbose"] = "light"
+    hydration_projection: str = "context"
+    variants: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     def fingerprint(self) -> str:
         """Stable sha256 fingerprint of resolved configuration."""
         dumped = self.model_dump_json()
         return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
+
+    def with_overrides(self, **changes: Any) -> "EngineProfile":
+        """Return a new profile with deep-merged changes (§12.1)."""
+        data = self.model_dump()
+        for k, v in changes.items():
+            if isinstance(v, dict) and isinstance(data.get(k), dict):
+                data[k].update(v)
+            else:
+                data[k] = v
+        return EngineProfile(**data)
+
+    def variant(self, name: str, **overrides: Any) -> "EngineProfile":
+        """Return named variant of this profile (§12.1)."""
+        var_data = dict(self.variants.get(name, {}))
+        var_data.update(overrides)
+        profile = self.with_overrides(**var_data)
+        if not profile.name.endswith(name):
+            data = profile.model_dump()
+            data["name"] = f"{self.name}_{name}"
+            return EngineProfile(**data)
+        return profile
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any]) -> "EngineProfile":
+        """Construct EngineProfile from mapping dictionary (§12.1)."""
+        return cls(**data)
 
     def validate(self, registry: ComponentRegistry | None = None) -> None:
         """Validate configuration and bindings; raises ProfileConfigError with all issues."""
@@ -206,21 +235,48 @@ def news_intelligence(models: ModelBindings, **overrides: Any) -> EngineProfile:
         "retrieval": RetrievalConfig(
             default_strategy="hybrid_rrf",
             top_k=12,
+            retrieve_max_results=100,
             full_context_max_tokens=0,
             local_window_radius_chars=0,
             always_include_summaries=False,
             min_similarity=0.60,
         ),
-        "post_stages": ["identity_dedup", "recency", "top_k"],
+        "post_stages": ["identity_dedup", "rerank", "recency", "top_k"],
         "context": ContextConfig(max_context_tokens=32_000),
-        "generation": GenerationConfig(grounding_mode="labelled_fallback"),
+        "generation": GenerationConfig(grounding_mode="labelled_fallback", stream_mode="buffered"),
         "ingestion": IngestionConfig(
             splitter="pass_through",
             summaries=SummariesConfig(enabled=False),
         ),
+        "hydration_projection": "context",
+        "variants": {
+            "news_chat": {
+                "retrieval": {"top_k": 12, "min_similarity": 0.60, "retrieve_max_results": 100},
+                "post_stages": ["identity_dedup", "rerank", "recency", "top_k"],
+                "hydration_projection": "context",
+            },
+            "news_search": {
+                "router": {"name": "none"},
+                "retrieval": {"top_k": 2000, "min_similarity": 0.68, "retrieve_max_results": 2000},
+                "post_stages": ["identity_dedup", "recency", "top_k"],
+                "hydration_projection": "card",
+            },
+        },
     }
     cfg.update(overrides)
     return EngineProfile(**cfg)
+
+
+def news_chat(models: ModelBindings, **overrides: Any) -> EngineProfile:
+    """Preset variant for News chat (§12.2, §16.2)."""
+    base = news_intelligence(models=models)
+    return base.variant("news_chat", **overrides)
+
+
+def news_search(models: ModelBindings, **overrides: Any) -> EngineProfile:
+    """Preset variant for News search (supports up to 2000 results with card projection, §8.10, §12.2)."""
+    base = news_intelligence(models=models)
+    return base.variant("news_search", **overrides)
 
 
 def knowledge_base(models: ModelBindings, **overrides: Any) -> EngineProfile:

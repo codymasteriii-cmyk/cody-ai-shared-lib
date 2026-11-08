@@ -31,9 +31,14 @@ class DenseVectorStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
             task_type="RETRIEVAL_QUERY",
         )
 
-        top_k = ctx.intent.suggested_top_k or ctx.profile.retrieval.top_k
+        target_limit = (
+            ctx.request.top_k_override
+            or ctx.intent.suggested_top_k
+            or ctx.profile.retrieval.retrieve_max_results
+            or ctx.profile.retrieval.top_k
+        )
         return ctx.store.vector_search(
             query_vector=emb_res.vectors[0],
-            top_k=top_k,
+            top_k=target_limit + 1,
             filters=ctx.filters,
         )

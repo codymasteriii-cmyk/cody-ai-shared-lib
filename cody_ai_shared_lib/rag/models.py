@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, model_validator
 
 class DefaultNodeMeta(BaseModel):
     """Default metadata container for nodes without specialized schemas."""
+    model_config = {"extra": "allow"}
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -26,8 +27,8 @@ class FilterPatch(BaseModel):
     fields: dict[str, Any] = Field(default_factory=dict)
 
 
-MetaT = TypeVar("MetaT", bound=BaseModel)
-ExtT = TypeVar("ExtT", bound=BaseModel)
+MetaT = TypeVar("MetaT", bound=BaseModel, default=DefaultNodeMeta)
+ExtT = TypeVar("ExtT", bound=BaseModel, default=NoIntentExt)
 
 ScoreKind = Literal["cosine", "bm25", "rrf", "rerank", "fused", "none"]
 

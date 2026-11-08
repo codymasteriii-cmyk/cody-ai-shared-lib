@@ -62,6 +62,7 @@ from .postgen.sanitizer import OutputSanitizer
 from .summarizer import SectionSummarizer
 from .text.analyzer import CjkAwareAnalyzer, estimate_tokens
 from .text.splitter import PassThroughSplitter, SentenceSplitter
+from .postretrieval.boosters import RecencyBooster, ScoreFusionStage
 from .postretrieval.dedup import IdentityDeduplicator, OffsetDeduplicator
 from .postretrieval.rerank import JinaCrossEncoderReranker
 from .postretrieval.threshold import ThresholdFilter
@@ -223,7 +224,7 @@ class RAGEngine(Generic[MetaT]):
                     timeout=self.profile.router.jev_timeout,
                 )
 
-            intent_models = self.profile.models.intent or self.profile.models.generation
+            intent_models = self.profile.models.intent
             llm_router = None
             if intent_models:
                 llm_router = LLMIntentRouter(
@@ -358,7 +359,7 @@ class RAGEngine(Generic[MetaT]):
         if intent is not None:
             resolved_intent = clamp_intent(intent.model_dump(), degradations)
 
-        effective_filters = self._build_effective_filters(request)
+        effective_filters = self._build_effective_filters(request, intent=resolved_intent)
         all_guards = list(self.guards) + list(request.guards)
 
         # 2. Run guards before_retrieval
@@ -445,7 +446,7 @@ class RAGEngine(Generic[MetaT]):
         # Threshold filter (AC-RAG-31)
         min_sim = self.profile.retrieval.min_similarity
         if min_sim is not None and min_sim > 0.0:
-            nodes = ThresholdFilter[MetaT](min_similarity=min_sim).filter(nodes)
+            nodes = ThresholdFilter[MetaT](min_similarity=min_sim, kind="cosine").filter(nodes)
 
         # Deduplication (AC-RAG-32, AC-RAG-33)
         if "offset_dedup" in self.profile.post_stages:
@@ -468,13 +469,65 @@ class RAGEngine(Generic[MetaT]):
             )
             reranked = True
 
+        # Boosters (§9.4, AC-RAG-35)
+        if "recency" in self.profile.post_stages:
+            nodes = RecencyBooster[MetaT](clock=self.clock).boost(nodes, renderer=self.renderer)
+
+        if "score_fusion" in self.profile.post_stages:
+            nodes = ScoreFusionStage[MetaT]().fuse(nodes, renderer=self.renderer, clock=self.clock)
+
+        # Relaxation ladder (§7.6, §5.5, AC-RAG-18)
+        relaxations: list[str] = []
+        is_soft_date = (
+            resolved_intent.has_time_expression
+            and (request.filters is None or request.filters.date_range_utc is None)
+            and effective_filters.date_range_utc is not None
+        )
+        if not nodes and is_soft_date:
+            start_dt, end_dt = effective_filters.date_range_utc
+            if start_dt is not None and end_dt is not None:
+                delta = end_dt - start_dt
+                widened_start = end_dt - delta * 2
+                relaxed_filters = effective_filters.model_copy(update={"date_range_utc": (widened_start, end_dt)})
+                ret_ctx_widen = ret_ctx.model_copy(update={"filters": relaxed_filters})
+                relaxed_nodes = strategy.retrieve(ret_ctx_widen)
+                if relaxed_nodes:
+                    relaxations.append("widen_time_window(x2)")
+                    nodes = relaxed_nodes
+                    effective_filters = relaxed_filters
+
+            if not nodes:
+                relaxed_filters = effective_filters.model_copy(update={"date_range_utc": None})
+                ret_ctx_drop = ret_ctx.model_copy(update={"filters": relaxed_filters})
+                relaxed_nodes = strategy.retrieve(ret_ctx_drop)
+                if relaxed_nodes:
+                    relaxations.append("drop_time_window")
+                    nodes = relaxed_nodes
+                    effective_filters = relaxed_filters
+
+        # Hydration (§9.6, AC-RAG-36)
+        if caps.supports_hydration and nodes:
+            proj = self.profile.hydration_projection
+            meta_map = self.store.hydrate([n.id for n in nodes], projection=proj)
+            for n in nodes:
+                if n.id in meta_map:
+                    n.metadata = meta_map[n.id]
+                    n.hydrated = True
+
         tier_reason = request.metadata.get("tier_decision_reason", "") if request.metadata else ""
         strat_used = request.metadata.get("strategy_used", strategy.name) if request.metadata else strategy.name
 
-        # Cap to top_k (Tier 0 full_context preserves full scope)
+        # Sizing and truncation (§8.10, AC-RAG-63)
+        truncated = False
         if strat_used != "full_context":
-            top_k = resolved_intent.suggested_top_k or self.profile.retrieval.top_k
-            nodes = nodes[:top_k]
+            target_limit = (
+                request.top_k_override
+                or resolved_intent.suggested_top_k
+                or self.profile.retrieval.retrieve_max_results
+                or self.profile.retrieval.top_k
+            )
+            truncated = len(nodes) > target_limit
+            nodes = nodes[:target_limit]
 
         trace = RAGTrace(
             request_id=req_id,
@@ -491,6 +544,8 @@ class RAGEngine(Generic[MetaT]):
             applied_filters=effective_filters,
             reranked=reranked,
             degradations=degradations.degradations,
+            relaxations=relaxations,
+            truncated=truncated,
             usage=usage_tracker.stage_usages,
             trace=trace,
         )
@@ -1315,11 +1370,23 @@ class RAGEngine(Generic[MetaT]):
             fts_stale=fts_stale,
         )
 
-    def _build_effective_filters(self, request: RAGQueryRequest) -> RAGFilterSpec:
-        """Combine request-level filters, document_id, and tenant_id into RAGFilterSpec."""
+    def _build_effective_filters(
+        self,
+        request: RAGQueryRequest,
+        intent: QueryIntent | None = None,
+    ) -> RAGFilterSpec:
+        """Combine request-level filters, document_id, tenant_id, and resolved temporal dates."""
         f = request.filters.model_copy() if request.filters else RAGFilterSpec()
         if request.tenant_id and not f.tenant_id:
             f.tenant_id = request.tenant_id
         if request.document_id and not f.document_ids:
             f.document_ids = [request.document_id]
+
+        # Apply soft date window from intent if caller did not provide date_range_utc (§7.6, AC-RAG-17)
+        if intent is not None and getattr(intent, "has_time_expression", False) and f.date_range_utc is None:
+            start_dt = getattr(intent, "range_start_utc", None)
+            end_dt = getattr(intent, "range_end_utc", None)
+            if start_dt or end_dt:
+                f.date_range_utc = (start_dt, end_dt)
+
         return f
