@@ -19,14 +19,34 @@ Failure strategy:
 import os
 import time
 import logging
+from dataclasses import dataclass
+from typing import List, Union
 from google import genai
 from google.genai import types
-from typing import List, Union
+
+from .pricing import PRICE_TABLE_VERSION, compute_cost
+from .rag.text.analyzer import estimate_tokens
 
 logger = logging.getLogger("service-embedding")
 
 EMBEDDING_MODEL = "gemini-embedding-2"
 EMBEDDING_DIMENSIONS = 768
+
+
+@dataclass
+class EmbeddingUsage:
+    """Usage accounting for an embedding call."""
+    input_tokens: int
+    cost_usd: float | None = None
+    price_table_version: str | None = None
+    estimated: bool = True
+
+
+@dataclass
+class EmbeddingResult:
+    """Vectors and token usage for generate_embedding_with_usage()."""
+    vectors: Union[List[float], List[List[float]]]
+    usage: EmbeddingUsage
 
 # Hard character ceiling for individual-fallback embedding calls.
 # Applied only in Phase 2 (per-item fallback); batch callers should
@@ -192,3 +212,41 @@ def generate_embedding(
         f"{len(failed_indices) - recovered} zero-vector(s) assigned."
     )
     return results if is_batch else results[0]
+
+
+def generate_embedding_with_usage(
+    text: Union[str, List[str]],
+    task_type: str = "RETRIEVAL_DOCUMENT",
+) -> EmbeddingResult:
+    """Generates embeddings and returns usage with cost computed from pricing table.
+
+    Token usage is estimated with estimate_tokens and marked estimated=True (AC-RAG-69).
+    """
+    if not text:
+        return EmbeddingResult(
+            vectors=[] if isinstance(text, list) else [],
+            usage=EmbeddingUsage(
+                input_tokens=0,
+                cost_usd=0.0,
+                price_table_version=PRICE_TABLE_VERSION,
+                estimated=True,
+            ),
+        )
+
+    is_batch = isinstance(text, list)
+    input_list = text if is_batch else [text]
+
+    est_tokens = sum(estimate_tokens(t) for t in input_list if t and t.strip())
+    vectors = generate_embedding(text, task_type=task_type)
+    cost_usd = compute_cost(EMBEDDING_MODEL, input_tokens=est_tokens)
+
+    return EmbeddingResult(
+        vectors=vectors,
+        usage=EmbeddingUsage(
+            input_tokens=est_tokens,
+            cost_usd=cost_usd,
+            price_table_version=PRICE_TABLE_VERSION,
+            estimated=True,
+        ),
+    )
+

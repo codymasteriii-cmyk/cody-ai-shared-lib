@@ -143,9 +143,20 @@ def get_model_pricing(model: str) -> Optional[ModelPricingType]:
     return None
 
 
-def compute_cost(model: str, usage: Any) -> Optional[float]:
-    """Compute total dollar cost for a model call given its reported token or unit usage.
+def compute_cost(
+    model: str,
+    usage: Any = None,
+    *,
+    input_tokens: Optional[Union[int, float]] = None,
+    output_tokens: Optional[Union[int, float]] = None,
+    cached_tokens: Optional[Union[int, float]] = None,
+    images: Optional[Union[int, float]] = None,
+    seconds: Optional[Union[int, float]] = None,
+    total_tokens: Optional[Union[int, float]] = None,
+) -> Optional[float]:
+    """Compute total dollar cost for a model call given reported token or unit usage.
 
+    Accepts either a usage object/dict as positional second argument, or explicit keyword args.
     Returns:
         float cost in USD (rounded to 6 decimal places), or None if the model is unpriced.
     """
@@ -153,38 +164,47 @@ def compute_cost(model: str, usage: Any) -> Optional[float]:
     if pricing is None:
         return None
 
-    # Extract fields from usage (dataclass, Pydantic model, or dict)
-    def _val(attr_name: str, default: float = 0.0) -> float:
-        if isinstance(usage, dict):
-            return float(usage.get(attr_name, default) or 0.0)
-        return float(getattr(usage, attr_name, default) or 0.0)
+    def _val(attr_name: str, kwarg_val: Optional[Union[int, float]], default: float = 0.0) -> float:
+        if kwarg_val is not None:
+            return float(kwarg_val)
+        if usage is not None:
+            if isinstance(usage, dict):
+                return float(usage.get(attr_name, default) or 0.0)
+            return float(getattr(usage, attr_name, default) or 0.0)
+        return default
 
-    input_tokens = _val("input_tokens", 0.0)
-    output_tokens = _val("output_tokens", 0.0)
-    cached_tokens = _val("cached_tokens", 0.0)
-    images = _val("images", 0.0)
-    seconds = _val("seconds", 0.0)
+    in_tok = _val("input_tokens", input_tokens, 0.0)
+    out_tok = _val("output_tokens", output_tokens, 0.0)
+    cached_tok = _val("cached_tokens", cached_tokens, 0.0)
+    imgs = _val("images", images, 0.0)
+    secs = _val("seconds", seconds, 0.0)
+    tot_tok = _val("total_tokens", total_tokens, 0.0)
+
+    # For rerank or single-metric token models, total_tokens counts as input_tokens if in_tok == 0
+    if in_tok == 0.0 and tot_tok > 0.0:
+        in_tok = tot_tok
 
     total_cost = 0.0
 
-    if isinstance(pricing, TokenPricing) or isinstance(pricing, VoicePricing):
-        # Cached tokens pricing
-        cached_rate = getattr(pricing, "cached_input_cost_per_m", None) or pricing.input_cost_per_m
-        effective_input = max(0.0, input_tokens - cached_tokens)
+    if isinstance(pricing, (TokenPricing, VoicePricing)):
+        cached_rate = getattr(pricing, "cached_input_cost_per_m", None)
+        if cached_rate is None:
+            cached_rate = pricing.input_cost_per_m * 0.25
+        effective_input = max(0.0, in_tok - cached_tok)
         total_cost += (effective_input / 1_000_000.0) * pricing.input_cost_per_m
-        total_cost += (cached_tokens / 1_000_000.0) * cached_rate
-        total_cost += (output_tokens / 1_000_000.0) * pricing.output_cost_per_m
+        total_cost += (cached_tok / 1_000_000.0) * cached_rate
+        total_cost += (out_tok / 1_000_000.0) * pricing.output_cost_per_m
 
     elif isinstance(pricing, ImagePricing):
-        total_cost += (input_tokens / 1_000_000.0) * pricing.input_cost_per_m
-        total_cost += (output_tokens / 1_000_000.0) * pricing.output_cost_per_m
-        total_cost += images * pricing.cost_per_image
+        total_cost += (in_tok / 1_000_000.0) * pricing.input_cost_per_m
+        total_cost += (out_tok / 1_000_000.0) * pricing.output_cost_per_m
+        total_cost += imgs * pricing.cost_per_image
 
     elif isinstance(pricing, VideoPricing):
-        total_cost += (input_tokens / 1_000_000.0) * pricing.input_cost_per_m
-        total_cost += (output_tokens / 1_000_000.0) * pricing.output_cost_per_m
-        total_cost += images * pricing.input_cost_per_image
-        total_cost += seconds * pricing.output_cost_per_second
+        total_cost += (in_tok / 1_000_000.0) * pricing.input_cost_per_m
+        total_cost += (out_tok / 1_000_000.0) * pricing.output_cost_per_m
+        total_cost += imgs * pricing.input_cost_per_image
+        total_cost += secs * pricing.output_cost_per_second
 
     return round(total_cost, 6)
 

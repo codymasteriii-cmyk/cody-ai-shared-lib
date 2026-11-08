@@ -1,9 +1,10 @@
 """Model-agnostic LLM client with singleton SDK connections and cross-provider retry.
 
 Shared across all Cody AI projects. Routes API calls by model name prefix:
-  gemini-*  → Google GenAI SDK (google-generativeai)
+  gemini-*  → Google GenAI SDK (google-genai)
   claude-*  → Anthropic Messages SDK (anthropic) — lazy import, only loaded
               if the caller actually routes to a Claude model.
+  gpt-*     → OpenAI SDK (openai) — lazy import, routes to OpenAI models.
 
 Design principles:
   - One LLMClient instance per project (singleton at module level in the
@@ -11,53 +12,47 @@ Design principles:
     first use and reused across all subsequent generate() calls.
   - Returns raw response.text only. All parsing (json.loads, fence stripping,
     Pydantic construction, field sanitisation) is the caller's responsibility.
-  - Retry with exponential backoff is applied uniformly to both providers for
+  - Retry with exponential backoff is applied uniformly across providers for
     rate-limit (429) and transient server errors (5xx).
   - No config file dependency. All parameters are passed at instantiation time
     with sensible defaults, or overridden per-call via generate().
 
-Usage tracking: generate_with_usage() returns real token counts from the
-provider response instead of a char-count estimate. output_tokens means the
-same thing for both providers (total generation cost) — see LLMUsage
-docstring for how each provider's raw response maps onto it. generate() is
-unchanged (still returns a bare str) so existing callers across all projects
-are unaffected.
+Usage tracking: generate_with_usage() returns real token counts and USD cost
+calculated from cody_ai_shared_lib.pricing. finish_reason is normalized to
+("stop", "length", "safety", "other").
 """
+from __future__ import annotations
+
 import logging
 import os
 import time
 from dataclasses import dataclass
+from typing import Any
+
+from .pricing import PRICE_TABLE_VERSION, compute_cost
 
 logger = logging.getLogger("shared-llm")
 
-
-# ── Usage tracking types ────────────────────────────────────────────────────────
-
-@dataclass
-class LLMUsage:
-    """Token usage for one generate_with_usage() call.
-
-    input_tokens:  Prompt tokens (system + user message), both providers.
-    output_tokens: Total generation spend, both providers — the number that
-                    matters for cost. Claude reports this as a single combined
-                    count already (thinking included when thinking was used).
-                    Gemini reports visible-text and thinking tokens separately
-                    (`candidates_token_count` + `thoughts_token_count`); this
-                    field is their sum, folded in at the call site in
-                    _gemini_generate() so callers never need to know the two
-                    providers report differently.
-    """
-    input_tokens: int
-    output_tokens: int
+__all__ = ["LLMClient", "LLMUsage", "LLMResult", "ModelCallError"]
 
 
-@dataclass
-class LLMResult:
-    """Return value of generate_with_usage(): text plus real token counts."""
-    text: str
-    usage: LLMUsage
+# ── Error classification & Exception Types ─────────────────────────────────────
 
-# ── Error classification ───────────────────────────────────────────────────────
+class ModelCallError(Exception):
+    """Raised when a model call fails or post-processing fails after a billed response (AC-RAG-70)."""
+
+    def __init__(
+        self,
+        message: str,
+        usage: LLMUsage | None = None,
+        billing: str = "billed",
+        cause: Exception | None = None,
+    ):
+        super().__init__(message)
+        self.usage = usage
+        self.billing = billing  # "billed" | "unknown"
+        self.cause = cause
+
 
 def _is_retryable(exc: Exception) -> bool:
     """Return True for rate-limit and transient server errors that warrant retry."""
@@ -69,20 +64,43 @@ def _is_retryable(exc: Exception) -> bool:
     ))
 
 
+# ── Usage tracking types ────────────────────────────────────────────────────────
+
+@dataclass
+class LLMUsage:
+    """Token usage and cost accounting for one generate_with_usage() call.
+
+    input_tokens:        Prompt tokens (system + user message).
+    output_tokens:       Total generation spend (including thinking tokens where reported).
+    cached_tokens:       Cached prompt tokens read (where reported by provider).
+    cost_usd:            Calculated USD cost against pricing table, or None if unlisted.
+    price_table_version: Version of pricing table used (e.g. '2026-11-08').
+    estimated:           False when token counts are reported directly by provider.
+    """
+    input_tokens: int
+    output_tokens: int
+    cached_tokens: int = 0
+    cost_usd: float | None = None
+    price_table_version: str | None = None
+    estimated: bool = False
+
+
+@dataclass
+class LLMResult:
+    """Return value of generate_with_usage(): text, token usage, cost, and finish reason."""
+    text: str
+    usage: LLMUsage
+    finish_reason: str | None = None  # Normalized: "stop", "length", "safety", "other"
+
+
 # ── LLMClient ─────────────────────────────────────────────────────────────────
 
 class LLMClient:
     """Reusable, model-agnostic LLM client.
 
     Instantiate once at module/app startup. SDK connections (Gemini client,
-    Anthropic client) are created lazily on first use and shared across all
-    subsequent generate() calls, avoiding repeated authentication overhead.
-
-    Example (project-level singleton)::
-
-        from cody_ai_shared_lib.llm import LLMClient
-        _client = LLMClient()               # uses defaults
-        raw = _client.generate(sys, user, "gemini-3-flash-preview")
+    Anthropic client, OpenAI client) are created lazily on first use and shared
+    across all subsequent generate() calls.
     """
 
     def __init__(
@@ -91,22 +109,12 @@ class LLMClient:
         retry_base_wait_secs: float = 2.0,
         sdk_timeout_ms: int = 60_000,
     ):
-        """Create an LLMClient.
-
-        Args:
-            retry_max:            Maximum attempts per generate() call on
-                                  rate-limit or transient errors. Applies to
-                                  both Gemini and Claude.
-            retry_base_wait_secs: Exponential backoff base in seconds.
-                                  Wait = base * 2^attempt → 2s, 4s, 8s, …
-            sdk_timeout_ms:       HTTP timeout for the Gemini SDK (milliseconds).
-                                  The Anthropic SDK manages its own timeout.
-        """
         self.retry_max = retry_max
         self.retry_base_wait_secs = retry_base_wait_secs
         self.sdk_timeout_ms = sdk_timeout_ms
         self._gemini_client = None
         self._anthropic_client = None
+        self._openai_client = None
 
     # ── SDK singleton accessors ────────────────────────────────────────────────
 
@@ -122,9 +130,36 @@ class LLMClient:
     def _get_anthropic_client(self):
         if self._anthropic_client is None:
             import anthropic
-            # Reads ANTHROPIC_API_KEY from environment automatically.
             self._anthropic_client = anthropic.Anthropic()
         return self._anthropic_client
+
+    def _get_openai_client(self):
+        if self._openai_client is None:
+            from openai import OpenAI
+            self._openai_client = OpenAI(
+                api_key=os.getenv("OPENAI_API_KEY"),
+                timeout=self.sdk_timeout_ms / 1000.0,
+            )
+        return self._openai_client
+
+    # ── Finish reason normalization ────────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_finish_reason(raw: Any) -> str | None:
+        """Normalize provider-specific finish reason to 'stop', 'length', 'safety', or 'other'."""
+        if raw is None:
+            return None
+        raw_str = str(raw).lower().strip()
+        if "." in raw_str:
+            raw_str = raw_str.split(".")[-1]
+
+        if raw_str in ("stop", "end_turn", "stop_sequence"):
+            return "stop"
+        if raw_str in ("length", "max_tokens"):
+            return "length"
+        if raw_str in ("safety", "refusal", "content_filter", "recitation", "blocklist", "prohibited_content", "spii"):
+            return "safety"
+        return "other"
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -134,60 +169,22 @@ class LLMClient:
         user_message: str,
         model: str,
         max_tokens: int | None = None,
-        # ── Gemini-specific ───────────────────────────────────────────────────
+        # Gemini-specific / shared structured options
         response_mime_type: str | None = None,
-        # "application/json" → Gemini returns clean JSON with no fences, no
-        # Python literals (None/True/False), no trailing commas. Eliminates
-        # fence-stripping and sanitisation at the call site.
-        # Ignored for claude-* models.
         response_schema: type | None = None,
-        # A Pydantic model class for server-side schema enforcement.
-        # Only valid alongside response_mime_type for gemini-* models.
-        # Ignored for claude-* models.
         disable_auto_func_calling: bool = False,
-        # Prevents Gemini from auto-invoking function tools. Set True when
-        # the pipeline does not use tools, to avoid SDK deadlocks.
-        # Ignored for claude-* models.
         thinking_level: str | None = None,
-        # Categorical thinking level for Gemini 3 ("minimal", "low", "medium", "high").
-        # If None (default), omitted so model uses its default thinking setting.
-        # Ignored for claude-* models.
-        # ── Claude-specific ───────────────────────────────────────────────────
+        # Claude/OpenAI-specific options
         temperature: float | None = None,
-        # Sampling temperature for Claude (0.0–1.0). Provider default if None.
-        # Deprecated and ignored for Gemini (models use optimal built-in sampling).
         stop_sequences: list[str] | None = None,
-        # Sequences that halt generation early. Supported by Claude.
-        # Gemini ignores this parameter in the current implementation.
         stream: bool = False,
-        # When True, uses the provider's streaming API internally. The return
-        # value is identical — the full assembled response — but the HTTP
-        # timeout applies per-chunk rather than to the total call, so long
-        # generations do not 504.
     ) -> str:
-        """Call the LLM and return raw response text.
+        """Call the LLM and return raw response text string.
 
         Routes by model name prefix:
           'gemini-*' → Google GenAI SDK
           'claude-*' → Anthropic Messages API
-
-        Retries on rate-limit and transient errors for both providers using
-        exponential backoff (retry_base_wait_secs * 2^attempt).
-
-        Args:
-            max_tokens: Output token limit. None (default) means:
-                        - Gemini: field omitted; model uses its own default.
-                        - Claude: internal fallback of 8192 (the Anthropic API
-                          requires the field; passing None would error).
-                        Pass an explicit value for short structured tasks
-                        (e.g. max_tokens=256 for classification) to control cost.
-
-        Returns:
-            Raw response text string. Parsing is the caller's responsibility.
-
-        Raises:
-            ValueError: Unknown model prefix.
-            RuntimeError: All retry attempts exhausted.
+          'gpt-*'    → OpenAI API
         """
         return self.generate_with_usage(
             system_prompt, user_message, model, max_tokens,
@@ -214,18 +211,7 @@ class LLMClient:
         stop_sequences: list[str] | None = None,
         stream: bool = False,
     ) -> LLMResult:
-        """Same call as generate(), but returns real token usage alongside the text.
-
-        See LLMUsage for what output_tokens means per provider — Gemini's
-        thinking-token spend is folded in at the call site (_gemini_generate),
-        so both providers' output_tokens mean the same thing: total generation
-        cost, ready to multiply by a per-token price with no provider-specific
-        math at the call site.
-
-        Raises:
-            ValueError: Unknown model prefix.
-            RuntimeError: All retry attempts exhausted.
-        """
+        """Same call as generate(), but returns real token usage, cost, and finish reason."""
         if model.startswith("gemini"):
             return self._gemini_generate(
                 system_prompt, user_message, model, max_tokens,
@@ -237,11 +223,20 @@ class LLMClient:
             return self._claude_generate(
                 system_prompt, user_message, model, max_tokens,
                 temperature, stop_sequences,
+                response_schema=response_schema,
+                stream=stream,
+            )
+        if model.startswith("gpt"):
+            return self._openai_generate(
+                system_prompt, user_message, model, max_tokens,
+                temperature, stop_sequences,
+                response_mime_type=response_mime_type,
+                response_schema=response_schema,
                 stream=stream,
             )
         raise ValueError(
             f"Unknown model provider for: {model!r}. "
-            "Expected prefix 'gemini-' or 'claude-'."
+            "Expected prefix 'gemini-', 'claude-', or 'gpt-'."
         )
 
     # ── Provider implementations ───────────────────────────────────────────────
@@ -260,8 +255,6 @@ class LLMClient:
     ) -> LLMResult:
         from google.genai import types
 
-        # Build config kwargs; only include optional fields when explicitly set
-        # to avoid overriding Gemini model defaults unnecessarily.
         config_kwargs: dict = {"system_instruction": system_prompt}
         if max_tokens is not None:
             config_kwargs["max_output_tokens"] = max_tokens
@@ -275,14 +268,10 @@ class LLMClient:
                     disable=True, maximum_remote_calls=0
                 )
             )
-        # Thinking level for Gemini 3 ("minimal", "low", "medium", "high").
-        # If None, omitted so the model uses its default thinking behavior.
         if thinking_level is not None:
             config_kwargs["thinking_config"] = types.ThinkingConfig(
                 thinking_level=thinking_level
             )
-        # Note: sampling parameters (temperature, top_p, top_k) are deprecated
-        # since Gemini 3.6 Flash and omitted to prevent 400 errors in future models.
 
         client = self._get_gemini_client()
         last_exc = None
@@ -299,36 +288,70 @@ class LLMClient:
                     ):
                         if chunk.text:
                             chunks.append(chunk.text)
-                        last_chunk = chunk  # usage_metadata is None on all but the final chunk
+                        last_chunk = chunk
                     response_text = "".join(chunks)
                     meta = last_chunk.usage_metadata if last_chunk else None
+                    candidate = (
+                        last_chunk.candidates[0]
+                        if (last_chunk and getattr(last_chunk, "candidates", None) and len(last_chunk.candidates) > 0)
+                        else None
+                    )
                 else:
                     response = client.models.generate_content(
                         model=model,
                         contents=user_message,
                         config=types.GenerateContentConfig(**config_kwargs),
                     )
-                    response_text = response.text
+                    response_text = response.text or ""
                     meta = response.usage_metadata
-                logger.debug(f"[LLM] Gemini {model} succeeded (attempt {attempt + 1}).")
-                # Fold thinking into output_tokens here — the one place that needs
-                # to know Gemini reports them separately (see LLMUsage docstring).
-                visible_tokens = (meta.candidates_token_count if meta else 0) or 0
-                # getattr, not a direct attribute read: thoughts_token_count was added to
-                # GenerateContentResponseUsageMetadata in a later google-genai release.
-                # On an older installed SDK (e.g. 1.2.0, the floor this project pins in
-                # requirements.txt with no upper bound) the field does not exist on the
-                # Pydantic model at all, and a direct `meta.thoughts_token_count` read
-                # raises AttributeError — crashing every real call, structured or text,
-                # the moment a thinking-capable model is used. getattr(..., 0) is correct
-                # on both old (field absent) and new (field present, 0 when unused) SDKs.
-                thinking_tokens = (getattr(meta, "thoughts_token_count", 0) if meta else 0) or 0
-                usage = LLMUsage(
-                    input_tokens=(meta.prompt_token_count if meta else 0) or 0,
-                    output_tokens=visible_tokens + thinking_tokens,
-                )
-                return LLMResult(text=response_text, usage=usage)
+                    candidate = (
+                        response.candidates[0]
+                        if (getattr(response, "candidates", None) and len(response.candidates) > 0)
+                        else None
+                    )
 
+                logger.debug(f"[LLM] Gemini {model} succeeded (attempt {attempt + 1}).")
+
+                visible_tokens = (meta.candidates_token_count if meta else 0) or 0
+                thinking_tokens = (getattr(meta, "thoughts_token_count", 0) if meta else 0) or 0
+                output_tokens = visible_tokens + thinking_tokens
+                input_tokens = (meta.prompt_token_count if meta else 0) or 0
+                cached_tokens = (getattr(meta, "cached_content_token_count", 0) if meta else 0) or 0
+
+                raw_finish = getattr(candidate, "finish_reason", None) if candidate else None
+                finish_reason = self._normalize_finish_reason(raw_finish)
+
+                cost_usd = compute_cost(
+                    model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cached_tokens=cached_tokens,
+                )
+
+                usage = LLMUsage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cached_tokens=cached_tokens,
+                    cost_usd=cost_usd,
+                    price_table_version=PRICE_TABLE_VERSION,
+                    estimated=False,
+                )
+
+                if response_schema is not None:
+                    try:
+                        response_schema.model_validate_json(response_text)
+                    except Exception as parse_exc:
+                        raise ModelCallError(
+                            f"[LLM] Gemini {model} structured output parse failure: {parse_exc}",
+                            usage=usage,
+                            billing="billed",
+                            cause=parse_exc,
+                        )
+
+                return LLMResult(text=response_text, usage=usage, finish_reason=finish_reason)
+
+            except ModelCallError:
+                raise
             except Exception as exc:
                 last_exc = exc
                 if _is_retryable(exc) and attempt < self.retry_max - 1:
@@ -354,14 +377,13 @@ class LLMClient:
         max_tokens: int | None,
         temperature: float | None,
         stop_sequences: list[str] | None,
+        response_schema: type | None = None,
         stream: bool = False,
     ) -> LLMResult:
         client = self._get_anthropic_client()
 
         create_kwargs: dict = {
             "model": model,
-            # Claude's API requires max_tokens; use 8192 as the internal
-            # fallback when the caller does not specify a limit.
             "max_tokens": max_tokens if max_tokens is not None else 8192,
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_message}],
@@ -380,20 +402,53 @@ class LLMClient:
                         response_text = s.get_final_text()
                         final_msg = s.get_final_message()
                     usage_obj = final_msg.usage
+                    raw_stop = getattr(final_msg, "stop_reason", None)
                 else:
                     response = client.messages.create(**create_kwargs)
-                    response_text = response.content[0].text
+                    # Support ThinkingBlock followed by TextBlock (e.g. claude-opus-5-5)
+                    response_text = "".join(b.text for b in response.content if hasattr(b, "text"))
                     usage_obj = response.usage
-                logger.debug(f"[LLM] Claude {model} succeeded (attempt {attempt + 1}).")
-                # Claude's usage.output_tokens is a single combined count — it
-                # already includes thinking tokens when thinking was used, and
-                # the API does not report them separately (unlike Gemini).
-                usage = LLMUsage(
-                    input_tokens=usage_obj.input_tokens,
-                    output_tokens=usage_obj.output_tokens,
-                )
-                return LLMResult(text=response_text, usage=usage)
+                    raw_stop = getattr(response, "stop_reason", None)
 
+                logger.debug(f"[LLM] Claude {model} succeeded (attempt {attempt + 1}).")
+
+                uncached_tokens = getattr(usage_obj, "input_tokens", 0) or 0
+                cached_tokens = getattr(usage_obj, "cache_read_input_tokens", 0) or 0
+                input_tokens = uncached_tokens + cached_tokens
+                output_tokens = getattr(usage_obj, "output_tokens", 0) or 0
+                finish_reason = self._normalize_finish_reason(raw_stop)
+
+                cost_usd = compute_cost(
+                    model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cached_tokens=cached_tokens,
+                )
+
+                usage = LLMUsage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cached_tokens=cached_tokens,
+                    cost_usd=cost_usd,
+                    price_table_version=PRICE_TABLE_VERSION,
+                    estimated=False,
+                )
+
+                if response_schema is not None:
+                    try:
+                        response_schema.model_validate_json(response_text)
+                    except Exception as parse_exc:
+                        raise ModelCallError(
+                            f"[LLM] Claude {model} structured output parse failure: {parse_exc}",
+                            usage=usage,
+                            billing="billed",
+                            cause=parse_exc,
+                        )
+
+                return LLMResult(text=response_text, usage=usage, finish_reason=finish_reason)
+
+            except ModelCallError:
+                raise
             except Exception as exc:
                 last_exc = exc
                 if _is_retryable(exc) and attempt < self.retry_max - 1:
@@ -409,4 +464,128 @@ class LLMClient:
 
         raise RuntimeError(
             f"[LLM] Claude {model} failed after {self.retry_max} attempts: {last_exc}"
+        )
+
+    def _openai_generate(
+        self,
+        system_prompt: str,
+        user_message: str,
+        model: str,
+        max_tokens: int | None,
+        temperature: float | None,
+        stop_sequences: list[str] | None,
+        response_mime_type: str | None = None,
+        response_schema: type | None = None,
+        stream: bool = False,
+    ) -> LLMResult:
+        client = self._get_openai_client()
+        # Reasoning models (gpt-6 series, o1, o3) enforce max_completion_tokens and reject temperature
+        is_reasoning = any(x in model.lower() for x in ("gpt-6", "o1", "o3"))
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+        create_kwargs: dict = {
+            "model": model,
+            "messages": messages,
+        }
+        if is_reasoning:
+            if max_tokens is not None:
+                create_kwargs["max_completion_tokens"] = max_tokens
+        else:
+            if max_tokens is not None:
+                create_kwargs["max_tokens"] = max_tokens
+            if temperature is not None:
+                create_kwargs["temperature"] = temperature
+
+        if stop_sequences:
+            create_kwargs["stop"] = stop_sequences
+
+        if response_mime_type == "application/json" and response_schema is None:
+            create_kwargs["response_format"] = {"type": "json_object"}
+
+        last_exc = None
+
+        for attempt in range(self.retry_max):
+            try:
+                if stream:
+                    chunks = []
+                    raw_reason = None
+                    final_usage = None
+                    response_stream = client.chat.completions.create(
+                        stream=True,
+                        stream_options={"include_usage": True},
+                        **create_kwargs,
+                    )
+                    for chunk in response_stream:
+                        if chunk.choices and chunk.choices[0].delta.content:
+                            chunks.append(chunk.choices[0].delta.content)
+                        if chunk.choices and chunk.choices[0].finish_reason:
+                            raw_reason = chunk.choices[0].finish_reason
+                        if getattr(chunk, "usage", None):
+                            final_usage = chunk.usage
+                    response_text = "".join(chunks)
+                    usage_obj = final_usage
+                else:
+                    response = client.chat.completions.create(**create_kwargs)
+                    choice = response.choices[0]
+                    response_text = choice.message.content or ""
+                    raw_reason = choice.finish_reason
+                    usage_obj = response.usage
+
+                logger.debug(f"[LLM] OpenAI {model} succeeded (attempt {attempt + 1}).")
+
+                input_tokens = getattr(usage_obj, "prompt_tokens", 0) or 0
+                output_tokens = getattr(usage_obj, "completion_tokens", 0) or 0
+                prompt_details = getattr(usage_obj, "prompt_tokens_details", None)
+                cached_tokens = getattr(prompt_details, "cached_tokens", 0) or 0
+                finish_reason = self._normalize_finish_reason(raw_reason)
+
+                cost_usd = compute_cost(
+                    model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cached_tokens=cached_tokens,
+                )
+
+                usage = LLMUsage(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cached_tokens=cached_tokens,
+                    cost_usd=cost_usd,
+                    price_table_version=PRICE_TABLE_VERSION,
+                    estimated=False,
+                )
+
+                if response_schema is not None:
+                    try:
+                        response_schema.model_validate_json(response_text)
+                    except Exception as parse_exc:
+                        raise ModelCallError(
+                            f"[LLM] OpenAI {model} structured output parse failure: {parse_exc}",
+                            usage=usage,
+                            billing="billed",
+                            cause=parse_exc,
+                        )
+
+                return LLMResult(text=response_text, usage=usage, finish_reason=finish_reason)
+
+            except ModelCallError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if _is_retryable(exc) and attempt < self.retry_max - 1:
+                    wait = self.retry_base_wait_secs * (2 ** attempt)
+                    logger.warning(
+                        f"[LLM] OpenAI {model} retryable error "
+                        f"(attempt {attempt + 1}/{self.retry_max}): {exc}. "
+                        f"Retrying in {wait:.0f}s..."
+                    )
+                    time.sleep(wait)
+                else:
+                    raise
+
+        raise RuntimeError(
+            f"[LLM] OpenAI {model} failed after {self.retry_max} attempts: {last_exc}"
         )

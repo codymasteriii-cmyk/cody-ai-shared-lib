@@ -1,20 +1,29 @@
 from .auth import AuthError, extract_bearer_token, verify_supabase_jwt
 from .email import EmailError, send_email
-from .embedding import generate_embedding
+from .embedding import (
+    EmbeddingResult,
+    EmbeddingUsage,
+    generate_embedding,
+    generate_embedding_with_usage,
+)
 from .fetcher import (
     extract_pdf_text,
     extract_title_and_markdown,
     fetch_article,
     normalize_url,
 )
-from .llm import LLMClient
+from .jev import JevClient, JevResult, JevUsage, NoulAnswer
+from .llm import LLMClient, LLMResult, LLMUsage, ModelCallError
 from .pricing import (
     PRICE_TABLE_VERSION,
+    clear_price_overrides,
     compute_cost,
     estimate_cost,
     get_model_pricing,
+    get_price_table_version,
     set_price_override,
 )
+from .rerank import RerankClient, RerankItem, RerankResult, RerankUsage
 from .supabase_client import _get_supabase_client as get_supabase_client
 from .url_validator import validate_public_url
 
@@ -35,11 +44,25 @@ except ModuleNotFoundError as _tts_import_error:
 
 __all__ = [
     "generate_embedding",
+    "generate_embedding_with_usage",
+    "EmbeddingResult",
+    "EmbeddingUsage",
     "fetch_article",
     "normalize_url",
     "extract_pdf_text",
     "extract_title_and_markdown",
     "LLMClient",
+    "LLMResult",
+    "LLMUsage",
+    "ModelCallError",
+    "JevClient",
+    "JevResult",
+    "JevUsage",
+    "NoulAnswer",
+    "RerankClient",
+    "RerankResult",
+    "RerankUsage",
+    "RerankItem",
     "get_supabase_client",
     "validate_public_url",
     "verify_supabase_jwt",
@@ -51,7 +74,9 @@ __all__ = [
     "compute_cost",
     "estimate_cost",
     "get_model_pricing",
+    "get_price_table_version",
     "set_price_override",
+    "clear_price_overrides",
 ]
 
 if _tts_available:
