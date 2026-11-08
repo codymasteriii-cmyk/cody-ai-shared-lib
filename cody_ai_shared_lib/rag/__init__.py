@@ -14,6 +14,8 @@ from .errors import (
     StoreCapabilityError,
     UnsupportedFilterError,
 )
+from .degradation import AGREED_DEGRADATIONS, DegradationTracker
+from .gateway import ModelGateway
 from .granularity import (
     BUILTIN_GRANULARITIES,
     TRAIT_ATOMIC,
@@ -66,7 +68,33 @@ from .ports import (
     ScopeStats,
     StoreCapabilities,
 )
+from .profile import (
+    ContextConfig,
+    EngineProfile,
+    GenerationConfig,
+    IngestionConfig,
+    ModelBindings,
+    RetrievalConfig,
+    RouterConfig,
+    RuntimeConfig,
+    knowledge_base,
+    long_form_reader,
+    news_intelligence,
+)
+from .registry import ComponentRegistry, create_default_registry
 from .render import DefaultRenderer, NodeRenderer
+from .runtime import (
+    Clock,
+    Deadline,
+    DeterministicRng,
+    FrozenClock,
+    Rng,
+    SystemClock,
+    SystemRng,
+    make_bounded_pool,
+)
+from .trace import ObserverDispatcher, RAGObserver, RAGTrace, StageRecord
+from .usage import BudgetGuard, CallContext, UsageTracker
 
 __all__ = [
     # Errors
@@ -132,4 +160,40 @@ __all__ = [
     "ScopeGuard",
     "NodeRenderer",
     "DefaultRenderer",
+    # Degradation
+    "AGREED_DEGRADATIONS",
+    "DegradationTracker",
+    # Gateway & Usage
+    "ModelGateway",
+    "CallContext",
+    "BudgetGuard",
+    "UsageTracker",
+    # Trace & Observer
+    "StageRecord",
+    "RAGTrace",
+    "RAGObserver",
+    "ObserverDispatcher",
+    # Registry & Profile
+    "ComponentRegistry",
+    "create_default_registry",
+    "ModelBindings",
+    "EngineProfile",
+    "RouterConfig",
+    "RetrievalConfig",
+    "ContextConfig",
+    "GenerationConfig",
+    "IngestionConfig",
+    "RuntimeConfig",
+    "long_form_reader",
+    "news_intelligence",
+    "knowledge_base",
+    # Runtime determinism
+    "Clock",
+    "SystemClock",
+    "FrozenClock",
+    "Rng",
+    "SystemRng",
+    "DeterministicRng",
+    "Deadline",
+    "make_bounded_pool",
 ]

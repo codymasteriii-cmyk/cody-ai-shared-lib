@@ -110,7 +110,17 @@ class RAGStageError(RAGEngineError):
 
 class BudgetExceeded(RAGEngineError):
     """Raised when a BudgetGuard halts execution because token or cost limits are exceeded."""
-    pass
+
+    def __init__(
+        self,
+        message: str,
+        limit_usd: float | None = None,
+        spent_usd: float | None = None,
+        **kwargs: Any,
+    ):
+        super().__init__(message, **kwargs)
+        self.limit_usd = limit_usd
+        self.spent_usd = spent_usd
 
 
 class DeadlineExceeded(RAGEngineError):
