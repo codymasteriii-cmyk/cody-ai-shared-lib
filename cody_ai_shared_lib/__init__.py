@@ -8,6 +8,13 @@ from .fetcher import (
     normalize_url,
 )
 from .llm import LLMClient
+from .pricing import (
+    PRICE_TABLE_VERSION,
+    compute_cost,
+    estimate_cost,
+    get_model_pricing,
+    set_price_override,
+)
 from .supabase_client import _get_supabase_client as get_supabase_client
 from .url_validator import validate_public_url
 
@@ -40,6 +47,11 @@ __all__ = [
     "AuthError",
     "send_email",
     "EmailError",
+    "PRICE_TABLE_VERSION",
+    "compute_cost",
+    "estimate_cost",
+    "get_model_pricing",
+    "set_price_override",
 ]
 
 if _tts_available:
