@@ -2230,39 +2230,41 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 - **Data in one place:** for each model id, input, output and cached-input price per million tokens, price per call where applicable, and `effective_from`. The table has a `price_table_version`. A lib release updates it once for every app.
 - **It is data, not a model choice.** The table lists prices for models; it never selects one. D-12 (no model ids chosen by the lib) is unchanged.
 - **Supported model pricing catalog:**
-  - `gemini-3.8-flash`: $1.50 in / $7.50 out per 1M
-  - `gemini-3.5-flash-lite`: $0.30 in / $2.50 out per 1M
-  - `gemini-4-argon`: $4.00 in / $20.00 out per 1M
-  - `gemini-omni-1.2-flash`: $1.50 in / $12.00 out per 1M (Interactions API)
-  - `gemini-nano-banana-2.1`: $1.50 in / $30.00 out per 1M
-  - `gemini-3.8-flash-tts`: $1.00 in / $18.00 out per 1M
-  - `gemini-3-pro-image`: $2.00 in / $120.00 out per 1M
-  - `gemini-embedding-2`: $0.20 in per 1M (embedding only)
-  - `gpt-6-luna`: $0.10 in / $0.50 out per 1M
-  - `gpt-6.1-terra`: $1.00 in / $5.00 out per 1M
-  - `gpt-6.1-sol`: $2.00 in / $10.00 out per 1M
-  - `gpt-6-astra`: $10.00 in / $50.00 out per 1M
-  - `claude-fable-5-1`: $10.00 in / $50.00 out per 1M
-  - `claude-opus-5-5`: $4.00 in / $20.00 out per 1M
-  - `claude-sonnet-5-5`: $2.00 in / $10.00 out per 1M
-  - `claude-haiku-5-5`: $0.10 in / $0.50 out per 1M
-  - `claude-opus-5`: $5.00 in / $25.00 out per 1M
-  - `claude-sonnet-5`: $2.00 in / $10.00 out per 1M
-  - `claude-haiku-4-5-20251001`: $1.00 in / $5.00 out per 1M
-  - `jev`: $0.04 in per 1M
-  - `moonshotai/kimi-k3.1-pro`: $0.29 in / $8.14 out per 1M
-  - `moonshotai/kimi-k3.1-pro-highspeed`: $4.00 in / $20.00 out per 1M
-  - `minimax/minimax-m3.1-flash`: $0.10 in / $0.45 out per 1M
-  - `bytedance/seedream-5.0-pro`: $0.003 in per 1M, $0.04 per image
-  - `bytedance/seedream-5.0-lite`: $0.04 per image
-  - `bytedance/seedream-4.5`: $0.04 per image
-  - `minimax/minimax-h3`: $0.04 per image input, $0.08 per second output
-  - `minimax/minimax-h3-max`: $0.05 per second output
-  - `bytedance/seedance-2.5`: $10.70 out per 1M
-  - `bytedance/seedance-2.0-mini`: $3.50 out per 1M
-  - `bytedance/seedance-2.0`: $7.00 out per 1M
-  - `bytedance/seedance-2.0-fast`: $5.60 out per 1M
-  - `jina-reranker`: $0.05 per 1M tokens
+
+| Model | Input Rate (USD) | Output Rate (USD) | Use / Modality |
+| :--- | :--- | :--- | :--- |
+| `gemini-3.8-flash` | $1.50 / 1M | $7.50 / 1M | text |
+| `gemini-3.5-flash-lite` | $0.30 / 1M | $2.50 / 1M | text |
+| `gemini-4-argon` | $4.00 / 1M | $20.00 / 1M | text |
+| `gemini-omni-1.2-flash` | $1.50 / 1M | $12.00 / 1M | video |
+| `gemini-nano-banana-2.1` | $1.50 / 1M | $30.00 / 1M | image |
+| `gemini-3.8-flash-tts` | $1.00 / 1M | $18.00 / 1M | voice |
+| `gemini-3-pro-image` | $2.00 / 1M | $120.00 / 1M | image |
+| `gemini-embedding-2` | $0.20 / 1M | — (embedding only) | embedding |
+| `gpt-6-luna` | $0.10 / 1M | $0.50 / 1M | text |
+| `gpt-6.1-terra` | $1.00 / 1M | $5.00 / 1M | text |
+| `gpt-6.1-sol` | $2.00 / 1M | $10.00 / 1M | text |
+| `gpt-6-astra` | $10.00 / 1M | $50.00 / 1M | text |
+| `claude-fable-5-1` | $10.00 / 1M | $50.00 / 1M | text |
+| `claude-opus-5-5` | $4.00 / 1M | $20.00 / 1M | text |
+| `claude-sonnet-5-5` | $2.00 / 1M | $10.00 / 1M | text |
+| `claude-haiku-5-5` | $0.10 / 1M | $0.50 / 1M | text |
+| `claude-opus-5` | $5.00 / 1M | $25.00 / 1M | text |
+| `claude-sonnet-5` | $2.00 / 1M | $10.00 / 1M | text |
+| `claude-haiku-4-5-20251001` | $1.00 / 1M | $5.00 / 1M | text |
+| `jev` | $0.04 / 1M | — | decision |
+| `moonshotai/kimi-k3.1-pro` | $0.29 / 1M | $8.14 / 1M | image |
+| `moonshotai/kimi-k3.1-pro-highspeed` | $4.00 / 1M | $20.00 / 1M | image |
+| `bytedance/seedream-5.0-pro` | $0.003 / 1M | $0.04 / image | image |
+| `bytedance/seedream-5.0-lite` | — | $0.04 / image | image |
+| `bytedance/seedream-4.5` | — | $0.04 / image | image |
+| `minimax/minimax-h3` | $0.04 / image | $0.08 / second | video |
+| `minimax/minimax-h3-max` | — | $0.05 / second | video |
+| `bytedance/seedance-2.5` | — | $10.70 / 1M | video |
+| `bytedance/seedance-2.0-mini` | — | $3.50 / 1M | video |
+| `bytedance/seedance-2.0` | — | $7.00 / 1M | video |
+| `bytedance/seedance-2.0-fast` | — | $5.60 / 1M | video |
+| `jina-reranker` | $0.05 / 1M | — | rerank |
 - **`compute_cost(model, usage) -> float | None`** is used by the model modules. A model not in the table gives `None`; the lib never guesses.
 - **`estimate_cost(model, est_input_tokens, est_output_tokens) -> float | None`** lets any caller, and the RAG gateway, check a dollar limit **before** a call.
 - **Overrides:** `set_price_override(model, price)`, or the same mapping from settings, for negotiated rates and models not yet in the table. Precedence: override, then table, then `None`.
