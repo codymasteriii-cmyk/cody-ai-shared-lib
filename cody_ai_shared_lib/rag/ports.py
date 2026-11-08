@@ -21,7 +21,7 @@ class EmbeddingSpace(BaseModel):
     model: str
     dims: int
     task_type_documents: str = "RETRIEVAL_DOCUMENT"
-    splitter_version: str | None = None
+    splitter_version: str | None = "1.0.0"
 
 
 class ScopeStats(BaseModel):

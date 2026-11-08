@@ -6,15 +6,23 @@ spend accounting, and observable tracing.
 """
 from __future__ import annotations
 
+import hashlib
 import time
 import uuid
-from typing import Any, Generic
+from typing import Any, Callable, Generic
 
 from .context.assembler import ContextAssembler
 from .context.conversation import ConversationManager
 from .context.fence import ContextFencer
 from .degradation import DegradationTracker
-from .errors import GenerationError, MissingRequiredScopeError, ProfileConfigError, StoreCapabilityError
+from .embedder import BatchEmbedder
+from .errors import (
+    EmbeddingSignatureMismatch,
+    GenerationError,
+    MissingRequiredScopeError,
+    ProfileConfigError,
+    StoreCapabilityError,
+)
 from .gateway import ModelGateway
 from .generation.stuff import StuffStrategy
 from .guards import ScopeGuard, SequentialBoundaryGuard, TemporalGuard, TenantGuard
@@ -29,20 +37,27 @@ from .models import (
     IngestionProgress,
     MetaT,
     NodeRef,
+    PreparedNode,
     QueryIntent,
     QueryPlan,
+    RAGDocumentInput,
     RAGFilterSpec,
     RAGNode,
     RAGQueryRequest,
     RAGResponse,
     RAGRetrievalResult,
+    RAGSectionInput,
+    ReindexStatus,
     SourceSpan,
     StageUsage,
 )
-from .ports import Guard, NodeRenderer, RAGStore
+from .ports import Fingerprint, Guard, NodeRenderer, RAGStore
 from .postgen.citations import CitationExtractor
 from .postgen.quotes import QuoteVerifier
 from .postgen.sanitizer import OutputSanitizer
+from .summarizer import SectionSummarizer
+from .text.analyzer import CjkAwareAnalyzer, estimate_tokens
+from .text.splitter import PassThroughSplitter, SentenceSplitter
 from .postretrieval.dedup import IdentityDeduplicator, OffsetDeduplicator
 from .postretrieval.rerank import JinaCrossEncoderReranker
 from .postretrieval.threshold import ThresholdFilter
@@ -58,7 +73,7 @@ from .strategies.hybrid_rrf import HybridRRFStrategy
 from .strategies.keyword import KeywordFirstStrategy, KeywordOnlyStrategy
 from .strategies.transforms import SecondaryQueryFanOut, fair_interleave
 from .trace import ObserverDispatcher, RAGObserver, RAGTrace, StageRecord
-from .usage import BudgetGuard, UsageTracker
+from .usage import BudgetGuard, CallContext, UsageTracker
 
 
 class RAGEngine(Generic[MetaT]):
@@ -111,6 +126,39 @@ class RAGEngine(Generic[MetaT]):
         self.guards = list(guards or [])
         if not self.guards:
             self._init_builtin_guards()
+
+        # Text analyzer & splitter
+        analyzer_cls = self.registry.get("analyzer", self.profile.analyzer) or CjkAwareAnalyzer
+        self.analyzer = analyzer_cls() if callable(analyzer_cls) else analyzer_cls
+
+        splitter_cls = self.registry.get("splitter", self.profile.ingestion.splitter) or SentenceSplitter
+        if callable(splitter_cls):
+            try:
+                self.splitter = splitter_cls(
+                    target_size=self.profile.ingestion.target_size,
+                    overlap=self.profile.ingestion.overlap,
+                    analyzer=self.analyzer,
+                )
+            except TypeError:
+                self.splitter = splitter_cls()
+        else:
+            self.splitter = splitter_cls
+
+        self.embedder = BatchEmbedder(
+            gateway=self.gateway,
+            model=self.profile.models.embedding,
+            renderer=self.renderer,
+        )
+
+        self.summarizer = SectionSummarizer(
+            gateway=self.gateway,
+            summary_models=self.profile.models.summary,
+            enabled=self.profile.ingestion.summaries.enabled,
+            min_chars_for_summary=self.profile.ingestion.summaries.min_chars_for_summary,
+            summary_unit_chars=self.profile.ingestion.summaries.summary_unit_chars,
+            analyzer=self.analyzer,
+            fallback_action=self.profile.fallbacks.get("summarizer", "raise"),
+        )
 
         # Router setup
         self._init_router()
@@ -231,12 +279,29 @@ class RAGEngine(Generic[MetaT]):
             scope=stats,
         )
 
+    def validate(self) -> None:
+        """Validate engine configuration and store compatibility (AC-RAG-07, AC-RAG-49)."""
+        self.profile.validate(self.registry)
+        store_space = self.store.embedding_space()
+        if store_space.model != self.profile.models.embedding:
+            raise ProfileConfigError(
+                f"Store embedding space model '{store_space.model}' does not match "
+                f"profile embedding model '{self.profile.models.embedding}'"
+            )
+
     def retrieve(
         self,
         request: RAGQueryRequest,
         intent: QueryIntent | None = None,
     ) -> RAGRetrievalResult[MetaT]:
         """Ranked list retrieval mode (§8.10, AC-RAG-51)."""
+        # Check embedding space match (RAG-ING-7, AC-RAG-07)
+        store_space = self.store.embedding_space()
+        if store_space.model != self.profile.models.embedding:
+            raise EmbeddingSignatureMismatch(
+                f"Store embedding space '{store_space.model}' does not match profile '{self.profile.models.embedding}'"
+            )
+
         t0 = self.clock.monotonic()
         req_id = f"req-{uuid.uuid4().hex[:12]}"
         usage_tracker = UsageTracker(request_id=req_id, tenant_or_user_id=request.tenant_id)
@@ -508,57 +573,329 @@ class RAGEngine(Generic[MetaT]):
 
     def ingest_document(
         self,
-        document_id: str,
-        text: str,
+        doc: RAGDocumentInput[MetaT] | str,
+        start_section_seq: int = 0,
+        on_section_complete: Callable[[IngestionProgress], None] | None = None,
+        text: str | None = None,
         metadata: MetaT | None = None,
         section_id: str = "main",
         chunk_size: int = 600,
         chunk_overlap: int = 50,
     ) -> IngestionProgress:
-        """Splits document, embeds nodes, and atomically upserts into persistent store."""
+        """Splits document, embeds nodes, generates summaries, and atomically upserts into persistent store.
+
+        Resumable via start_section_seq and append-only (RAG-ING-5, RAG-ING-6, AC-RAG-05).
+        Enforces atomic sections (RAG-ING-10, AC-RAG-66) and budget guard (RAG-ING-12, AC-RAG-65).
+        """
         t0 = self.clock.monotonic()
-        nodes = self.prepare_nodes(
-            document_id=document_id,
-            text=text,
-            metadata=metadata,
-            section_id=section_id,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
+
+        # Handle legacy string/text positional arguments
+        if isinstance(doc, str):
+            doc_id = doc
+            sec = RAGSectionInput[MetaT](
+                section_id=section_id,
+                section_seq=0,
+                text=text or "",
+                char_start=0,
+                metadata=metadata or {},  # type: ignore[arg-type]
+            )
+            doc_input = RAGDocumentInput[MetaT](doc_id=doc_id, sections=[sec])
+        else:
+            doc_input = doc
+
+        sections_to_process = [
+            s for s in sorted(doc_input.sections, key=lambda x: x.section_seq)
+            if s.section_seq >= start_section_seq
+        ]
+
+        total_passages_upserted = 0
+        total_failed = 0
+        last_progress = None
+        completed_count = 0
+
+        for sec in sections_to_process:
+            tracker = UsageTracker(request_id=f"ingest-{doc_input.doc_id}-s{sec.section_seq}")
+            deg_tracker = DegradationTracker(fallbacks=self.profile.fallbacks)
+
+            # 1. Budget check before calls (RAG-ING-12, AC-RAG-65)
+            if self.budget_guard:
+                est_in_tokens = estimate_tokens(sec.text)
+                self.budget_guard.before_call(
+                    CallContext(
+                        stage="ingest_embedding",
+                        request_id=f"ingest-{doc_input.doc_id}",
+                        est_input_tokens=est_in_tokens,
+                        est_cost_usd=None,
+                        request_spent=tracker.total(),
+                    )
+                )
+
+            # 2. Summarize section (RAG-ING-3, RAG-ING-9, AC-RAG-08, AC-RAG-59)
+            sum_res = self.summarizer.summarize_section(
+                doc_id=doc_input.doc_id,
+                section_seq=sec.section_seq,
+                section_id=sec.section_id,
+                text=sec.text,
+                char_start=sec.char_start,
+                metadata=sec.metadata,
+                existing_summary=sec.existing_summary,
+                usage_tracker=tracker,
+                degradation_tracker=deg_tracker,
+            )
+
+            # 3. Split section text into passage nodes (RAG-ING-1, RAG-ING-2, AC-RAG-01)
+            chunks = self.splitter.split(sec.text, base_offset=sec.char_start)
+            nodes: list[RAGNode[MetaT]] = []
+            for p_idx, chunk in enumerate(chunks):
+                node_id = f"{doc_input.doc_id}#s{sec.section_seq}p{p_idx}"
+                n = RAGNode[MetaT](
+                    node_id=node_id,
+                    doc_id=doc_input.doc_id,
+                    section_id=sec.section_id,
+                    section_seq=sec.section_seq,
+                    granularity="passage",
+                    text=chunk.text,
+                    span=SourceSpan(
+                        doc_id=doc_input.doc_id,
+                        section_id=sec.section_id,
+                        section_seq=sec.section_seq,
+                        section_title=sec.title,
+                        char_start=sec.char_start + chunk.local_start,
+                        char_end=sec.char_start + chunk.local_end,
+                        breadcrumb=list(sec.breadcrumb) + chunk.breadcrumb,
+                    ),
+                    metadata=sec.metadata,
+                )
+                n.token_estimate = estimate_tokens(n.text)
+                if self.store.capabilities().uses_analyzer_tokens:
+                    n.search_tokens = self.analyzer.tokenize(n.text)
+                nodes.append(n)
+
+            # 4. Batch embed nodes (RAG-ING-4, AC-RAG-04)
+            valid_pairs = self.embedder.embed_nodes(nodes, tracker, deg_tracker)
+            failed_in_sec = len(nodes) - len(valid_pairs)
+            total_failed += failed_in_sec
+
+            valid_nodes = [p[0] for p in valid_pairs]
+            valid_embeddings = [p[1] for p in valid_pairs]
+
+            # 5. Populate fingerprints on nodes
+            dims = self.store.embedding_space().dims
+            splitter_ver = self.store.embedding_space().splitter_version or getattr(self.splitter, "version", "1.0.0")
+            emb_sig = f"{self.profile.models.embedding}|{dims}|RETRIEVAL_DOCUMENT|{splitter_ver}"
+            fts_sig = f"{self.analyzer.name}|{self.analyzer.version}" if self.store.capabilities().uses_analyzer_tokens else None
+
+            for n in valid_nodes:
+                content_hash = hashlib.sha256(self.analyzer.normalize(self.renderer.embed_text(n)).encode("utf-8")).hexdigest()
+                n.content_hash = content_hash
+
+            # Also embed summary node if generated
+            summary_node = sum_res.section_summary
+            if summary_node:
+                s_pairs = self.embedder.embed_nodes([summary_node], tracker, deg_tracker, stage="summary_embedding")
+                if s_pairs:
+                    summary_node.embedding = s_pairs[0][1]
+
+            # Also add unit summaries to nodes if present
+            for u_node in sum_res.unit_summaries:
+                u_pairs = self.embedder.embed_nodes([u_node], tracker, deg_tracker, stage="summary_embedding")
+                if u_pairs:
+                    u_node.embedding = u_pairs[0][1]
+                    valid_nodes.append(u_node)
+                    valid_embeddings.append(u_pairs[0][1])
+
+            # 6. Atomic upsert to store (RAG-ING-10, AC-RAG-66)
+            written = self.store.upsert_section_nodes(
+                doc_id=doc_input.doc_id,
+                section_seq=sec.section_seq,
+                nodes=valid_nodes,
+                embeddings=valid_embeddings,
+                summary=summary_node,
+            )
+            total_passages_upserted += written
+            completed_count += 1
+
+            last_progress = IngestionProgress(
+                doc_id=doc_input.doc_id,
+                section_seq=sec.section_seq,
+                sections_completed=completed_count,
+                sections_total=len(doc_input.sections),
+                passages_upserted=written,
+                passages_skipped_unchanged=0,
+                passages_failed=failed_in_sec,
+                summary_status=sum_res.summary_status,
+                usage=tracker.stage_usages,
+                degradations=deg_tracker.degradations,
+            )
+
+            if on_section_complete:
+                on_section_complete(last_progress)
+
+        return last_progress or IngestionProgress(
+            doc_id=doc_input.doc_id,
+            section_seq=0,
+            sections_completed=0,
+            sections_total=len(doc_input.sections),
+            passages_upserted=0,
+            summary_status="skipped",
         )
 
-        # Embed nodes
-        texts_to_embed = [n.text for n in nodes]
-        tracker = UsageTracker(request_id=f"ingest-{document_id}")
+    def sync_document(self, doc: RAGDocumentInput[MetaT]) -> IngestionProgress:
+        """Syncs document: embeds only changed nodes, deletes vanished ones, preserves node ids (§6.6, AC-RAG-06)."""
+        stored_fps = self.store.get_fingerprints(doc.doc_id)
+        all_section_nodes: list[RAGNode[MetaT]] = []
+        for sec in sorted(doc.sections, key=lambda s: s.section_seq):
+            chunks = self.splitter.split(sec.text, base_offset=sec.char_start)
+            for p_idx, chunk in enumerate(chunks):
+                n = RAGNode[MetaT](
+                    node_id=f"{doc.doc_id}#s{sec.section_seq}p{p_idx}",
+                    doc_id=doc.doc_id,
+                    section_id=sec.section_id,
+                    section_seq=sec.section_seq,
+                    granularity="passage",
+                    text=chunk.text,
+                    span=SourceSpan(
+                        doc_id=doc.doc_id,
+                        section_id=sec.section_id,
+                        section_seq=sec.section_seq,
+                        section_title=sec.title,
+                        char_start=sec.char_start + chunk.local_start,
+                        char_end=sec.char_start + chunk.local_end,
+                        breadcrumb=list(sec.breadcrumb) + chunk.breadcrumb,
+                    ),
+                    metadata=sec.metadata,
+                )
+                all_section_nodes.append(n)
+
+        current_node_ids = {n.node_id for n in all_section_nodes}
+
+        # Identify vanished nodes and delete them
+        vanished_ids = [nid for nid in stored_fps.keys() if nid not in current_node_ids]
+        if vanished_ids and self.store.capabilities().supports_delete:
+            self.store.delete_nodes(vanished_ids)
+
+        # Identify changed vs unchanged nodes
+        nodes_to_embed: list[RAGNode[MetaT]] = []
+        skipped_count = 0
+        dims = self.store.embedding_space().dims
+        splitter_ver = self.store.embedding_space().splitter_version or getattr(self.splitter, "version", "1.0.0")
+        emb_sig = f"{self.profile.models.embedding}|{dims}|RETRIEVAL_DOCUMENT|{splitter_ver}"
+
+        for n in all_section_nodes:
+            embed_text = self.renderer.embed_text(n)
+            chash = hashlib.sha256(self.analyzer.normalize(embed_text).encode("utf-8")).hexdigest()
+
+            if n.node_id in stored_fps:
+                st_fp = stored_fps[n.node_id]
+                if st_fp.content_hash == chash and st_fp.embedding_signature == emb_sig:
+                    skipped_count += 1
+                    continue
+            nodes_to_embed.append(n)
+
+        # Embed changed/new nodes
+        upserted_count = 0
+        tracker = UsageTracker(request_id=f"sync-{doc.doc_id}")
+        deg_tracker = DegradationTracker(fallbacks=self.profile.fallbacks)
+
+        if nodes_to_embed:
+            pairs = self.embedder.embed_nodes(nodes_to_embed, tracker, deg_tracker)
+            by_sec: dict[int, list[tuple[RAGNode[MetaT], list[float]]]] = {}
+            for node, vec in pairs:
+                by_sec.setdefault(node.span.section_seq, []).append((node, vec))
+
+            for s_seq, s_pairs in by_sec.items():
+                s_nodes = [p[0] for p in s_pairs]
+                s_vecs = [p[1] for p in s_pairs]
+                w = self.store.upsert_section_nodes(
+                    doc_id=doc.doc_id,
+                    section_seq=s_seq,
+                    nodes=s_nodes,
+                    embeddings=s_vecs,
+                )
+                upserted_count += w
+
+        return IngestionProgress(
+            doc_id=doc.doc_id,
+            section_seq=0,
+            sections_completed=len(doc.sections),
+            sections_total=len(doc.sections),
+            passages_upserted=upserted_count,
+            passages_skipped_unchanged=skipped_count,
+            passages_failed=0,
+            summary_status="skipped",
+            usage=tracker.stage_usages,
+        )
+
+    def prepare_nodes(
+        self,
+        nodes_or_doc_id: list[RAGNode[MetaT]] | str,
+        text: str | None = None,
+        metadata: MetaT | None = None,
+        section_id: str = "main",
+        chunk_size: int = 600,
+        chunk_overlap: int = 50,
+    ) -> list[PreparedNode[MetaT]] | list[RAGNode[MetaT]]:
+        """Compute embedding, fingerprint, token_estimate, search_tokens without store write (§6.4.1, RAG-ING-13, AC-RAG-71)."""
+        if isinstance(nodes_or_doc_id, str):
+            return self._legacy_prepare_nodes(nodes_or_doc_id, text or "", metadata, section_id, chunk_size, chunk_overlap)
+
+        nodes = nodes_or_doc_id
+        if not nodes:
+            return []
+
+        prepared: list[PreparedNode[MetaT]] = []
+        tracker = UsageTracker(request_id="prepare-nodes")
+        embed_texts = [self.renderer.embed_text(n) for n in nodes]
+
         emb_res = self.gateway.embed(
-            texts=texts_to_embed,
+            texts=embed_texts,
             model=self.profile.models.embedding,
-            stage="ingest_embedding",
+            stage="prepare_embedding",
             usage_tracker=tracker,
             task_type="RETRIEVAL_DOCUMENT",
         )
 
-        for i, vec in enumerate(emb_res.vectors):
-            nodes[i].embedding = vec
+        dims = self.store.embedding_space().dims
+        splitter_ver = self.store.embedding_space().splitter_version or getattr(self.splitter, "version", "1.0.0")
 
-        # Upsert into store atomically
-        self.store.upsert_section(
-            document_id=document_id,
-            section_id=section_id,
-            nodes=nodes,
-            metadata=metadata,
-        )
+        for idx, node in enumerate(nodes):
+            node_copy = node.model_copy()
+            node_copy.token_estimate = estimate_tokens(node_copy.text)
+            if self.store.capabilities().uses_analyzer_tokens:
+                node_copy.search_tokens = self.analyzer.tokenize(node_copy.text)
 
-        lat_ms = (self.clock.monotonic() - t0) * 1000.0
-        return IngestionProgress(
-            document_id=document_id,
-            section_id=section_id,
-            node_count=len(nodes),
-            token_count=emb_res.usage.input_tokens,
-            status="done",
-            total_time_ms=lat_ms,
-        )
+            embed_text = self.renderer.embed_text(node_copy)
+            content_hash = hashlib.sha256(self.analyzer.normalize(embed_text).encode("utf-8")).hexdigest()
+            node_copy.content_hash = content_hash
 
-    def prepare_nodes(
+            emb_sig = f"{self.profile.models.embedding}|{dims}|RETRIEVAL_DOCUMENT|{splitter_ver}"
+            fts_sig = f"{self.analyzer.name}|{self.analyzer.version}" if self.store.capabilities().uses_analyzer_tokens else None
+            fp = Fingerprint(
+                content_hash=content_hash,
+                embedding_signature=emb_sig,
+                fts_signature=fts_sig,
+            )
+
+            raw_vec = emb_res.vectors[idx] if idx < len(emb_res.vectors) else []
+            # Failed / zero vector rule (RAG-ING-4, AC-RAG-71): return [], never zero vector
+            if not raw_vec or all(v == 0.0 for v in raw_vec):
+                vec = []
+            else:
+                vec = raw_vec
+
+            stage_u = tracker.stage_usages[0] if tracker.stage_usages else None
+            prepared.append(
+                PreparedNode[MetaT](
+                    node=node_copy,
+                    vector=vec,
+                    fingerprint=fp,
+                    usage=stage_u,
+                )
+            )
+
+        return prepared
+
+    def _legacy_prepare_nodes(
         self,
         document_id: str,
         text: str,
@@ -597,11 +934,31 @@ class RAGEngine(Generic[MetaT]):
 
         return nodes
 
-    def needs_reindex(self, document_id: str) -> bool:
-        """Check whether stored embeddings match current embedder."""
-        stored_fp = self.store.fingerprint()
-        current_fp = self.profile.fingerprint()
-        return stored_fp.profile_fingerprint != current_fp
+    def needs_reindex(self, doc_id: str) -> ReindexStatus:
+        """Check whether stored embeddings or FTS tokens are stale (§6.6, AC-RAG-64)."""
+        stored_fps = self.store.get_fingerprints(doc_id)
+        if not stored_fps:
+            return ReindexStatus(doc_id=doc_id, embeddings_stale=False, fts_stale=False)
+
+        dims = self.store.embedding_space().dims
+        splitter_ver = self.store.embedding_space().splitter_version or getattr(self.splitter, "version", "1.0.0")
+        expected_emb_sig = f"{self.profile.models.embedding}|{dims}|RETRIEVAL_DOCUMENT|{splitter_ver}"
+        expected_fts_sig = f"{self.analyzer.name}|{self.analyzer.version}" if self.store.capabilities().uses_analyzer_tokens else None
+
+        emb_stale = False
+        fts_stale = False
+
+        for fp in stored_fps.values():
+            if fp.embedding_signature != expected_emb_sig:
+                emb_stale = True
+            if self.store.capabilities().uses_analyzer_tokens and fp.fts_signature != expected_fts_sig:
+                fts_stale = True
+
+        return ReindexStatus(
+            doc_id=doc_id,
+            embeddings_stale=emb_stale,
+            fts_stale=fts_stale,
+        )
 
     def _build_effective_filters(self, request: RAGQueryRequest) -> RAGFilterSpec:
         """Combine request-level filters, document_id, and tenant_id into RAGFilterSpec."""

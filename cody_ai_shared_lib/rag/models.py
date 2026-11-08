@@ -443,6 +443,35 @@ class RAGStreamEvent(BaseModel):
 
 # ── Ingestion & Reindex Status (§6) ───────────────────────────────────────────
 
+class RAGSectionInput(BaseModel, Generic[MetaT]):
+    """Input representation of a document section for ingestion (§6.6)."""
+    section_id: str | None = None
+    section_seq: int = 0
+    title: str | None = None
+    breadcrumb: list[str] = Field(default_factory=list)
+    text: str
+    char_start: int = 0
+    existing_summary: str | None = None
+    metadata: MetaT = Field(default_factory=dict)  # type: ignore
+
+
+class RAGDocumentInput(BaseModel, Generic[MetaT]):
+    """Input representation of a full document with ordered sections (§6.6)."""
+    doc_id: str
+    title: str | None = None
+    sections: list[RAGSectionInput[MetaT]]
+    total_char_length: int | None = None
+    revision: str | None = None
+
+
+class PreparedNode(BaseModel, Generic[MetaT]):
+    """Result of engine.prepare_nodes() for app-side insertion (§6.4.1, RAG-ING-13)."""
+    node: RAGNode[MetaT]
+    vector: list[float]
+    fingerprint: Any
+    usage: StageUsage | None = None
+
+
 class IngestionProgress(BaseModel):
     """Progress snapshot emitted after completing an ingestion section."""
     doc_id: str

@@ -66,11 +66,19 @@ class CitationConfig(BaseModel):
     policy: str = "filter"
 
 
+class SummariesConfig(BaseModel):
+    model_config = {"frozen": True}
+    enabled: bool = True
+    min_chars_for_summary: int = 1500
+    summary_unit_chars: int = 8000
+
+
 class IngestionConfig(BaseModel):
     model_config = {"frozen": True}
     splitter: str = "sentence"
     target_size: int = 1200
     overlap: int = 150
+    summaries: SummariesConfig = Field(default_factory=SummariesConfig)
 
 
 class RuntimeConfig(BaseModel):
@@ -203,6 +211,10 @@ def news_intelligence(models: ModelBindings, **overrides: Any) -> EngineProfile:
         "post_stages": ["identity_dedup", "recency", "top_k"],
         "context": ContextConfig(max_context_tokens=32_000),
         "generation": GenerationConfig(grounding_mode="labelled_fallback"),
+        "ingestion": IngestionConfig(
+            splitter="pass_through",
+            summaries=SummariesConfig(enabled=False),
+        ),
     }
     cfg.update(overrides)
     return EngineProfile(**cfg)
