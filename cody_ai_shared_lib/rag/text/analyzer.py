@@ -226,7 +226,7 @@ class CjkAwareAnalyzer:
 class TokenGroup(BaseModel):
     """Group of tokens for full-text search query construction."""
     tokens: list[str]
-    mode: Literal["any", "all", "phrase"]
+    mode: Literal["any", "phrase"]
     origin: Literal["free_text", "exact_term", "entity"] = "free_text"
 
 
@@ -235,13 +235,13 @@ def tokenize_query_groups(
     query: str,
     exact_terms: Sequence[str] | None = None,
     entity_terms: Sequence[str] | None = None,
-    entity_mode: Literal["boost", "require", "ignore"] = "boost",
+    entity_mode: Literal["require", "ignore"] = "ignore",
 ) -> list[TokenGroup]:
     """Tokenize a query and its exact/entity terms into TokenGroups per §6.1.
 
     - Free-text query tokens become a 'free_text' group with mode='any'.
     - Each exact_term becomes an 'exact_term' group with mode='phrase'.
-    - Each entity_term becomes an 'entity' group: mode='phrase' when required, 'all' when boosted.
+    - With entity_mode='require', each entity_term becomes an 'entity' group with mode='phrase'.
     """
     groups: list[TokenGroup] = []
     if query:
@@ -252,13 +252,11 @@ def tokenize_query_groups(
         toks = analyzer.tokenize(analyzer.normalize(term))
         if toks:
             groups.append(TokenGroup(tokens=toks, mode="phrase", origin="exact_term"))
-    if entity_mode == "ignore":
-        return groups
-    entity_group_mode: Literal["phrase", "all"] = "phrase" if entity_mode == "require" else "all"
-    for ent in entity_terms or []:
-        toks = analyzer.tokenize(analyzer.normalize(ent))
-        if toks:
-            groups.append(TokenGroup(tokens=toks, mode=entity_group_mode, origin="entity"))
+    if entity_mode == "require":
+        for ent in entity_terms or []:
+            toks = analyzer.tokenize(analyzer.normalize(ent))
+            if toks:
+                groups.append(TokenGroup(tokens=toks, mode="phrase", origin="entity"))
     return groups
 
 
@@ -266,7 +264,7 @@ def build_tsquery(groups: list[TokenGroup]) -> str:
     """Build PostgreSQL websearch/tsquery-safe string from token groups.
 
     Guarantees no unescaped tsquery operators or quotes from token text.
-    'phrase' groups use '<->' adjacency; 'all' groups use '&'; 'any' groups use '|'.
+    'phrase' groups use '<->' adjacency; 'any' groups use '|'; groups are joined with '&'.
     """
     clean_parts: list[str] = []
     # Strip any dangerous tsquery characters from tokens: only keep letters, digits, and CJK
@@ -282,11 +280,6 @@ def build_tsquery(groups: list[TokenGroup]) -> str:
                 clean_parts.append(sanitized[0])
             else:
                 clean_parts.append(f"({' <-> '.join(sanitized)})")
-        elif g.mode == "all":
-            if len(sanitized) == 1:
-                clean_parts.append(sanitized[0])
-            else:
-                clean_parts.append(f"({' & '.join(sanitized)})")
         else:  # any
             if len(sanitized) == 1:
                 clean_parts.append(sanitized[0])

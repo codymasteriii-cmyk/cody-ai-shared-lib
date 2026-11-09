@@ -187,7 +187,7 @@ def test_tier0_under_gate_reaches_the_prompt_whole_and_in_the_stable_block():
 
     prompt = ContextAssembler(prof, DefaultRenderer()).assemble_prompt(question(), nodes)
 
-    assert all(f'id="s{i}"' in prompt.user_message for i in range(10))
+    assert prompt.user_message.count("<node ref=") == 10
     assert len(prompt.cache_breakpoints) == 2
 
 

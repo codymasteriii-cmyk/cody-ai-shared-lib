@@ -55,7 +55,8 @@ class HeuristicRouter:
                 )
 
         # 2. Extract exact terms from quotes
-        quotes = re.findall(r'["“](.+?)["”]|[\'‘](.+?)[\'’]', text)
+        # A single quote inside a word ("Bob's") is an apostrophe, not the start of a quotation
+        quotes = re.findall(r'["“](.+?)["”]|(?<!\w)[\'‘](.+?)[\'’](?!\w)', text)
         exact_terms: list[str] = []
         for q1, q2 in quotes:
             term = (q1 or q2).strip()

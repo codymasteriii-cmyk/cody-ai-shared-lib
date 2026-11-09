@@ -6,7 +6,7 @@ from typing import Any, Generic
 from ..degradation import DegradationTracker
 from ..errors import StoreCapabilityError
 from ..models import IngestionProgress, MetaT, RAGDocumentInput, RAGNode
-from ..ports import Fingerprint, RAGStore
+from ..ports import Fingerprint, RAGStore, call_store
 from ..render import NodeRenderer
 from ..text.analyzer import TextAnalyzer
 from ..usage import BudgetGuard, UsageTracker
@@ -66,7 +66,7 @@ class DocumentSynchronizer(Generic[MetaT]):
                 stage="sync",
             )
 
-        stored = self.store.get_fingerprints(doc.doc_id)
+        stored = call_store("get_fingerprints", lambda: self.store.get_fingerprints(doc.doc_id))
         signature = embedding_signature(self.embedding_model, self.store.embedding_space(), self.splitter)
         sections = sorted(doc.sections, key=lambda s: s.section_seq)
 
@@ -81,7 +81,7 @@ class DocumentSynchronizer(Generic[MetaT]):
 
         changed_sections = self._sections_with_changed_text(doc.doc_id, stored, section_nodes, current_ids)
 
-        upserted = skipped = failed = 0
+        upserted = skipped = 0
         summary_status = "skipped"
         regenerated_ids: set[str] = set()
 
@@ -97,7 +97,6 @@ class DocumentSynchronizer(Generic[MetaT]):
                 if to_embed
                 else []
             )
-            failed += len(to_embed) - len(pairs)
             nodes = [p[0] for p in pairs]
             vectors = [p[1] for p in pairs]
 
@@ -135,12 +134,15 @@ class DocumentSynchronizer(Generic[MetaT]):
                     regenerated_ids.add(section_summary.node_id)
 
             if nodes or section_summary is not None:
-                upserted += self.store.upsert_section_nodes(
-                    doc_id=doc.doc_id,
-                    section_seq=seq,
-                    nodes=nodes,
-                    embeddings=vectors,
-                    summary=section_summary,
+                upserted += call_store(
+                    "upsert_section_nodes",
+                    lambda: self.store.upsert_section_nodes(
+                        doc_id=doc.doc_id,
+                        section_seq=seq,
+                        nodes=nodes,
+                        embeddings=vectors,
+                        summary=section_summary,
+                    ),
                 )
 
         # Delete last: a failed sync leaves the old rows readable, and a re-run converges.
@@ -153,7 +155,7 @@ class DocumentSynchronizer(Generic[MetaT]):
             and not self._is_kept_summary(doc.doc_id, node_id, section_seqs, changed_sections)
         ]
         if to_delete:
-            self.store.delete_nodes(to_delete)
+            call_store("delete_nodes", lambda: self.store.delete_nodes(to_delete))
 
         return IngestionProgress(
             doc_id=doc.doc_id,
@@ -162,7 +164,6 @@ class DocumentSynchronizer(Generic[MetaT]):
             sections_total=len(doc.sections),
             passages_upserted=upserted,
             passages_skipped_unchanged=skipped,
-            passages_failed=failed,
             summary_status=summary_status,  # type: ignore[arg-type]
             usage=usage_tracker.stage_usages,
             degradations=degradation_tracker.degradations,

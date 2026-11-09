@@ -69,6 +69,7 @@ class UsageTracker:
         doc_ids: list[str] | None = None,
         profile_name: str = "",
         variant: str | None = None,
+        scope: dict[str, Any] | None = None,
         on_record: Callable[[StageUsage], None] | None = None,
     ):
         self.request_id = request_id
@@ -76,6 +77,7 @@ class UsageTracker:
         self.doc_ids = doc_ids
         self.profile_name = profile_name
         self.variant = variant
+        self.scope = dict(scope or {})
         self.on_record = on_record
         self._records: list[StageUsage] = []
         self._lock = threading.Lock()
@@ -105,6 +107,7 @@ class UsageTracker:
             est_cost_usd=est_cost_usd,
             request_spent=self.total(),
             tenant_or_user_id=self.tenant_or_user_id,
+            scope=dict(self.scope),
             doc_ids=self.doc_ids,
             profile_name=self.profile_name,
             variant=self.variant,
@@ -121,7 +124,7 @@ class UsageTracker:
         in_tok = sum(u.input_tokens for u in records)
         out_tok = sum(u.output_tokens for u in records)
         cached_tok = sum(u.cached_tokens for u in records)
-        calls = sum(u.calls or 1 for u in records)
+        calls = sum(u.calls for u in records)
         lat = sum(u.latency_ms for u in records)
 
         cost_sum = 0.0

@@ -13,7 +13,7 @@ from .shared import query_text, query_token_groups
 def _keyword_hits(ctx: RetrievalContext[MetaT]) -> list[RAGNode[MetaT]]:
     return ctx.store.keyword_search(
         query_text(ctx),
-        top_k=ctx.target_limit() + 1,
+        top_k=ctx.candidate_limit(),
         filters=ctx.filters,
         analyzer_tokens=query_token_groups(ctx),
     )

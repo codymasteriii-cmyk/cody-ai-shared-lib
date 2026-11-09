@@ -66,7 +66,7 @@ def compute_coverage(
     )
 
 
-class QuoteVerifier(Generic[MetaT]):
+class QuoteValidator(Generic[MetaT]):
     """Checks that every quoted string next to a citation is really in the cited node (§11.3)."""
 
     def __init__(

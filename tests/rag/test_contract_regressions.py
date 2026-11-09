@@ -30,7 +30,7 @@ from cody_ai_shared_lib.rag.models import (
 )
 from cody_ai_shared_lib.rag.ports import StoreCapabilities
 from cody_ai_shared_lib.rag.postgen.citations import CitationExtractor, OffsetCitationFormatter
-from cody_ai_shared_lib.rag.postgen.quotes import QuoteVerifier, compute_coverage
+from cody_ai_shared_lib.rag.postgen.quotes import QuoteValidator, compute_coverage
 from cody_ai_shared_lib.rag.postgen.sanitizer import OutputSanitizer
 from cody_ai_shared_lib.rag.postretrieval.threshold import ThresholdFilter
 from cody_ai_shared_lib.rag.profile import (
@@ -696,7 +696,7 @@ def test_scrambled_quote_fails_and_near_exact_quote_passes():
 
     def check(quote: str) -> bool:
         citation = CitationExtractor().extract(f'He said "{quote}" [1].', [RAGNode(node_id="n", text=source)])
-        verified, _ = QuoteVerifier().verify(citation[1], [RAGNode(node_id="n", text=source)], citation[0])
+        verified, _ = QuoteValidator().verify(citation[1], [RAGNode(node_id="n", text=source)], citation[0])
         return verified[0].verified
 
     assert check(scrambled) is False
@@ -725,7 +725,7 @@ def test_reranker_override_disables_the_stage():
     assert engine(prof, gateway=gateway).retrieve(question(enable_reranker_override=False)).degradations == []
 
 
-# ── Items 29, 30: reference store, hydration, retry size
+# ── Items 29, 30: reference store, retry size
 
 
 def overlapping_store() -> InMemoryRAGStore:
@@ -758,19 +758,6 @@ def test_bm25_prefers_the_rarer_term_and_groups_filter():
     assert store.keyword_search("apple zebra", RAGFilterSpec(), 5)[0].node_id == "rare"
     phrase = [TokenGroup(tokens=["zebra", "banana"], mode="phrase")]
     assert [n.node_id for n in store.keyword_search("x", RAGFilterSpec(), 5, analyzer_tokens=phrase)] == ["rare"]
-
-
-def test_hydration_only_touches_nodes_that_survive_sizing(monkeypatch: pytest.MonkeyPatch):
-    store = InMemoryRAGStore()
-    nodes = [RAGNode(node_id=f"n{i}", text="text", span=SourceSpan(doc_id="d", char_end=4)) for i in range(5)]
-    store.upsert_section_nodes("d", 0, nodes, [[0.1] * DIM] * 5)
-    hydrated: list[list[str]] = []
-    original = store.hydrate
-    monkeypatch.setattr(store, "hydrate", lambda ids, projection: (hydrated.append(list(ids)), original(ids, projection))[1])
-
-    engine(profile(retrieval=RetrievalConfig(top_k=2)), store).query(question())
-
-    assert [len(ids) for ids in hydrated] == [2]
 
 
 def test_truncation_retry_asks_for_more_than_was_produced():
@@ -822,7 +809,7 @@ def test_oversized_state_prunes_node_refs_before_the_summary():
 
 
 def test_fuse_variants_keeps_every_variant_and_ranks_by_fused_score():
-    from cody_ai_shared_lib.rag.strategies.transforms import fuse_variants
+    from cody_ai_shared_lib.rag.transforms import fuse_variants
 
     def nodes(*ids: str) -> list[RAGNode]:
         return [RAGNode(node_id=i, text="x") for i in ids]

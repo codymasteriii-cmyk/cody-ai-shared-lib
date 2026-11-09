@@ -1,14 +1,7 @@
-"""BatchEmbedder for embedding RAG nodes and text through ModelGateway (§6.4).
-
-Implements:
-  - Batching and token usage tracking via ModelGateway.embed
-  - RAG-ING-4: Zero-vector guard (skips failed nodes with ERROR log and DG-08;
-    raises EmbeddingProviderError if all nodes in a non-empty set fail).
-"""
+"""BatchEmbedder: embeds nodes through ModelGateway with a zero-vector guard (§6.4, RAG-ING-4)."""
 from __future__ import annotations
 
-import logging
-from typing import Generic, TypeVar
+from typing import Generic
 
 from ..degradation import DegradationTracker
 from ..errors import EmbeddingProviderError
@@ -18,13 +11,9 @@ from ..render import DefaultRenderer, NodeRenderer
 from ..usage import BudgetGuard, UsageTracker
 from ..vectors import is_zero_vector
 
-logger = logging.getLogger("shared-rag")
-
-T = TypeVar("T")
-
 
 class BatchEmbedder(Generic[MetaT]):
-    """Embeds nodes or raw texts with batching, usage tracking, and zero-vector safety."""
+    """Embeds nodes in batches. A zero or missing vector is a failure and is never returned."""
 
     def __init__(
         self,
@@ -40,6 +29,39 @@ class BatchEmbedder(Generic[MetaT]):
         self.renderer = renderer or DefaultRenderer()
         self.task_type = task_type
 
+    def embed_each(
+        self,
+        nodes: list[RAGNode[MetaT]],
+        usage_tracker: UsageTracker,
+        degradation_tracker: DegradationTracker | None = None,
+        stage: str = "ingest_embedding",
+        budget_guard: BudgetGuard | None = None,
+    ) -> tuple[list[tuple[RAGNode[MetaT], list[float]]], list[RAGNode[MetaT]]]:
+        """Return (embedded pairs, failed nodes), judging every node on its own (§6.4.1)."""
+        vectors: list[list[float]] = []
+        texts = [self.renderer.embed_text(node) for node in nodes]
+        for start in range(0, len(texts), self.batch_size):
+            result = self.gateway.embed(
+                texts=texts[start : start + self.batch_size],
+                model=self.model,
+                stage=stage,
+                usage_tracker=usage_tracker,
+                degradation_tracker=degradation_tracker,
+                budget_guard=budget_guard,
+                task_type=self.task_type,
+            )
+            vectors.extend(result.vectors)
+
+        embedded: list[tuple[RAGNode[MetaT], list[float]]] = []
+        failed: list[RAGNode[MetaT]] = []
+        for index, node in enumerate(nodes):
+            vector = vectors[index] if index < len(vectors) else []
+            if is_zero_vector(vector):
+                failed.append(node)
+            else:
+                embedded.append((node, vector))
+        return embedded, failed
+
     def embed_nodes(
         self,
         nodes: list[RAGNode[MetaT]],
@@ -48,57 +70,12 @@ class BatchEmbedder(Generic[MetaT]):
         stage: str = "ingest_embedding",
         budget_guard: BudgetGuard | None = None,
     ) -> list[tuple[RAGNode[MetaT], list[float]]]:
-        """Embed nodes and return valid (node, vector) pairs.
-
-        Guarantees that zero vectors are never returned (RAG-ING-4).
-        If every node in a non-empty set has a zero vector, raises EmbeddingProviderError.
-        If some nodes are zero, skips them, records DG-08, and logs ERROR.
-        """
-        if not nodes:
-            return []
-
-        embed_texts = [self.renderer.embed_text(n) for n in nodes]
-        all_vectors: list[list[float]] = []
-
-        for i in range(0, len(embed_texts), self.batch_size):
-            batch = embed_texts[i : i + self.batch_size]
-            emb_res = self.gateway.embed(
-                texts=batch,
-                model=self.model,
-                stage=stage,
-                usage_tracker=usage_tracker,
-                degradation_tracker=degradation_tracker,
-                budget_guard=budget_guard,
-                task_type=self.task_type,
-            )
-            all_vectors.extend(emb_res.vectors)
-
-        zero_indices: list[int] = []
-        valid_pairs: list[tuple[RAGNode[MetaT], list[float]]] = []
-
-        for idx, (node, vec) in enumerate(zip(nodes, all_vectors)):
-            if is_zero_vector(vec):
-                zero_indices.append(idx)
-            else:
-                valid_pairs.append((node, vec))
-
-        if len(zero_indices) == len(nodes):
+        """Embed one unit all-or-nothing: any failure raises before anything is written (RAG-ING-4)."""
+        embedded, failed = self.embed_each(nodes, usage_tracker, degradation_tracker, stage, budget_guard)
+        if failed:
             raise EmbeddingProviderError(
-                f"All {len(nodes)} embedding vectors were zero from model '{self.model}'",
+                f"{len(failed)} of {len(nodes)} nodes failed to embed with model '{self.model}'",
+                failed_node_ids=[node.node_id for node in failed],
                 stage=stage,
             )
-
-        if zero_indices:
-            logger.error(
-                f"[BatchEmbedder] {len(zero_indices)} of {len(nodes)} nodes had zero vectors and were skipped [DG-08]."
-            )
-            if degradation_tracker is not None:
-                degradation_tracker.record(
-                    dg_id="DG-08",
-                    stage=stage,
-                    reason=f"{len(zero_indices)} nodes returned zero vectors from embedder",
-                    fallback_used="skipped_zero_vectors",
-                    impact=f"Skipped {len(zero_indices)} unindexed nodes; continuing ingestion",
-                )
-
-        return valid_pairs
+        return embedded

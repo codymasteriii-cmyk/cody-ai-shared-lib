@@ -196,8 +196,8 @@ class RAGStoreContractTests:
             assert res[0].keyword_score is not None
         assert res[0].score_kind == "rrf"
 
-    # ── Check 9: Hydrate and fetch_nodes honour filters ────────────────────────
-    def test_check_9_hydrate_and_fetch_nodes_honour_filters(self):
+    # ── Check 9: fetch_nodes honours filters ───────────────────────────────────
+    def test_check_9_fetch_nodes_honours_filters(self):
         store = self.make_store()
         n = RAGNode(node_id="fn_1", text="fetch content", span=SourceSpan(doc_id="fn_doc"), metadata=DefaultNodeMeta(extra={"active": True}))
         store.upsert_section_nodes("fn_doc", 0, [n], [[0.1] * 768])
@@ -209,10 +209,6 @@ class RAGStoreContractTests:
         # Omitted when filter does not match
         res_empty = store.fetch_nodes(["fn_1"], RAGFilterSpec(doc_ids=["other_doc"]))
         assert len(res_empty) == 0
-
-        # Hydrate
-        meta_map = store.hydrate(["fn_1"], projection="context")
-        assert "fn_1" in meta_map
 
     # ── Check 10: CJK keyword search finds exact name ──────────────────────────
     def test_check_10_cjk_keyword_search(self):

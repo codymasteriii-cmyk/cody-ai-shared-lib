@@ -30,10 +30,9 @@ class ThresholdFilter(Generic[MetaT]):
         return self.filter(nodes)
 
     def filter(self, nodes: list[RAGNode[MetaT]]) -> list[RAGNode[MetaT]]:
-        """Keep only nodes with score is None (unscored) or score >= min_similarity.
+        """Keep ordered nodes, nodes without the declared signal, and nodes meeting the minimum (§9.1).
 
-        A threshold of kind="cosine" reads vector_score, never the fused score.
-        A node with no value for the declared signal passes (§9.1, AC-RAG-31).
+        A threshold of kind="cosine" reads vector_score, never the fused score (AC-RAG-31).
         """
         passed: list[RAGNode[MetaT]] = []
         for n in nodes:

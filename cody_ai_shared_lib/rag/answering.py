@@ -17,9 +17,9 @@ from .models import (
     RAGResponse,
     RAGRetrievalResult,
 )
-from .ports import Guard, RAGStore
+from .ports import Guard, RAGStore, call_store
 from .postgen.citations import CitationExtractor
-from .postgen.quotes import QuoteVerifier, compute_coverage
+from .postgen.quotes import QuoteValidator, compute_coverage
 from .postgen.sanitizer import OutputSanitizer
 from .profile import EngineProfile
 from .runtime import RequestRun
@@ -37,7 +37,7 @@ class AnswerFinalizer(Generic[MetaT]):
         store: RAGStore[MetaT],
         analyzer: TextAnalyzer,
         citation_extractor: CitationExtractor[MetaT],
-        quote_verifier: QuoteVerifier[MetaT],
+        quote_validator: QuoteValidator[MetaT],
         sanitizer: OutputSanitizer,
         conversation_manager: ConversationManager,
     ):
@@ -45,7 +45,7 @@ class AnswerFinalizer(Generic[MetaT]):
         self.store = store
         self.analyzer = analyzer
         self.citation_extractor = citation_extractor
-        self.quote_verifier = quote_verifier
+        self.quote_validator = quote_validator
         self.sanitizer = sanitizer
         self.conversation_manager = conversation_manager
 
@@ -71,14 +71,15 @@ class AnswerFinalizer(Generic[MetaT]):
             turn_map=prompt.turn_map,
         )
         if self.profile.citations.verify_quotes:
-            citations, coverage = self.quote_verifier.verify(citations, nodes, answer_text=clean_text)
+            citations, coverage = self.quote_validator.verify(citations, nodes, answer_text=clean_text)
         else:
             coverage = compute_coverage(citations, clean_text, self.analyzer)
         final_answer = self.sanitizer.sanitize(clean_text, nodes=nodes, fence_id=prompt.fence_id)
 
-        # RAG-RES-4: with nothing retrieved the answer is "no" and carries no citations.
+        # RAG-RES-4: a search that found nothing is "no"; on the no-retrieval route nothing was searched.
+        no_retrieval = retrieval.intent is not None and retrieval.intent.route == "no_retrieval"
         no_data = not retrieval.nodes
-        answer_found = "no" if no_data else flag
+        answer_found = None if no_retrieval else ("no" if no_data else flag)
         if no_data:
             citations = []
         sources = self._deduplicated_sources(citations)
@@ -127,7 +128,7 @@ class AnswerFinalizer(Generic[MetaT]):
         if not self.store.capabilities().supports_revisions:
             return None
         ids = [n.node_id for n in nodes if n.revision is not None]
-        return self.store.current_revisions(ids) if ids else None
+        return call_store("current_revisions", lambda: self.store.current_revisions(ids)) if ids else None
 
     def _is_grounded(self, prompt: AssembledPrompt[MetaT], answer: str) -> bool:
         """False only when a labelled-fallback answer used the general-knowledge label (§10.5)."""

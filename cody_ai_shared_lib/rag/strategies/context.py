@@ -1,4 +1,4 @@
-"""RetrievalContext, QueryVariant, and RetrievalStrategy protocol (§8.1, §7.8, AC-RAG-19)."""
+"""RetrievalContext and the RetrievalStrategy contract (§8.1)."""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -9,15 +9,8 @@ from ..degradation import DegradationTracker
 from ..models import MetaT, QueryIntent, RAGFilterSpec, RAGNode, RAGQueryRequest
 from ..profile import EngineProfile
 from ..runtime import Deadline
+from ..transforms.base import QueryVariant
 from ..usage import UsageTracker
-
-
-class QueryVariant(BaseModel):
-    """Query variant produced by transforms or fan-out (§7.8)."""
-    text: str
-    weight: float = 1.0
-    origin: str = "primary"  # "primary" | "secondary" | "lexicon" | "hyde" | app name
-    embed_as: Literal["query", "document"] = "query"
 
 
 class RetrievalContext(BaseModel, Generic[MetaT]):
@@ -44,6 +37,7 @@ class RetrievalContext(BaseModel, Generic[MetaT]):
     last_tier_reason: str = ""
     last_rule: int = 0
     registry: Any = None
+    rerank_active: bool = False
     reranked: bool = False
     truncated: bool = False
     scope_revision: str | None = None
@@ -61,6 +55,15 @@ class RetrievalContext(BaseModel, Generic[MetaT]):
             or self.intent.suggested_top_k
             or self.profile.retrieval.top_k
         )
+
+
+    def candidate_limit(self) -> int:
+        """How many ranked candidates to fetch: one extra to detect truncation, or a reranker's pool (§9.3)."""
+        floor = self.target_limit() + 1
+        if not self.rerank_active:
+            return floor
+        pool = self.profile.retrieval.rerank_candidates or self.target_limit() * 3
+        return max(floor, min(pool, max(floor, self.store.capabilities().max_top_k)))
 
 
 class RetrievalStrategy(ABC, Generic[MetaT]):

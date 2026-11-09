@@ -1,4 +1,4 @@
-"""Tier 3 HierarchicalStrategy (§8.6, AC-RAG-22, §5.2).
+"""Tier 3 HierarchicalSummaryStrategy (§8.6, AC-RAG-22, §5.2).
 
 Combines parent summaries, local window text and detail passages. Under a sequential guard, the
 store excludes the summary of the section containing the boundary; its unit summaries and local
@@ -16,7 +16,7 @@ from .hybrid_rrf import HybridRRFStrategy
 from .shared import fetch_window
 
 
-class HierarchicalStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
+class HierarchicalSummaryStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
     name: ClassVar[str] = "hierarchical"
     version: ClassVar[str] = "1.0.0"
     requires: ClassVar[frozenset[str]] = frozenset(["supports_parent_summaries"])
@@ -24,7 +24,7 @@ class HierarchicalStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
     def retrieve(self, ctx: RetrievalContext[MetaT]) -> list[RAGNode[MetaT]]:
         caps = ctx.store.capabilities()
         if not self.is_runnable(caps):
-            raise StoreCapabilityError("HierarchicalStrategy requires store capability 'supports_parent_summaries'")
+            raise StoreCapabilityError("HierarchicalSummaryStrategy requires store capability 'supports_parent_summaries'")
 
         summaries = ctx.store.fetch_parent_summaries(ctx.filters)
         cursor = ctx.request.cursor_offset if ctx.request.cursor_offset is not None else ctx.filters.max_char_offset

@@ -30,9 +30,7 @@ from .usage import BudgetGuard, UsageTracker, invoke_budget_guard
 
 logger = logging.getLogger("shared-rag.generation")
 
-_OPTIONAL_STAGES = frozenset(
-    {"summary", "summarizer", "summarizer_unit", "rolling_summary", "rerank", "jev", "secondary_query", "hyde"}
-)
+_OPTIONAL_STAGES = frozenset({"summarizer", "summarizer_unit"})
 
 # finish_reason of the empty result returned when a BudgetGuard skips an optional stage
 FINISH_SKIPPED = "skipped"
@@ -70,8 +68,6 @@ class ModelGateway:
         temperature: float | None = None,
         response_schema: type | None = None,
         response_mime_type: str | None = None,
-        request_id: str = "",
-        tenant_or_user_id: str | None = None,
         optional: bool | None = None,
         cache_breakpoints: bool | list[int] | None = None,
     ) -> LLMResult:
@@ -196,6 +192,12 @@ class ModelGateway:
                             price_table_version=retry_res.usage.price_table_version,
                         )
                     )
+                    if retry_res.finish_reason == "safety":
+                        raise GenerationError(
+                            f"Generation blocked by safety filters on model '{model}'",
+                            reason="blocked",
+                            stage=stage,
+                        )
                     if retry_res.finish_reason != "length":
                         return retry_res
                     raise GenerationError(
@@ -274,8 +276,6 @@ class ModelGateway:
         use_cache: bool = True,
         cache: Cache | None = None,
         fallbacks: dict[str, str] | None = None,
-        request_id: str = "",
-        tenant_or_user_id: str | None = None,
         optional: bool = False,
         cache_ttl_seconds: int | None = None,
     ) -> EmbeddingResult:
@@ -432,11 +432,18 @@ class ModelGateway:
         top_n: int | None = None,
         budget_guard: BudgetGuard | None = None,
         fallbacks: dict[str, str] | None = None,
-        request_id: str = "",
-        tenant_or_user_id: str | None = None,
     ) -> RerankResult | None:
         """Call reranker with DG-06 degradation on error or timeout (unless fallbacks['rerank'] == 'raise')."""
         if not self.rerank_client:
+            if (fallbacks or {}).get("rerank") == "raise":
+                raise RAGStageError(stage=stage, message="Reranker is not configured")
+            degradation_tracker.record(
+                dg_id="DG-06",
+                stage=stage,
+                reason="Reranker is not configured",
+                fallback_used="keep_incoming_order",
+                impact="Results were not reranked; kept original order",
+            )
             return None
 
         if budget_guard is not None:
@@ -507,8 +514,6 @@ class ModelGateway:
         max_tokens: int | None = None,
         temperature: float | None = None,
         cache_breakpoints: list[int] | None = None,
-        request_id: str = "",
-        tenant_or_user_id: str | None = None,
         optional: bool | None = None,
     ) -> Any:
         """Stream generation through ordered model fallback list (§10.8, AC-RAG-44, AC-RAG-70)."""

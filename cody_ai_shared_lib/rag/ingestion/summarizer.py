@@ -10,23 +10,24 @@ Implements:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import Generic, Literal
-from pydantic import BaseModel
 
 from ..degradation import DegradationTracker
-from ..errors import RAGStageError
+from ..errors import BudgetExceeded, RAGStageError
 from ..gateway import FINISH_SKIPPED, ModelGateway
-from ..models import DefaultNodeMeta, MetaT, RAGNode, SourceSpan
+from ..models import MetaT, RAGNode, SourceSpan, node_class_for
 from ..text.analyzer import CjkAwareAnalyzer, TextAnalyzer
 from ..usage import BudgetGuard, UsageTracker
 
 logger = logging.getLogger("shared-rag")
 
 
-class SummarizerResult(BaseModel, Generic[MetaT]):
+@dataclass
+class SummarizerResult(Generic[MetaT]):
     """Result of section summarization."""
     section_summary: RAGNode[MetaT] | None = None
-    unit_summaries: list[RAGNode[MetaT]] = []
+    unit_summaries: list[RAGNode[MetaT]] = field(default_factory=list)
     summary_status: Literal["generated", "provided", "skipped", "failed"] = "skipped"
 
 
@@ -68,7 +69,7 @@ class SectionSummarizer(Generic[MetaT]):
         """Summarize a section, generating section summary and summary units."""
         # 1. Check existing summary (usable even if LLM summarizer is disabled)
         if existing_summary:
-            sec_node = RAGNode[MetaT](
+            sec_node = node_class_for(metadata)(
                 node_id=f"{doc_id}#s{section_seq}_sum",
                 is_summary=True,
                 granularity="parent_summary",
@@ -83,7 +84,7 @@ class SectionSummarizer(Generic[MetaT]):
                     char_start=char_start,
                     char_end=char_start + len(text),
                 ),
-                metadata=metadata if isinstance(metadata, BaseModel) else DefaultNodeMeta(),
+                metadata=metadata,
             )
             return SummarizerResult(
                 section_summary=sec_node,
@@ -119,7 +120,7 @@ class SectionSummarizer(Generic[MetaT]):
             )
             if res.finish_reason == FINISH_SKIPPED:
                 return SummarizerResult(summary_status="skipped")
-            section_summary_node = RAGNode[MetaT](
+            section_summary_node = node_class_for(metadata)(
                 node_id=f"{doc_id}#s{section_seq}_sum",
                 is_summary=True,
                 granularity="parent_summary",
@@ -134,9 +135,11 @@ class SectionSummarizer(Generic[MetaT]):
                     char_start=char_start,
                     char_end=char_start + len(text),
                 ),
-                metadata=metadata if isinstance(metadata, BaseModel) else DefaultNodeMeta(),
+                metadata=metadata,
             )
             status = "generated"
+        except BudgetExceeded:
+            raise
         except Exception as exc:
             if self.fallback_action == "skip":
                 logger.error(f"[Summarizer] Failed to summarize section {section_seq}: {exc} [DG-14]", exc_info=True)
@@ -173,7 +176,7 @@ class SectionSummarizer(Generic[MetaT]):
                     )
                     if u_res.finish_reason == FINISH_SKIPPED:
                         continue
-                    unit_node = RAGNode[MetaT](
+                    unit_node = node_class_for(metadata)(
                         node_id=f"{doc_id}#s{section_seq}_u{u_idx}_sum",
                         is_summary=True,
                         granularity="parent_summary",
@@ -188,9 +191,11 @@ class SectionSummarizer(Generic[MetaT]):
                             char_start=char_start + u_start,
                             char_end=char_start + u_end,
                         ),
-                        metadata=metadata if isinstance(metadata, BaseModel) else DefaultNodeMeta(),
+                        metadata=metadata,
                     )
                     unit_summaries.append(unit_node)
+                except BudgetExceeded:
+                    raise
                 except Exception as exc:
                     if self.fallback_action == "skip":
                         logger.error(f"[Summarizer] Unit {u_idx} failed: {exc}", exc_info=True)

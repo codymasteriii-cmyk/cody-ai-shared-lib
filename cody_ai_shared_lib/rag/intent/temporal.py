@@ -17,7 +17,7 @@ from typing import Any
 from ..runtime import Clock, SystemClock
 
 
-class TemporalExtractor:
+class TemporalResolver:
     """Extracts and resolves temporal expressions against an injected Clock."""
 
     def __init__(self, clock: Clock | None = None):

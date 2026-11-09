@@ -24,7 +24,7 @@ class ModelBindings(BaseModel):
 
 
 class RouterConfig(BaseModel):
-    model_config = {"frozen": True}
+    model_config = {"frozen": True, "extra": "forbid"}
     name: str = "auto"
     enable_jev: bool = False
     enable_temporal_extraction: bool = False
@@ -40,7 +40,7 @@ DEFAULT_FUSION_WEIGHTS: dict[str, tuple[float, float]] = {
 
 
 class RetrievalConfig(BaseModel):
-    model_config = {"frozen": True}
+    model_config = {"frozen": True, "extra": "forbid"}
     default_strategy: str = "dense_vector"
     top_k: int = 8
     retrieve_max_results: int = 100
@@ -50,6 +50,7 @@ class RetrievalConfig(BaseModel):
     rrf_k: int = 60
     min_similarity: float | None = None
     min_results_before_relax: int = 3
+    rerank_candidates: int | None = None  # how many candidates a rerank stage receives; default top_k x 3
     relaxation: list[str] = Field(default_factory=list)
     adaptive_rules: list[tuple[str, str]] | None = None
     enable_keyword_first: bool = False
@@ -59,19 +60,19 @@ class RetrievalConfig(BaseModel):
 
 
 class ContextConfig(BaseModel):
-    model_config = {"frozen": True}
+    model_config = {"frozen": True, "extra": "forbid"}
     max_context_tokens: int = 160_000
     reserved_instruction_tokens: int = 4000
-    reserved_history_tokens: int = 4000
+    reserved_history_tokens: int = 8000  # hard cap on the history zone
     question_reserve_tokens: int = 1000
     answer_reserve_tokens: int = 4000
     history_ratio: float = 0.15
     summary_ratio: float = 0.25
     local_window_ratio: float = 0.20
     retrieved_ratio: float = 0.40
-    turn_decay: float = 0.7
-    recent_turns_full: int = 2
-    turn_summary_cutoff_tokens: int = 300
+    min_recent_turns_kept: int = 2
+    history_decay_lambda: float = 0.35
+    history_overlap_alpha: float = 0.40
     state_max_bytes: int = 16_384
     reused_turns: int = 3
     max_reused_nodes: int = 24
@@ -79,8 +80,9 @@ class ContextConfig(BaseModel):
 
 
 class GenerationConfig(BaseModel):
-    model_config = {"frozen": True}
+    model_config = {"frozen": True, "extra": "forbid"}
     strategy: str = "stuff"
+    system_preamble: str = ""  # persona; {variables} come from request.system_prompt_variables
     temperature: float | None = None
     grounding_mode: Literal["strict", "labelled_fallback"] = "strict"
     fallback_label: str = "Not from your sources:"
@@ -88,7 +90,7 @@ class GenerationConfig(BaseModel):
 
 
 class CitationConfig(BaseModel):
-    model_config = {"frozen": True}
+    model_config = {"frozen": True, "extra": "forbid"}
     formatter: str = "ref"
     verify_quotes: bool = False
     policy: str = "filter"
@@ -107,14 +109,14 @@ class CitationConfig(BaseModel):
 
 
 class SummariesConfig(BaseModel):
-    model_config = {"frozen": True}
+    model_config = {"frozen": True, "extra": "forbid"}
     enabled: bool = False
     min_chars_for_summary: int = 1500
     summary_unit_chars: int = 8000
 
 
 class IngestionConfig(BaseModel):
-    model_config = {"frozen": True}
+    model_config = {"frozen": True, "extra": "forbid"}
     splitter: str = "sentence"
     target_size: int = 1200
     overlap: int = 150
@@ -122,16 +124,16 @@ class IngestionConfig(BaseModel):
 
 
 class RuntimeConfig(BaseModel):
-    model_config = {"frozen": True}
+    model_config = {"frozen": True, "extra": "forbid"}
     deadline_seconds: float = 30.0
     pool_size: int = 4
     stage_budgets: dict[str, float] = Field(
-        default_factory=lambda: {"rerank": 4.0, "secondary_queries": 3.0}
+        default_factory=lambda: {"rerank": 4.0, "secondary_queries": 3.0, "relaxation": 2.0}
     )
 
 
 class CacheConfig(BaseModel):
-    model_config = {"frozen": True}
+    model_config = {"frozen": True, "extra": "forbid"}
     enabled: bool = True
     max_bytes: int = 32 * 1024 * 1024
     query_embedding_ttl_seconds: int = 3600
@@ -148,11 +150,7 @@ class ValidationReport(BaseModel):
     unknown: list[str] = Field(default_factory=list)
 
 
-VALID_FALLBACK_KEYS = {
-    "rerank", "jev", "intent", "generation", "summarizer",
-    "query_embedding", "ingest_embedding", "cache", "observer", "deadline",
-    "relax_soft_filters",
-}
+VALID_FALLBACK_KEYS = {"rerank", "jev", "summarizer", "query_embedding", "cache", "deadline"}
 
 
 class EngineProfile(BaseModel):
@@ -180,7 +178,6 @@ class EngineProfile(BaseModel):
     cache: CacheConfig = Field(default_factory=CacheConfig)
     allowed_link_hosts: list[str] = Field(default_factory=list)
     trace_level: Literal["light", "verbose"] = "light"
-    hydration_projection: str = "context"
     variants: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     def fingerprint(self) -> str:
@@ -264,6 +261,19 @@ class EngineProfile(BaseModel):
                     unknown.append(f"{category}:{name}")
                     problems.append(f"Unknown {category} '{name}'")
 
+        if self.post_generation:
+            problems.append("post_generation stages are a seam and are not run by this version; leave the list empty")
+
+        for name in self.variants:
+            try:
+                nested = self.variant(name).model_copy(update={"variants": {}}).check(registry)
+            except ValueError as exc:
+                problems.append(f"Variant '{name}' is invalid: {exc}")
+                continue
+            problems.extend(f"Variant '{name}': {problem}" for problem in nested.problems)
+            missing.extend(nested.missing)
+            unknown.extend(nested.unknown)
+
         return ValidationReport(
             valid=not problems,
             profile_fingerprint=self.fingerprint(),
@@ -289,7 +299,7 @@ class EngineProfile(BaseModel):
         names += [
             ("stage", split_component_name(name)[0])
             for name in self.post_stages
-            if name not in ("hydrate", "guard_enforcement")
+            if name != "guard_enforcement"
         ]
         names += [("relaxation", split_component_name(step)[0]) for step in self.retrieval.relaxation]
         for predicate, strategy in self.retrieval.adaptive_rules or ():
@@ -364,18 +374,15 @@ def news_intelligence(models: ModelBindings, **overrides: Any) -> EngineProfile:
             splitter="pass_through",
             summaries=SummariesConfig(enabled=False),
         ),
-        "hydration_projection": "context",
         "variants": {
             "news_chat": {
                 "retrieval": {"top_k": 12, "min_similarity": 0.60, "retrieve_max_results": 100},
                 "post_stages": ["identity_dedup(url)", *_rerank_if_bound(models), "recency", "top_k"],
-                "hydration_projection": "context",
             },
             "news_search": {
                 "router": {"name": "none"},
                 "retrieval": {"top_k": 2000, "min_similarity": 0.68, "retrieve_max_results": 2000},
                 "post_stages": ["identity_dedup(url)", "recency", "top_k"],
-                "hydration_projection": "card",
             },
         },
     }
@@ -390,7 +397,7 @@ def news_chat(models: ModelBindings, **overrides: Any) -> EngineProfile:
 
 
 def news_search(models: ModelBindings, **overrides: Any) -> EngineProfile:
-    """Preset variant for News search (supports up to 2000 results with card projection, §8.10, §12.2)."""
+    """Preset variant for News search (supports up to 2000 results, §8.10, §12.2)."""
     base = news_intelligence(models=models)
     return base.variant("news_search", **overrides)
 
@@ -418,7 +425,6 @@ def knowledge_base(models: ModelBindings, **overrides: Any) -> EngineProfile:
             "jev": "raise",
             "deadline": "raise",
             "cache": "raise",
-            "ingest_embedding": "raise",
         },
     }
     cfg.update(overrides)

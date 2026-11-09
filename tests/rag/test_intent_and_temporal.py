@@ -13,7 +13,7 @@ import pytest
 
 from cody_ai_shared_lib.llm import LLMResult, LLMUsage
 from cody_ai_shared_lib.rag import (
-    AutoRouter,
+    HybridIntentRouter,
     CallContext,
     DegradationTracker,
     EngineProfile,
@@ -31,7 +31,7 @@ from cody_ai_shared_lib.rag import (
     RAGQueryRequest,
     RouterConfig,
     RouterContext,
-    TemporalExtractor,
+    TemporalResolver,
     UsageTracker,
     clamp_intent,
     knowledge_base,
@@ -46,7 +46,7 @@ def test_temporal_extractor_last_week_calendar_math():
     # Fixed clock: Wednesday Nov 11, 2026 14:00:00 UTC (weekday 2)
     fixed_now = datetime(2026, 11, 11, 14, 0, 0, tzinfo=timezone.utc)
     clock = FrozenClock(fixed_now)
-    extractor = TemporalExtractor(clock=clock)
+    extractor = TemporalResolver(clock=clock)
 
     res = extractor.extract("What happened in AI last week?")
     assert res["has_time_expression"] is True
@@ -66,7 +66,7 @@ def test_temporal_extractor_yesterday_and_quarter():
     """AC-RAG-17: 'yesterday' and quarter patterns resolve to exact UTC bounds."""
     fixed_now = datetime(2026, 11, 11, 14, 0, 0, tzinfo=timezone.utc)
     clock = FrozenClock(fixed_now)
-    extractor = TemporalExtractor(clock=clock)
+    extractor = TemporalResolver(clock=clock)
 
     # Yesterday
     y_res = extractor.extract("Show me reports from yesterday")
@@ -85,7 +85,7 @@ def test_temporal_range_repair():
     """AC-RAG-17: Reversed temporal ranges (start > end) are repaired."""
     start = datetime(2026, 11, 15, tzinfo=timezone.utc)
     end = datetime(2026, 11, 10, tzinfo=timezone.utc)
-    repaired_start, repaired_end = TemporalExtractor.repair_range(start, end)
+    repaired_start, repaired_end = TemporalResolver.repair_range(start, end)
     assert repaired_start == end
     assert repaired_end == start
 

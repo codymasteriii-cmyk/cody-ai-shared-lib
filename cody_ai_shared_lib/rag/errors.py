@@ -76,8 +76,11 @@ class UnsupportedFilterError(RAGEngineError):
 
 
 class EmbeddingProviderError(RAGEngineError):
-    """Raised when embedding generation fails or produces all-zero vectors."""
-    pass
+    """Raised when an embedding call fails or returns a zero vector; names the affected nodes."""
+
+    def __init__(self, message: str, failed_node_ids: list[str] | None = None, **kwargs: Any):
+        super().__init__(message, **kwargs)
+        self.failed_node_ids = list(failed_node_ids or [])
 
 
 class EmbeddingSignatureMismatch(RAGEngineError):

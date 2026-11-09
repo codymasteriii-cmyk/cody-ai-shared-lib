@@ -27,7 +27,6 @@ class TestInMemoryRAGStoreConformance(RAGStoreContractTests):
             supports_local_window=True,
             supports_full_scope_fetch=True,
             supports_sequential_boundary=True,
-            supports_hydration=True,
             supports_fetch_nodes=True,
             supports_fingerprints=True,
             supports_delete=True,

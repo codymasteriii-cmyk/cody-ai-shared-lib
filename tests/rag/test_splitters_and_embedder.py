@@ -45,7 +45,7 @@ def test_passthrough_splitter():
 
 
 def test_batch_embedder_zero_vector_guard():
-    """AC-RAG-04: Single zero vector node is skipped with DG-08; all-zero raises EmbeddingProviderError."""
+    """AC-RAG-04: Any zero vector in a unit raises and names the node, so nothing is written."""
     mock_gw = MagicMock()
     embedder = BatchEmbedder(gateway=mock_gw, model="gemini-embedding-2", batch_size=2)
     tracker = UsageTracker("req-test")
@@ -61,12 +61,9 @@ def test_batch_embedder_zero_vector_guard():
     emb_res_mock.vectors = [[0.1, 0.2], [0.0, 0.0]]
     mock_gw.embed.return_value = emb_res_mock
 
-    pairs = embedder.embed_nodes(nodes, tracker, deg_tracker)
-    assert len(pairs) == 1
-    assert pairs[0][0].node_id == "n1"
-    assert pairs[0][1] == [0.1, 0.2]
-    # Check DG-08 recorded
-    assert any(d.id == "DG-08" for d in deg_tracker.degradations)
+    with pytest.raises(EmbeddingProviderError) as partial:
+        embedder.embed_nodes(nodes, tracker, deg_tracker)
+    assert partial.value.failed_node_ids == ["n2"]
 
     # Scenario 2: All nodes zero in non-empty section -> raises EmbeddingProviderError
     emb_res_all_zero = MagicMock()

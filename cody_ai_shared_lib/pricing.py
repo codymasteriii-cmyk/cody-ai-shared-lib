@@ -82,6 +82,7 @@ MODEL_CATALOG: Dict[str, ModelPricingType] = {
     # ── Reranker ──
     "jina-reranker": TokenPricing(input_cost_per_m=0.05, output_cost_per_m=0.0, modality="rerank"),
     "jina-reranker-v2-base-multilingual": TokenPricing(input_cost_per_m=0.05, output_cost_per_m=0.0, modality="rerank"),
+    "jina-reranker-v3.5": TokenPricing(input_cost_per_m=0.05, output_cost_per_m=0.0, modality="rerank"),
 
     # ── Image Models ──
     "gemini-nano-banana-2.1": ImagePricing(input_cost_per_m=1.50, output_cost_per_m=30.00, modality="image"),

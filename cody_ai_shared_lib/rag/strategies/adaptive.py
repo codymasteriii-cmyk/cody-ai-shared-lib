@@ -1,4 +1,4 @@
-"""Tier ladder AdaptiveStrategy driven by ordered (predicate, strategy) rules (§8.9, §8.12)."""
+"""Tier ladder AdaptiveRetrievalStrategy driven by ordered (predicate, strategy) rules (§8.9, §8.12)."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -63,7 +63,7 @@ def fits_full_context(rc: RuleContext) -> bool:
 
 BUILTIN_PREDICATES = {
     "has_strategy_override": lambda rc: bool(rc.request.strategy_override)
-    and rc.request.strategy_override != AdaptiveStrategy.name,
+    and rc.request.strategy_override != AdaptiveRetrievalStrategy.name,
     "route_no_retrieval": lambda rc: rc.intent.route == "no_retrieval",
     "fits_full_context": fits_full_context,
     "wants_overview": lambda rc: rc.intent.scope == "document_overview"
@@ -76,7 +76,7 @@ BUILTIN_PREDICATES = {
 }
 
 
-class AdaptiveStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
+class AdaptiveRetrievalStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
     """Runs the first rule that is true and whose strategy the store can serve (§8.9)."""
     name: ClassVar[str] = "adaptive"
     version: ClassVar[str] = "1.0.0"

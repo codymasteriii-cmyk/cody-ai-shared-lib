@@ -1,18 +1,18 @@
-"""IntentRouter implementations and AutoRouter (§7.2, AC-RAG-12, AC-RAG-13, AC-RAG-14, AC-RAG-16)."""
+"""IntentRouter implementations and HybridIntentRouter (§7.2, AC-RAG-12, AC-RAG-13, AC-RAG-14, AC-RAG-16)."""
 from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 from pydantic import BaseModel
 
 from ..degradation import DegradationTracker
-from ..gateway import ModelGateway
+from ..errors import ProfileConfigError
 from ..models import ConversationState, QueryIntent, RAGQueryRequest
 from ..profile import EngineProfile
 from ..usage import BudgetGuard, UsageTracker
 from .heuristic import HeuristicRouter
 from .jev_gate import JevGateRouter
 from .llm_rewriter import LLMIntentRouter
-from .temporal import TemporalExtractor
+from .temporal import TemporalResolver
 
 
 class RouterContext(BaseModel):
@@ -110,24 +110,22 @@ class LLMOnlyRouter:
         return _route_with_llm(self.llm_router, request, ctx)
 
 
-class AutoRouter:
+class HybridIntentRouter:
     """Hybrid layered router: Heuristic -> Jev gate (opt-in) -> LLM rewriter -> Passthrough."""
     name = "auto"
     version = "1.0.0"
 
     def __init__(
         self,
-        gateway: ModelGateway,
         heuristic: HeuristicRouter | None = None,
         jev_gate: JevGateRouter | None = None,
         llm_router: LLMIntentRouter | None = None,
-        temporal_extractor: TemporalExtractor | None = None,
+        temporal_resolver: TemporalResolver | None = None,
     ):
-        self.gateway = gateway
         self.heuristic = heuristic or HeuristicRouter()
         self.jev_gate = jev_gate
         self.llm_router = llm_router
-        self.temporal_extractor = temporal_extractor
+        self.temporal_resolver = temporal_resolver
 
     def _jev_gate_usable(self, ctx: RouterContext) -> bool:
         if not ctx.profile.router.enable_jev or self.jev_gate is None:
@@ -172,8 +170,8 @@ class AutoRouter:
             router_source="passthrough",
         )
 
-        if ctx.profile.router.enable_temporal_extraction and self.temporal_extractor and not intent.has_time_expression:
-            temp_info = self.temporal_extractor.extract(request.question)
+        if ctx.profile.router.enable_temporal_extraction and self.temporal_resolver and not intent.has_time_expression:
+            temp_info = self.temporal_resolver.extract(request.question)
             if temp_info.get("has_time_expression"):
                 intent.has_time_expression = True
                 intent.temporal_scope = temp_info.get("temporal_scope", "recent")
@@ -188,8 +186,8 @@ def _build_llm_rewriter(deps: Any) -> LLMIntentRouter | None:
     models = deps.profile.models.intent
     if not models:
         return None
-    temporal = deps.temporal_extractor if deps.profile.router.enable_temporal_extraction else None
-    return LLMIntentRouter(gateway=deps.gateway, models=models, temporal_extractor=temporal)
+    temporal = deps.temporal_resolver if deps.profile.router.enable_temporal_extraction else None
+    return LLMIntentRouter(gateway=deps.gateway, models=models, temporal_resolver=temporal)
 
 
 def build_passthrough_router(deps: Any) -> PassthroughRouter:
@@ -201,16 +199,18 @@ def build_heuristic_router(deps: Any) -> HeuristicIntentRouter:
 
 
 def build_llm_router(deps: Any) -> LLMOnlyRouter:
-    return LLMOnlyRouter(_build_llm_rewriter(deps))
+    rewriter = _build_llm_rewriter(deps)
+    if rewriter is None:
+        raise ProfileConfigError("Router 'llm' requires models.intent to be configured", missing=["models.intent"])
+    return LLMOnlyRouter(rewriter)
 
 
-def build_auto_router(deps: Any) -> AutoRouter:
+def build_auto_router(deps: Any) -> HybridIntentRouter:
     jev_gate = None
     if deps.profile.router.enable_jev:
         jev_gate = JevGateRouter(gateway=deps.gateway, timeout=deps.profile.router.jev_timeout)
-    return AutoRouter(
-        gateway=deps.gateway,
+    return HybridIntentRouter(
         llm_router=_build_llm_rewriter(deps),
         jev_gate=jev_gate,
-        temporal_extractor=deps.temporal_extractor,
+        temporal_resolver=deps.temporal_resolver,
     )

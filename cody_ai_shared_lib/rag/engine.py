@@ -20,6 +20,7 @@ from .context.conversation import ConversationManager
 from .context.fence import ContextFencer
 from .degradation import DegradationTracker
 from .errors import (
+    EmbeddingProviderError,
     GenerationError,
     ProfileConfigError,
     RAGEngineError,
@@ -38,10 +39,12 @@ from .ingestion.nodes import (
 )
 from .intent.llm_rewriter import clamp_intent
 from .intent.router import IntentRouter, RouterContext
-from .intent.temporal import TemporalExtractor
+from .intent.temporal import TemporalResolver
 from .models import (
     IngestionProgress,
+    FailedNode,
     MetaT,
+    PreparedBatch,
     PreparedNode,
     QueryIntent,
     QueryPlan,
@@ -56,18 +59,17 @@ from .models import (
     ReindexStatus,
     UsageTotal,
 )
-from .ports import Fingerprint, Guard, NodeRenderer, RAGStore
+from .ports import Fingerprint, Guard, NodeRenderer, RAGStore, call_store, filter_value
 from .postgen.citations import CitationExtractor
-from .postgen.quotes import QuoteVerifier
+from .postgen.quotes import QuoteValidator
 from .postgen.sanitizer import OutputSanitizer
 from .profile import EngineProfile, ValidationReport
 from .registry import ComponentDeps, ComponentRegistry, create_default_registry
 from .retrieval_pipeline import RetrievalPipeline, apply_guards
 from .runtime import Clock, Deadline, RequestRun, Rng, SystemClock, SystemRng, make_bounded_pool
-from .strategies.adaptive import AdaptiveStrategy
+from .strategies.adaptive import AdaptiveRetrievalStrategy
 from .trace import ObserverDispatcher, RAGObserver, TraceCollector
 from .usage import BudgetGuard, UsageTracker
-from .vectors import is_zero_vector
 
 logger = logging.getLogger("shared-rag")
 
@@ -113,8 +115,10 @@ class RAGEngine(Generic[MetaT]):
         cache: Cache | None = None,
         pool: Any = None,
         router: IntentRouter | None = None,
+        variant_name: str | None = None,
     ):
         self.profile = profile
+        self._variant_name = variant_name
         self.store = store
         self.gateway = gateway or ModelGateway()
         self.clock = clock or SystemClock()
@@ -142,20 +146,20 @@ class RAGEngine(Generic[MetaT]):
             overlap=profile.ingestion.overlap,
             analyzer=self.analyzer,
         )
-        self.temporal_extractor = TemporalExtractor(clock=self.clock)
+        self.temporal_resolver = TemporalResolver(clock=self.clock)
         self._deps = ComponentDeps(
             profile=profile,
             gateway=self.gateway,
             renderer=self.renderer,
             analyzer=self.analyzer,
             clock=self.clock,
-            temporal_extractor=self.temporal_extractor,
+            temporal_resolver=self.temporal_resolver,
             registry=self.registry,
         )
 
         self.formatter = self.registry.get("formatter", profile.citations.formatter)(self.renderer)
         self.fencer = ContextFencer(rng=self.rng)
-        self.assembler = ContextAssembler(profile, self.renderer, self.fencer, self.formatter)
+        self.assembler = ContextAssembler(profile, self.renderer, self.fencer, self.formatter, self.analyzer)
         self.conversation_manager = ConversationManager(
             max_reused_turns=profile.context.reused_turns,
             max_reused_nodes=profile.context.max_reused_nodes,
@@ -164,14 +168,14 @@ class RAGEngine(Generic[MetaT]):
         )
         self.generator: GenerationStrategy = self.registry.get("generator", profile.generation.strategy)(self._deps)
         self.citation_extractor = CitationExtractor(profile.citations.on_unverified, self.formatter)
-        self.quote_verifier = QuoteVerifier(analyzer=self.analyzer)
+        self.quote_validator = QuoteValidator(analyzer=self.analyzer)
         self.sanitizer = OutputSanitizer(allowed_link_hosts=profile.allowed_link_hosts)
         self.finalizer = AnswerFinalizer(
             profile,
             store,
             self.analyzer,
             self.citation_extractor,
-            self.quote_verifier,
+            self.quote_validator,
             self.sanitizer,
             self.conversation_manager,
         )
@@ -277,7 +281,7 @@ class RAGEngine(Generic[MetaT]):
         if gaps:
             raise StoreCapabilityError(f"Engine validation failed: {'; '.join(gaps)}", stage="startup")
 
-    def with_profile(self, profile: EngineProfile) -> "RAGEngine[MetaT]":
+    def with_profile(self, profile: EngineProfile, variant_name: str | None = None) -> "RAGEngine[MetaT]":
         """Return an engine for another profile that shares this engine's store, gateway and pool."""
         return RAGEngine[MetaT](
             profile=profile,
@@ -293,6 +297,7 @@ class RAGEngine(Generic[MetaT]):
             cache=self.cache,
             pool=self._pool,
             router=self._explicit_router,
+            variant_name=variant_name,
         )
 
     def _variant_engine(self, name: str) -> "RAGEngine[MetaT]":
@@ -301,7 +306,7 @@ class RAGEngine(Generic[MetaT]):
             raise ProfileConfigError(f"Unknown profile variant '{name}'", unknown=[f"variant:{name}"])
         with self._variant_lock:
             if name not in self._variant_engines:
-                self._variant_engines[name] = self.with_profile(self.profile.variant(name))
+                self._variant_engines[name] = self.with_profile(self.profile.variant(name), variant_name=name)
             return self._variant_engines[name]
 
     # ── Per-request plumbing ──────────────────────────────────────────────
@@ -309,6 +314,8 @@ class RAGEngine(Generic[MetaT]):
     def _begin(self, request: RAGQueryRequest) -> RequestRun:
         request_id = request.request_id or f"req-{uuid.uuid4().hex[:12]}"
         filters = request.filters
+        variant = request.variant or self._variant_name
+        scope = {key: filter_value(filters, key) for key in self.store.capabilities().required_filter_keys}
         degradations = DegradationTracker(fallbacks=self.profile.fallbacks)
         dispatcher = self.dispatcher.for_request(degradations)
         degradations.on_record = dispatcher.notify_degrade
@@ -317,7 +324,8 @@ class RAGEngine(Generic[MetaT]):
             tenant_or_user_id=request.tenant_id or filters.tenant_or_user_id,
             doc_ids=filters.doc_ids,
             profile_name=self.profile.name,
-            variant=request.variant,
+            variant=variant,
+            scope=scope,
             on_record=dispatcher.notify_usage,
         )
         return RequestRun(
@@ -331,7 +339,7 @@ class RAGEngine(Generic[MetaT]):
                 self.clock,
                 dispatcher,
                 request.trace_level or self.profile.trace_level,
-                request.variant,
+                variant,
             ),
         )
 
@@ -354,6 +362,11 @@ class RAGEngine(Generic[MetaT]):
     def _fail(self, exc: Exception, run: RequestRun, retrieval: RAGRetrievalResult[MetaT] | None = None) -> None:
         self._attach_failure_context(exc, run, retrieval)
         logger.error(f"[RAG] id={run.request_id} error={type(exc).__name__} stage={getattr(exc, 'stage', None)}")
+        try:
+            trace = run.trace.build(None, run.degradations.degradations, run.usage.stage_usages, run.usage.total())
+            run.trace.dispatcher.notify_complete(trace, None)
+        except Exception:  # an observer must never replace the error the caller needs to see
+            logger.error(f"[RAG] id={run.request_id} on_complete failed while reporting a failure", exc_info=True)
 
     def _select_router(self, request: RAGQueryRequest) -> IntentRouter:
         """Selection order: request override, then the engine's router (§7.2)."""
@@ -367,7 +380,8 @@ class RAGEngine(Generic[MetaT]):
 
     def _resolve_intent(self, request: RAGQueryRequest, intent: QueryIntent | None, run: RequestRun) -> QueryIntent:
         if intent is not None:
-            return clamp_intent(intent.model_dump(), run.degradations)
+            clamped = clamp_intent(intent.model_dump(exclude={"ext"}), run.degradations)
+            return self._with_ext(clamped, intent)
         started = run.trace.elapsed_ms()
         router = self._select_router(request)
         context = RouterContext(
@@ -385,6 +399,12 @@ class RAGEngine(Generic[MetaT]):
             "scope": resolved.scope,
         }
         return resolved
+
+    @staticmethod
+    def _with_ext(clamped: QueryIntent, original: QueryIntent) -> QueryIntent:
+        """Keep the caller's typed intent class and extension on the clamped values."""
+        values = {name: getattr(clamped, name) for name in type(clamped).model_fields if name != "ext"}
+        return original.model_copy(update=values)
 
     def _prepare_generation(
         self,
@@ -412,8 +432,6 @@ class RAGEngine(Generic[MetaT]):
             usage_tracker=run.usage,
             degradation_tracker=run.degradations,
             budget_guard=self.budget_guard,
-            request_id=run.request_id,
-            tenant_or_user_id=request.tenant_id,
             stage=stage,
         )
 
@@ -421,13 +439,17 @@ class RAGEngine(Generic[MetaT]):
 
     def route(self, request: RAGQueryRequest) -> QueryIntent:
         """Public routing entry point (§7.2, AC-RAG-16)."""
+        if request.variant:
+            return self._variant_engine(request.variant).route(request.model_copy(update={"variant": None}))
         return self._resolve_intent(request, None, self._begin(request))
 
     def plan(self, request: RAGQueryRequest, intent: QueryIntent | None = None) -> QueryPlan:
         """Evaluate the adaptive rules without retrieval or generation (§8.12, AC-RAG-48, AC-RAG-58)."""
+        if request.variant:
+            return self._variant_engine(request.variant).plan(request.model_copy(update={"variant": None}), intent)
         resolved = intent or QueryIntent(search_query=request.question, router_source="passthrough")
         filters, _, _ = self.pipeline.scoped_filters(request, resolved)
-        return AdaptiveStrategy.decide_tier(request, resolved, filters, self.store, self.profile, self.registry)
+        return AdaptiveRetrievalStrategy.decide_tier(request, resolved, filters, self.store, self.profile, self.registry)
 
     def retrieve(self, request: RAGQueryRequest, intent: QueryIntent | None = None) -> RAGRetrievalResult[MetaT]:
         """Ranked list retrieval mode (§8.10, AC-RAG-51)."""
@@ -520,7 +542,7 @@ class RAGEngine(Generic[MetaT]):
 
         clean_text, citations = self.citation_extractor.extract(answer_text, nodes)
         if self.profile.citations.verify_quotes:
-            citations, _ = self.quote_verifier.verify(citations, nodes, answer_text=clean_text)
+            citations, _ = self.quote_validator.verify(citations, nodes, answer_text=clean_text)
         return citations
 
     def stream_query(self, request: RAGQueryRequest, intent: QueryIntent | None = None) -> RAGStream[MetaT]:
@@ -681,37 +703,39 @@ class RAGEngine(Generic[MetaT]):
 
         Resumable via start_section_seq and append-only (RAG-ING-5, RAG-ING-6, AC-RAG-05).
         """
-        doc_input = doc
-        sections = [
-            s for s in sorted(doc_input.sections, key=lambda x: x.section_seq) if s.section_seq >= start_section_seq
-        ]
+        sections = [s for s in sorted(doc.sections, key=lambda x: x.section_seq) if s.section_seq >= start_section_seq]
         last_progress: IngestionProgress | None = None
-        completed = 0
+        completed = len(doc.sections) - len(sections)  # a resumed job counts what earlier runs finished
 
         for section in sections:
             tracker, deg_tracker = self._ingestion_trackers(
-                f"ingest-{doc_input.doc_id}-s{section.section_seq}", doc_input.doc_id
+                f"ingest-{doc.doc_id}-s{section.section_seq}", doc.doc_id
             )
             try:
-                last_progress = self._ingest_section(doc_input, section, completed + 1, tracker, deg_tracker)
+                last_progress = self._ingest_section(doc, section, completed + 1, tracker, deg_tracker)
             except RAGEngineError as exc:
-                exc.request_id = exc.request_id or tracker.request_id
-                exc.degradations = deg_tracker.degradations
-                exc.usage = tracker.stage_usages
-                exc.usage_total = tracker.total()
+                self._attach_ingestion_failure(exc, tracker, deg_tracker)
                 raise
             completed += 1
             if on_section_complete:
                 on_section_complete(last_progress)
 
         return last_progress or IngestionProgress(
-            doc_id=doc_input.doc_id,
+            doc_id=doc.doc_id,
             section_seq=0,
-            sections_completed=0,
-            sections_total=len(doc_input.sections),
+            sections_completed=completed,
+            sections_total=len(doc.sections),
             passages_upserted=0,
             summary_status="skipped",
         )
+
+    @staticmethod
+    def _attach_ingestion_failure(exc: RAGEngineError, tracker: UsageTracker, degradations: DegradationTracker) -> None:
+        """Give an ingestion error what the call had spent before it failed (RAG-ING-12, RAG-OPS-1)."""
+        exc.request_id = exc.request_id or tracker.request_id
+        exc.degradations = degradations.degradations
+        exc.usage = tracker.stage_usages
+        exc.usage_total = tracker.total()
 
     def _ingest_section(
         self,
@@ -745,12 +769,15 @@ class RAGEngine(Generic[MetaT]):
         summaries = prepare_summaries(
             result, self.embedder, self.renderer, self.analyzer, uses_tokens, tracker, deg_tracker, self.budget_guard
         )
-        written = self.store.upsert_section_nodes(
-            doc_id=doc_input.doc_id,
-            section_seq=section.section_seq,
-            nodes=[p[0] for p in pairs] + summaries.unit_nodes,
-            embeddings=[p[1] for p in pairs] + summaries.unit_vectors,
-            summary=summaries.section_summary,
+        written = call_store(
+            "upsert_section_nodes",
+            lambda: self.store.upsert_section_nodes(
+                doc_id=doc_input.doc_id,
+                section_seq=section.section_seq,
+                nodes=[p[0] for p in pairs] + summaries.unit_nodes,
+                embeddings=[p[1] for p in pairs] + summaries.unit_vectors,
+                summary=summaries.section_summary,
+            ),
         )
         return IngestionProgress(
             doc_id=doc_input.doc_id,
@@ -758,7 +785,6 @@ class RAGEngine(Generic[MetaT]):
             sections_completed=sections_completed,
             sections_total=len(doc_input.sections),
             passages_upserted=written,
-            passages_failed=len(nodes) - len(pairs),
             summary_status=result.summary_status,
             usage=tracker.stage_usages,
             degradations=deg_tracker.degradations,
@@ -770,50 +796,70 @@ class RAGEngine(Generic[MetaT]):
         try:
             return self.synchronizer.sync(doc, tracker, deg_tracker)
         except RAGEngineError as exc:
-            exc.request_id = exc.request_id or tracker.request_id
-            exc.degradations = deg_tracker.degradations
-            exc.usage = tracker.stage_usages
-            exc.usage_total = tracker.total()
+            self._attach_ingestion_failure(exc, tracker, deg_tracker)
             raise
 
-    def prepare_nodes(self, nodes: list[RAGNode[MetaT]]) -> list[PreparedNode[MetaT]]:
-        """Compute embedding, fingerprint, token estimate and search tokens without writing (RAG-ING-13)."""
-        if not nodes:
-            return []
+    def prepare_node(self, node: RAGNode[MetaT]) -> PreparedNode[MetaT]:
+        """Prepare one node for an app-side insert: it either succeeds completely or raises (§6.4.1)."""
+        return self.prepare_nodes([node]).prepared[0]
 
-        tracker, _ = self._ingestion_trackers("prepare-nodes", nodes[0].span.doc_id)
-        vectors = self.gateway.embed(
-            texts=[self.renderer.embed_text(n) for n in nodes],
-            model=self.profile.models.embedding,
-            stage="prepare_embedding",
-            usage_tracker=tracker,
-            task_type="RETRIEVAL_DOCUMENT",
-            budget_guard=self.budget_guard,
-        ).vectors
+    def prepare_nodes(self, nodes: list[RAGNode[MetaT]]) -> PreparedBatch[MetaT]:
+        """Prepare a batch for app-side inserts, judging each node on its own (§6.4.1, RAG-ING-13).
+
+        Nodes that fail are listed in `failed` and the good ones are returned, so the caller can
+        keep those and retry the rest. Raises only when nothing succeeded or the budget ran out.
+        """
+        if not nodes:
+            return PreparedBatch[MetaT]()
+
+        tracker, degradations = self._ingestion_trackers("prepare-nodes", nodes[0].span.doc_id)
+        try:
+            embedded, failed = self.embedder.embed_each(
+                nodes, tracker, degradations, "prepare_embedding", self.budget_guard
+            )
+            if not embedded:
+                raise EmbeddingProviderError(
+                    f"All {len(nodes)} nodes failed to embed with model '{self.profile.models.embedding}'",
+                    failed_node_ids=[node.node_id for node in failed],
+                    stage="prepare_embedding",
+                )
+        except RAGEngineError as exc:
+            self._attach_ingestion_failure(exc, tracker, degradations)
+            raise
+
+        if failed:
+            degradations.record(
+                dg_id="DG-08",
+                stage="prepare_embedding",
+                reason=f"{len(failed)} of {len(nodes)} nodes failed to embed",
+                impact="Failed nodes were returned in `failed`; the rest are ready to insert",
+            )
 
         uses_tokens = self.store.capabilities().uses_analyzer_tokens
         emb_sig = embedding_signature(self.profile.models.embedding, self.store.embedding_space(), self.splitter)
         fts_sig = fts_signature(self.analyzer, uses_tokens)
-        stage_usage = tracker.stage_usages[0] if tracker.stage_usages else None
 
         prepared: list[PreparedNode[MetaT]] = []
-        for idx, node in enumerate(nodes):
+        for node, vector in embedded:
             node_copy = node.model_copy()
             finalize_node(node_copy, self.renderer, self.analyzer, uses_tokens)
-            vector = vectors[idx] if idx < len(vectors) else []
             prepared.append(
                 PreparedNode[MetaT](
                     node=node_copy,
-                    vector=[] if is_zero_vector(vector) else vector,
+                    vector=vector,
                     fingerprint=Fingerprint(
                         content_hash=node_copy.content_hash,
                         embedding_signature=emb_sig,
                         fts_signature=fts_sig,
                     ),
-                    usage=stage_usage,
                 )
             )
-        return prepared
+        return PreparedBatch[MetaT](
+            prepared=prepared,
+            failed=[FailedNode(node_id=node.node_id, reason="empty or zero embedding") for node in failed],
+            usage=tracker.stage_usages,
+            degradations=degradations.degradations,
+        )
 
     def needs_reindex(self, doc_id: str) -> ReindexStatus:
         """Check whether stored embeddings or FTS tokens are stale (§6.6, AC-RAG-64)."""

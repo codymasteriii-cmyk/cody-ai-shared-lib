@@ -194,7 +194,7 @@ def test_budget_guard_skip_dg11():
         system_prompt="sys",
         user_message="hello",
         models=["gemini-3.8-flash"],
-        stage="summary",
+        stage="summarizer",
         usage_tracker=tracker,
         degradation_tracker=degradations,
         budget_guard=mock_guard,
@@ -297,24 +297,21 @@ def test_engine_profile_fingerprint():
 # ── Runtime Determinism & Deadlines ────────────────────────────────────────────
 
 def test_deadline_expired_handling():
-    """AC-RAG-48: Deadline expired allows optional stage, raises DeadlineExceeded on required."""
+    """AC-RAG-48: An expired deadline raises DeadlineExceeded for a required stage."""
     clock = FrozenClock(datetime(2026, 11, 8, 12, 0, 0, tzinfo=timezone.utc), fixed_monotonic=100.0)
     dl = Deadline(deadline_seconds=5.0, clock=clock)
 
     # Initial state: 5.0 seconds remaining
     assert dl.remaining_seconds() == 5.0
-    dl.check("generation", is_optional=False)  # Should not raise
+    dl.check("generation")  # Should not raise
 
     # Advance time by 6 seconds -> expired
     clock.advance(6.0)
     assert dl.is_expired()
 
-    # Optional stage does not raise
-    dl.check("summarizer", is_optional=True)
-
     # Required stage raises DeadlineExceeded
     with pytest.raises(DeadlineExceeded) as exc_info:
-        dl.check("generation", is_optional=False)
+        dl.check("generation")
     assert exc_info.value.stage == "generation"
 
 

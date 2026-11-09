@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Generic
 
 from ..degradation import DegradationTracker
-from ..models import MetaT, RAGNode, RAGSectionInput, SourceSpan
+from ..models import MetaT, RAGNode, RAGSectionInput, SourceSpan, node_class_for
 from ..ports import EmbeddingSpace
 from ..render import NodeRenderer
 from ..text.analyzer import TextAnalyzer, estimate_tokens
@@ -26,7 +26,7 @@ def build_section_nodes(
     nodes: list[RAGNode[MetaT]] = []
     for idx, chunk in enumerate(splitter.split(section.text, base_offset=section.char_start)):
         nodes.append(
-            RAGNode[MetaT](
+            node_class_for(section.metadata)(
                 node_id=f"{doc_id}#s{section.section_seq}p{idx}",
                 granularity="passage",
                 text=chunk.text,

@@ -58,7 +58,7 @@ class _BaseFormatter:
 class RefCitationFormatter(_BaseFormatter):
     """Short per-turn markers: `[1]`, `[2]`. Four or more digits are not markers, so `[2024]` stays text."""
     name = "ref"
-    pattern = re.compile(r"\[\s*\d{1,3}(?:\s*,\s*\d{1,3})*\s*\]")
+    pattern = re.compile(r"(?<![\w)])\[\s*\d{1,3}(?:\s*,\s*\d{1,3})*\s*\]")
 
     def marker(self, node: RAGNode[Any], index: int) -> str:
         return f"[{index}]"
@@ -105,6 +105,43 @@ BUILTIN_FORMATTERS = {
 }
 
 
+_CODE_RE = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)
+
+
+def _markers_outside_code(text: str, formatter: CitationFormatter) -> list[tuple[str, int, int]]:
+    """Parsed markers, leaving anything inside a code block or code span alone."""
+    code = [match.span() for match in _CODE_RE.finditer(text)]
+    return [
+        (raw, start, end)
+        for raw, start, end in formatter.parse(text)
+        if not any(code_start <= start < code_end for code_start, code_end in code)
+    ]
+
+
+def _rebuild(text: str, replacements: list[tuple[int, int, str]]) -> str:
+    """Apply marker replacements, tidying spaces only where a marker was removed."""
+    parts: list[str] = []
+    cursor = 0
+    for start, end, replacement in replacements:
+        before = text[cursor:start]
+        cursor = end
+        if replacement:
+            parts.append(before + replacement)
+            continue
+        parts.append(before.rstrip(" "))
+        written = "".join(parts)
+        if not written or written.endswith("\n"):  # at a line start, the following spaces go too
+            while cursor < len(text) and text[cursor] == " ":
+                cursor += 1
+    parts.append(text[cursor:])
+    return "".join(parts).strip()
+
+
+def strip_markers(text: str, formatter: CitationFormatter) -> str:
+    """Remove citation markers, for a UI that needs clean text while streaming (§10.8)."""
+    return _rebuild(text, [(start, end, "") for _, start, end in _markers_outside_code(text, formatter)])
+
+
 class CitationExtractor(Generic[MetaT]):
     """Resolves markers against this turn's fenced nodes and applies the unverified policy (§11.2)."""
 
@@ -140,23 +177,21 @@ class CitationExtractor(Generic[MetaT]):
                 )
             return by_marker[marker]
 
-        parts: list[str] = []
-        cursor = 0
-        for raw, start, end in self.formatter.parse(text):
-            parts.append(text[cursor:start])
-            cursor = end
+        replacements: list[tuple[int, int, str]] = []
+        for raw, start, end in _markers_outside_code(text, self.formatter):
+            markers = self._expand(raw)
+            if len(markers) > 1 and not all(self.formatter.resolve(m, markers_to_nodes) for m in markers):
+                continue  # a list of numbers such as [7, 8, 9] that are not all sources is ordinary text
             outputs = []
-            for marker in self._expand(raw):
+            for marker in markers:
                 citation = citation_for(marker)
                 if citation.verified:
                     outputs.append(marker)
                 elif policy == "flag":
                     outputs.append("[?]")
-            parts.append(" ".join(outputs))
-        parts.append(text[cursor:])
+            replacements.append((start, end, " ".join(outputs)))
 
-        cleaned = re.sub(r" +([.,;!?])", r"\1", "".join(parts))
-        return re.sub(r"  +", " ", cleaned).strip(), list(by_marker.values())
+        return _rebuild(text, replacements), list(by_marker.values())
 
     def _expand(self, marker: str) -> list[str]:
         expand = getattr(self.formatter, "expand", None)

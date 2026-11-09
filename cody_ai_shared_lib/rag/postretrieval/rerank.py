@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, ClassVar, Generic
 from ..degradation import DegradationTracker
 from ..gateway import ModelGateway
-from ..granularity import TRAIT_RERANKABLE, has_trait
+from ..granularity import TRAIT_RERANKABLE, has_trait, limit_ranked
 from ..models import MetaT, RAGNode
 from ..ports import NodeRenderer
 from ..render import DefaultRenderer
@@ -40,10 +40,8 @@ class JinaCrossEncoderReranker(Generic[MetaT]):
             nodes,
             ctx.usage_tracker,
             ctx.degradation_tracker,
-            top_n=None if len(nodes) <= top_n else top_n,
+            top_n=top_n,
             budget_guard=ctx.budget_guard,
-            request_id=ctx.usage_tracker.request_id,
-            tenant_or_user_id=ctx.usage_tracker.tenant_or_user_id,
         )
 
     def rerank_nodes(
@@ -54,9 +52,8 @@ class JinaCrossEncoderReranker(Generic[MetaT]):
         degradation_tracker: DegradationTracker,
         top_n: int | None = None,
         budget_guard: BudgetGuard | None = None,
-        request_id: str | None = None,
-        tenant_or_user_id: str | None = None,
     ) -> list[RAGNode[MetaT]]:
+        """Rerank what can be reranked; `top_n` limits only those, never the ordered layers."""
         if not nodes:
             return []
 
@@ -70,7 +67,7 @@ class JinaCrossEncoderReranker(Generic[MetaT]):
                 non_rerankable.append(n)
 
         if not rerankable:
-            return nodes[:top_n] if top_n else nodes
+            return nodes
 
         doc_texts = [
             self.renderer.rerank_text(n) if hasattr(self.renderer, "rerank_text") else n.text
@@ -85,22 +82,12 @@ class JinaCrossEncoderReranker(Generic[MetaT]):
             degradation_tracker=degradation_tracker,
             budget_guard=budget_guard,
             fallbacks={"rerank": self.fallback_action},
-            request_id=request_id or "",
-            tenant_or_user_id=tenant_or_user_id,
-            top_n=top_n or len(rerankable),
+            top_n=min(top_n, len(rerankable)) if top_n else len(rerankable),
         )
 
         if res is None:
-            # DG-06 fallback: keep incoming order
-            if not any(d.id == "DG-06" for d in degradation_tracker.degradations):
-                degradation_tracker.record(
-                    dg_id="DG-06",
-                    stage="post_retrieval_rerank",
-                    reason="Reranker failed or unavailable",
-                    fallback_used="keep_incoming_order",
-                    impact="Candidate nodes were not reranked",
-                )
-            return nodes[:top_n] if top_n else nodes
+            # The gateway has already recorded why: DG-06 on failure, DG-11 on a budget skip
+            return limit_ranked(nodes, top_n) if top_n else nodes
 
         # Map reranked results back to rerankable nodes
         reranked_nodes: list[RAGNode[MetaT]] = []
@@ -113,5 +100,4 @@ class JinaCrossEncoderReranker(Generic[MetaT]):
                 node.score_kind = "rerank"
                 reranked_nodes.append(node)
 
-        combined = non_rerankable + reranked_nodes
-        return combined[:top_n] if top_n else combined
+        return non_rerankable + (reranked_nodes[:top_n] if top_n else reranked_nodes)

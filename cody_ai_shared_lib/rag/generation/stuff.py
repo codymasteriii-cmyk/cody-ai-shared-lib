@@ -18,8 +18,6 @@ class GenerationContext:
     usage_tracker: UsageTracker
     degradation_tracker: DegradationTracker
     budget_guard: BudgetGuard | None = None
-    request_id: str = ""
-    tenant_or_user_id: str | None = None
     stage: str = "generation"
 
 
@@ -55,8 +53,6 @@ class StuffStrategy:
             "budget_guard": ctx.budget_guard,
             "temperature": self.profile.generation.temperature,
             "cache_breakpoints": prompt.cache_breakpoints,
-            "request_id": ctx.request_id,
-            "tenant_or_user_id": ctx.tenant_or_user_id,
         }
 
     def generate(self, prompt: AssembledPrompt[Any], ctx: GenerationContext) -> LLMResult:

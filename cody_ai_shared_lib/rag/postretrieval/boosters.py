@@ -67,7 +67,8 @@ class ScoreFusionStage(Generic[MetaT]):
     def process(self, nodes: list[RAGNode[MetaT]], ctx: Any) -> list[RAGNode[MetaT]]:
         return self.fuse(nodes, renderer=ctx.renderer, clock=ctx.deadline.clock)
 
-    def __init__(self, weights: dict[str, float] | None = None):
+    def __init__(self, weights: dict[str, float] | None = None, feature: str | None = None):
+        self.feature = feature  # one named app feature, e.g. score_fusion(confidence); None uses them all
         self.weights = dict(weights or {
             "semantic": 0.5,
             "keyword": 0.2,
@@ -127,6 +128,8 @@ class ScoreFusionStage(Generic[MetaT]):
         feat_scores: list[float] = []
         for node in node_list:
             features = view.features(node.metadata)
+            if self.feature is not None:
+                features = {k: v for k, v in features.items() if k == self.feature}
             feat_scores.append(sum(features.values()) / len(features) if features else 0.5)
         norm_f = self._min_max_normalize(feat_scores)
 

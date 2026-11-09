@@ -28,6 +28,7 @@ from .models import (
     RAGFilterSpec,
     RAGNode,
     SourceSpan,
+    as_utc,
 )
 from .ports import (
     EmbeddingSpace,
@@ -62,7 +63,6 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             supports_local_window=True,
             supports_full_scope_fetch=True,
             supports_sequential_boundary=True,
-            supports_hydration=True,
             supports_fetch_nodes=True,
             supports_fingerprints=True,
             supports_delete=True,
@@ -182,9 +182,9 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                     extra.get(date_field) if isinstance(extra, dict) else None
                 )
             if node_dt is not None and isinstance(node_dt, datetime):
-                if dt_start is not None and node_dt < dt_start:
+                if dt_start is not None and as_utc(node_dt) < as_utc(dt_start):
                     return False
-                if dt_end is not None and node_dt > dt_end:
+                if dt_end is not None and as_utc(node_dt) > as_utc(dt_end):
                     return False
 
         # custom filters
@@ -220,11 +220,9 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
 
     @staticmethod
     def _matches_group(tokens: list[str], group: TokenGroup) -> bool:
-        """Apply one token group: any, all, or adjacent in order (§6.1)."""
+        """Apply one token group: any token, or all of them adjacent and in order (§6.1)."""
         if group.mode == "any":
             return bool(set(group.tokens) & set(tokens))
-        if group.mode == "all":
-            return set(group.tokens) <= set(tokens)
         size = len(group.tokens)
         return any(tokens[i:i + size] == group.tokens for i in range(len(tokens) - size + 1))
 
@@ -456,7 +454,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
 
             if window_start is None:
                 return []
-            window_node = RAGNode[MetaT](
+            window_node = RAGNode(
                 node_id=f"window_{doc_id}_{window_start}_{position}",
                 text="".join(window_parts),
                 span=SourceSpan(doc_id=doc_id, char_start=window_start, char_end=position),
@@ -468,16 +466,18 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
     def scope_stats(self, filters: RAGFilterSpec) -> ScopeStats:
         self._validate_filters(filters)
         with self._lock:
-            matched_nodes = [n for n in self._nodes.values() if self._passes_filters(n, filters)]
+            matched_nodes = [
+                n for n in self._nodes.values() if self._passes_filters(n, filters) and not n.is_summary
+            ]
             docs = {n.span.doc_id for n in matched_nodes}
             char_count = sum(len(n.text) for n in matched_nodes)
             est_tok = sum(
                 n.token_estimate if (n.token_estimate is not None and n.token_estimate > 0) else estimate_tokens(n.text)
                 for n in matched_nodes
             )
-            has_sums = any(
-                self._passes_filters(s, filters) for s in self._section_summaries.values()
-            ) or any(n.is_summary or n.granularity == "parent_summary" for n in matched_nodes)
+            has_sums = any(self._passes_filters(s, filters) for s in self._section_summaries.values()) or any(
+                n.is_summary and self._passes_filters(n, filters) for n in self._nodes.values()
+            )
             revision = f"rev_{self._revision_counter}_{len(matched_nodes)}"
             return ScopeStats(
                 doc_count=len(docs),
@@ -502,19 +502,12 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         self._validate_filters(filters)
         with self._lock:
             results: list[RAGNode[MetaT]] = []
+            summaries = {s.node_id: s for s in self._section_summaries.values()}
             for nid in node_ids:
-                node = self._nodes.get(nid)
+                node = self._nodes.get(nid) or summaries.get(nid)
                 if node and self._passes_filters(node, filters):
                     results.append(copy.deepcopy(node))
             return results
-
-    def hydrate(self, node_ids: list[str], projection: str) -> dict[str, MetaT]:
-        with self._lock:
-            return {
-                nid: copy.deepcopy(self._nodes[nid].metadata)
-                for nid in node_ids
-                if nid in self._nodes
-            }
 
     # ── Lifecycle Methods (§4.4) ───────────────────────────────────────────────
 

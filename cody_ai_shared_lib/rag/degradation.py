@@ -67,10 +67,10 @@ AGREED_DEGRADATIONS: dict[str, dict[str, Any]] = {
     },
     "DG-08": {
         "stage": "ingestion",
-        "description": "Some nodes in section embed to zero",
+        "description": "Some nodes in a prepare_nodes batch fail to embed",
         "default": "on",
         "log_level": logging.ERROR,
-        "fallback": "skip_failed_nodes",
+        "fallback": "return_the_rest",
     },
     "DG-09": {
         "stage": "generation",

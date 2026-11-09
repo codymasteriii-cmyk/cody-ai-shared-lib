@@ -70,7 +70,7 @@ def test_ingest_document_resumable_and_append_only():
     )
 
     assert callbacks_fired == [2, 3]
-    assert progress.sections_completed == 2
+    assert progress.sections_completed == 4  # includes the sections earlier runs finished
     assert progress.passages_upserted > 0
 
     # Earlier sections 0 and 1 were not ingested
@@ -220,7 +220,7 @@ def test_ingestion_budget_guard():
 
 
 def test_prepare_nodes_parity():
-    """AC-RAG-71: prepare_nodes computes vector, fingerprint, tokens without store write; failed returns []."""
+    """AC-RAG-71: prepare_nodes returns the good nodes with fingerprints and names the failed ones, without writing."""
     engine, store, mock_gw = _make_engine_and_store()
 
     nodes = [
@@ -245,17 +245,19 @@ def test_prepare_nodes_parity():
         usage=MagicMock(input_tokens=20, cost_usd=0.0001, cached_tokens=0, price_table_version="v2026-11-08", estimated=False),
     )
 
-    prepared = engine.prepare_nodes(nodes)
-    assert len(prepared) == 2
+    batch = engine.prepare_nodes(nodes)
+    assert len(batch.prepared) == 1
 
     # Node 1 succeeded
-    assert len(prepared[0].vector) == 768
-    assert prepared[0].fingerprint.content_hash is not None
-    assert prepared[0].fingerprint.embedding_signature is not None
-    assert prepared[0].node.token_estimate is not None
+    assert batch.prepared[0].node.node_id == "prep-1"
+    assert len(batch.prepared[0].vector) == 768
+    assert batch.prepared[0].fingerprint.content_hash is not None
+    assert batch.prepared[0].fingerprint.embedding_signature is not None
+    assert batch.prepared[0].node.token_estimate is not None
 
-    # Node 2 failed: vector is [] (never zero vector, AC-RAG-71)
-    assert prepared[1].vector == []
+    # Node 2 failed: it is named, and has no vector or fingerprint to store
+    assert [failed.node_id for failed in batch.failed] == ["prep-2"]
+    assert any(d.id == "DG-08" for d in batch.degradations)
 
     # Store was not written
     assert len(store.get_fingerprints("d1")) == 0

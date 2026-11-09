@@ -20,6 +20,7 @@ from .errors import (
 )
 from .gateway import ModelGateway
 from .generation import StuffStrategy
+from .generation.stuff import GenerationStrategy
 from .granularity import (
     BUILTIN_GRANULARITIES,
     TRAIT_ATOMIC,
@@ -50,7 +51,7 @@ from .ingestion import (
 )
 from .integrations.sse import format_event
 from .intent import (
-    AutoRouter,
+    HybridIntentRouter,
     HeuristicIntentRouter,
     HeuristicRouter,
     IntentRouter,
@@ -58,7 +59,7 @@ from .intent import (
     LLMIntentRouter,
     PassthroughRouter,
     RouterContext,
-    TemporalExtractor,
+    TemporalResolver,
     clamp_intent,
 )
 from .memory_store import InMemoryRAGStore
@@ -69,11 +70,13 @@ from .models import (
     DefaultNodeMeta,
     Degradation,
     ExtT,
+    FailedNode,
     FilterPatch,
     IngestionProgress,
     MetaT,
     NodeRef,
     NoIntentExt,
+    PreparedBatch,
     PreparedNode,
     QueryIntent,
     QueryPlan,
@@ -101,12 +104,15 @@ from .ports import (
     ScopeStats,
     StoreCapabilities,
 )
-from .postgen import CitationExtractor, OutputSanitizer, QuoteVerifier
+from .postgen import CitationExtractor, OutputSanitizer, QuoteValidator
+from .postgen.citations import CitationFormatter, RefCitationFormatter, strip_markers
 from .postretrieval import (
     IdentityDeduplicator,
     JinaCrossEncoderReranker,
     OffsetDeduplicator,
+    PostRetrievalStage,
     RecencyBooster,
+    Reranker,
     ScoreFusionStage,
     ThresholdFilter,
 )
@@ -141,21 +147,27 @@ from .runtime import (
     make_bounded_pool,
 )
 from .strategies import (
-    AdaptiveStrategy,
+    AdaptiveRetrievalStrategy,
     DenseVectorStrategy,
     FullContextStrategy,
-    HierarchicalStrategy,
+    HierarchicalSummaryStrategy,
     HybridRRFStrategy,
     KeywordFirstStrategy,
     KeywordOnlyStrategy,
-    QueryVariant,
     RetrievalContext,
     RetrievalStrategy,
-    SecondaryQueryFanOut,
-    fair_interleave,
 )
-from .text.analyzer import CjkAwareAnalyzer, TextAnalyzer, estimate_tokens, is_cjk_char, tokenize_query_groups
+from .text.analyzer import (
+    CjkAwareAnalyzer,
+    TextAnalyzer,
+    TokenGroup,
+    build_tsquery,
+    estimate_tokens,
+    is_cjk_char,
+    tokenize_query_groups,
+)
 from .trace import ObserverDispatcher, RAGObserver, RAGTrace, StageRecord
+from .transforms import QueryTransform, QueryVariant, SecondaryQueryFanOut, TransformContext, fair_interleave, fuse_variants
 from .usage import BudgetGuard, CallContext, UsageTracker
 
 # The built-in components, for apps that share one registry (§8.8)
@@ -212,6 +224,8 @@ __all__ = [
     "RAGDocumentInput",
     "RAGSectionInput",
     "PreparedNode",
+    "PreparedBatch",
+    "FailedNode",
     "IngestionProgress",
     "ReindexStatus",
     "RetrievalDiff",
@@ -283,7 +297,7 @@ __all__ = [
     "RAGStream",
     "format_event",
     "QueryPlan",
-    "TemporalExtractor",
+    "TemporalResolver",
     "HeuristicRouter",
     "JevGateRouter",
     "LLMIntentRouter",
@@ -292,34 +306,43 @@ __all__ = [
     "RouterContext",
     "PassthroughRouter",
     "HeuristicIntentRouter",
-    "AutoRouter",
+    "HybridIntentRouter",
     # Context, Generation, Postgen, Postretrieval, Strategies, Ingestion, Testing
     "ContextAssembler",
     "ContextFencer",
     "ConversationManager",
     "TokenBudgeter",
+    "GenerationStrategy",
     "StuffStrategy",
+    "CitationFormatter",
+    "RefCitationFormatter",
+    "strip_markers",
     "CitationExtractor",
-    "QuoteVerifier",
+    "QuoteValidator",
     "OutputSanitizer",
+    "PostRetrievalStage",
+    "Reranker",
     "ThresholdFilter",
     "IdentityDeduplicator",
     "OffsetDeduplicator",
     "JinaCrossEncoderReranker",
     "RecencyBooster",
     "ScoreFusionStage",
+    "QueryTransform",
+    "TransformContext",
     "QueryVariant",
     "RetrievalContext",
     "RetrievalStrategy",
     "FullContextStrategy",
     "DenseVectorStrategy",
     "HybridRRFStrategy",
-    "HierarchicalStrategy",
+    "HierarchicalSummaryStrategy",
     "KeywordOnlyStrategy",
     "KeywordFirstStrategy",
-    "AdaptiveStrategy",
+    "AdaptiveRetrievalStrategy",
     "SecondaryQueryFanOut",
     "fair_interleave",
+    "fuse_variants",
     "PassThroughSplitter",
     "SentenceSplitter",
     "SplitChunk",
@@ -332,4 +355,6 @@ __all__ = [
     "is_cjk_char",
     "estimate_tokens",
     "tokenize_query_groups",
+    "TokenGroup",
+    "build_tsquery",
 ]

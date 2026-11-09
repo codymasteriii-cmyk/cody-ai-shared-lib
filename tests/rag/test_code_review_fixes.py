@@ -1,12 +1,12 @@
 """Tests verifying all code review fixes across Phases P1-P3:
-  - Runtime bug fixes: ContextAssembler & AutoRouter with multi-turn ConversationState/history;
+  - Runtime bug fixes: ContextAssembler & HybridIntentRouter with multi-turn ConversationState/history;
     InMemoryRAGStore.scope_stats() token estimation when token_estimate is unset;
     RAGNode(span=..., doc_id=...) alias population;
     RecencyBooster with NodeRenderer.timestamp(node.metadata).
   - Security & Guard fixes: per-turn guard parameterization from request.filters (SequentialBoundaryGuard,
     TenantGuard, ScopeGuard, TemporalGuard); pre-store validation of required_filter_keys and
     supported_custom_filters; ContextFencer zero-width and U+2039 scrubbing;
-    CitationExtractor unverified marker stripping/flagging; QuoteVerifier fabricated quote detection;
+    CitationExtractor unverified marker stripping/flagging; QuoteValidator fabricated quote detection;
     OutputSanitizer external link stripping against allowed_link_hosts.
   - Missing Phase 1-3 deliverables: RAGEngine.generate_from_nodes, RAGEngine.verify_answer,
     RAGEngine.with_profile, InMemoryRAGStore.to_jsonl / from_jsonl, InMemoryLRUCache & query embedding
@@ -20,7 +20,7 @@ import pytest
 from cody_ai_shared_lib.embedding import EmbeddingResult, EmbeddingUsage
 from cody_ai_shared_lib.llm import LLMResult, LLMUsage
 from cody_ai_shared_lib.rag import (
-    AutoRouter,
+    HybridIntentRouter,
     ChatTurn,
     CitationConfig,
     CitationExtractor,
@@ -44,7 +44,7 @@ from cody_ai_shared_lib.rag import (
     OutputSanitizer,
     ProfileConfigError,
     QueryIntent,
-    QuoteVerifier,
+    QuoteValidator,
     RAGEngine,
     RAGFilterSpec,
     RAGNode,
@@ -55,7 +55,7 @@ from cody_ai_shared_lib.rag import (
     RouterContext,
     SourceSpan,
     StoreCapabilities,
-    TemporalExtractor,
+    TemporalResolver,
     TokenBudgeter,
     UnsupportedFilterError,
     UsageTracker,
@@ -76,7 +76,7 @@ def _dummy_vec(val: float = 0.5) -> list[float]:
 
 
 def test_context_assembler_and_auto_router_with_conversation_history():
-    """Verify ContextAssembler and AutoRouter handle multi-turn history without AttributeError."""
+    """Verify ContextAssembler and HybridIntentRouter handle multi-turn history without AttributeError."""
     models = ModelBindings(summary=["gemini-3.5-flash-lite"], generation=["gemini-3.8-flash"], intent=["gemini-3.5-flash-lite"], embedding="gemini-embedding-2")
     profile = long_form_reader(models)
     assembler = ContextAssembler(profile=profile, renderer=DefaultRenderer())
@@ -109,17 +109,16 @@ def test_context_assembler_and_auto_router_with_conversation_history():
     assert "Alice opened the mysterious door." in user_p
     assert len(breakpoints) >= 1
 
-    # AutoRouter with history and LLM rewriter
+    # HybridIntentRouter with history and LLM rewriter
     mock_gw = MagicMock()
     mock_gw.generate.return_value = MagicMock(
         text='{"route": "rag", "scope": "local_lookup", "search_query": "Alice next action", "is_followup": true}'
     )
     llm_router = LLMIntentRouter(gateway=mock_gw, models=["gemini-3.5-flash-lite"])
-    auto_router = AutoRouter(
-        gateway=mock_gw,
+    auto_router = HybridIntentRouter(
         heuristic=HeuristicRouter(),
         llm_router=llm_router,
-        temporal_extractor=TemporalExtractor(),
+        temporal_resolver=TemporalResolver(),
     )
     ctx = RouterContext(
         usage_tracker=UsageTracker("req-1"),
@@ -209,7 +208,7 @@ def test_pre_store_filter_validation_missing_scope_and_unsupported_custom():
         engine.retrieve(
             RAGQueryRequest(
                 question="test",
-                filters=RAGFilterSpec(tenant_id="t1", custom={"unknown_key": "val"}),
+                filters=RAGFilterSpec(tenant_or_user_id="t1", custom={"unknown_key": "val"}),
             )
         )
 
@@ -222,12 +221,12 @@ def test_fencer_zero_width_and_u2039_scrubbing():
     cleaned = fencer.sanitize_content(attack)
     assert "</data-12345>" not in cleaned
     assert "\u200b" not in cleaned
-    assert "<sanitized-data" in cleaned
-    assert "<sanitized-question" in cleaned
+    assert "\u2039/data-12345>" in cleaned
+    assert "\u2039/question-abc>" in cleaned
 
 
 def test_citation_extractor_unverified_and_quote_verifier_fabricated():
-    """Verify CitationExtractor strips/flags out-of-range [99] and QuoteVerifier catches fabricated quotes."""
+    """Verify CitationExtractor strips/flags out-of-range [99] and QuoteValidator catches fabricated quotes."""
     node = RAGNode(
         node_id="n1",
         text="The treaty was signed in Geneva in 1954.",
@@ -248,8 +247,8 @@ def test_citation_extractor_unverified_and_quote_verifier_fabricated():
     clean_fl, _ = ext_flag.extract("Signed in Geneva [1] and ratified later [99].", [node])
     assert "[?]" in clean_fl
 
-    # 3. QuoteVerifier detects fabricated quote in answer_text vs real quote
-    verifier = QuoteVerifier(threshold=0.85)
+    # 3. QuoteValidator detects fabricated quote in answer_text vs real quote
+    verifier = QuoteValidator(threshold=0.85)
     ans_fabricated = 'The document states "The treaty was completely rejected in Paris in 1999" [1].'
     clean_fab, cites_fab = ext_filter.extract(ans_fabricated, [node])
     verified_cites, cov = verifier.verify(cites_fab, [node], answer_text=clean_fab)
@@ -416,6 +415,7 @@ def test_tokenize_query_groups_and_recency_booster_renderer_metadata():
         query="人工智能 development",
         exact_terms=["GPT-6"],
         entity_terms=["OpenAI"],
+        entity_mode="require",
     )
     assert len(groups) >= 3
     assert any(g.origin == "exact_term" for g in groups)

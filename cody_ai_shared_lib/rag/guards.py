@@ -15,6 +15,7 @@ from .models import (
     RAGCitation,
     RAGFilterSpec,
     RAGNode,
+    as_utc,
 )
 from .text.analyzer import CjkAwareAnalyzer, TextAnalyzer
 
@@ -158,9 +159,9 @@ class TemporalGuard:
                 extra.get(self.date_field) if isinstance(extra, dict) else None
             )
         if node_dt is not None and isinstance(node_dt, datetime):
-            if dt_start is not None and node_dt < dt_start:
+            if dt_start is not None and as_utc(node_dt) < as_utc(dt_start):
                 return None
-            if dt_end is not None and node_dt > dt_end:
+            if dt_end is not None and as_utc(node_dt) > as_utc(dt_end):
                 return None
         return node
 

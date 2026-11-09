@@ -1,34 +1,31 @@
-"""Retrieval pipeline: filters, strategy, post-stages, relaxation, hydration, guards (§5.3, §7.6, §8, §9)."""
+"""Retrieval pipeline: filters, strategy, follow-up reuse, post-stages, relaxation, guards (§5.3, §7.6, §7.7, §8, §9)."""
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Generic, Literal, TypeVar
+from typing import Any, Callable, Generic, Literal
 
-from .errors import (
-    EmbeddingSignatureMismatch,
-    ProfileConfigError,
-    RAGEngineError,
-    RetrievalError,
-)
+from .context.conversation import FollowupTermCheck, reusable_node_ids
+from .errors import EmbeddingSignatureMismatch, ProfileConfigError
+from .granularity import is_ranked, limit_ranked
 from .guards import BUILTIN_GUARDS, build_turn_guards
 from .models import MetaT, QueryIntent, RAGFilterSpec, RAGNode, RAGQueryRequest, RAGRetrievalResult
-from .ports import Guard, RAGStore, validate_scope
+from .ports import Guard, RAGStore, call_store, validate_scope
 from .registry import ComponentDeps, split_component_name
 from .runtime import RequestRun
-from .strategies.context import QueryVariant, RetrievalContext, RetrievalStrategy
+from .strategies.context import RetrievalContext, RetrievalStrategy
 from .strategies.relaxation import RelaxationState, build_relaxation
-from .strategies.transforms import fuse_variants
+from .transforms import QueryVariant, TransformContext, fair_interleave, fuse_variants
 
 logger = logging.getLogger("shared-rag.retrieval")
 
-T = TypeVar("T")
+# The stage the engine always runs itself; naming it in a profile changes nothing (§9).
+ENGINE_OWNED_STAGES = frozenset({"guard_enforcement"})
 
-# Stages the engine always runs itself; naming them in a profile changes nothing (§9).
-ENGINE_OWNED_STAGES = frozenset({"hydrate", "guard_enforcement"})
+CONVERSATION_REUSE = "conversation_reuse"
 
 
 class RetrievalPipeline(Generic[MetaT]):
-    """Turns a request and intent into guarded, ranked, hydrated nodes."""
+    """Turns a request and intent into guarded, ranked nodes."""
 
     def __init__(
         self,
@@ -53,6 +50,7 @@ class RetrievalPipeline(Generic[MetaT]):
         self.stages = [self._build_stage(name) for name in self.profile.post_stages if name not in ENGINE_OWNED_STAGES]
         self.transforms = [self.registry.get("transform", name)(deps) for name in self.profile.transforms]
         self.relaxation_steps = [build_relaxation(step, self.registry) for step in self.profile.retrieval.relaxation]
+        self.followup_terms = FollowupTermCheck(deps.analyzer)
 
     def _build_stage(self, configured: str) -> Any:
         name, argument = split_component_name(configured)
@@ -63,11 +61,12 @@ class RetrievalPipeline(Generic[MetaT]):
 
     def effective_filters(self, request: RAGQueryRequest, intent: QueryIntent | None) -> RAGFilterSpec:
         """Combine request filters, the cosine floor and the intent's soft date window (§5.5, §9.1)."""
-        filters = request.filters.model_copy(deep=True)
-        if request.tenant_id and not filters.tenant_or_user_id:
-            filters.tenant_or_user_id = request.tenant_id
-        if request.document_id and not filters.doc_ids:
-            filters.doc_ids = [request.document_id]
+        filters = request.filters.patch(
+            {
+                "tenant_or_user_id": request.tenant_id,
+                "doc_ids": [request.document_id] if request.document_id else None,
+            }
+        )
 
         floor = self.profile.retrieval.min_similarity
         if floor is not None:
@@ -136,17 +135,14 @@ class RetrievalPipeline(Generic[MetaT]):
         ctx.variants = self._variants(request, intent, run)
         strategy = self._resolve_strategy(request)
         stages = self._stages_for(request)
+        ctx.rerank_active = any(stage.name == "rerank" for stage in stages)
 
         nodes = self._execute(ctx, strategy, stages, guards, run)
         nodes, ctx, relaxations = self._relax(nodes, ctx, strategy, stages, guards, soft_date, request, run)
 
-        if ctx.last_strategy_used != "full_context":
-            limit = ctx.target_limit()
-            ctx.truncated = ctx.truncated or len(nodes) > limit
-            nodes = nodes[:limit]
-
-        nodes = self._hydrate(nodes, run)
-        nodes = self._enforce_guards(nodes, guards, "guard_enforcement", run)
+        limited = limit_ranked(nodes, ctx.target_limit())
+        ctx.truncated = ctx.truncated or len(limited) < len(nodes)
+        nodes = self._enforce_guards(limited, guards, run)
 
         run.trace.tier_decision_reason = ctx.last_tier_reason
         run.trace.scope_revision = ctx.scope_revision
@@ -223,8 +219,17 @@ class RetrievalPipeline(Generic[MetaT]):
         primary = QueryVariant(text=intent.search_query or request.question, weight=1.0, origin="primary")
         variants = [primary]
         seen = {primary.text}
+        context = TransformContext(
+            profile=self.profile,
+            analyzer=self.deps.analyzer,
+            gateway=self.deps.gateway,
+            usage_tracker=run.usage,
+            degradation_tracker=run.degradations,
+            deadline=run.deadline,
+            budget_guard=self.budget_guard,
+        )
         for transform in self.transforms:
-            for variant in transform.transform(request, intent):
+            for variant in transform.transform(request, intent, context):
                 if variant.text not in seen:
                     seen.add(variant.text)
                     variants.append(variant)
@@ -253,20 +258,27 @@ class RetrievalPipeline(Generic[MetaT]):
         guards: list[Guard],
         run: RequestRun,
     ) -> list[RAGNode[MetaT]]:
-        """Run the strategy and every stage, with guards after each one (§5.3)."""
-        started = run.trace.elapsed_ms()
-        nodes = self._fetch(ctx, strategy)
-        run.trace.record_stage(
-            name=ctx.last_strategy_used or strategy.name,
-            kind="strategy",
-            started_ms=started,
-            version=strategy.version,
-            out_count=len(nodes),
-            notes={"reason": ctx.last_tier_reason},
-            nodes=nodes,
-        )
-        nodes = self._enforce_guards(nodes, guards, "strategy", run)
-        nodes = self._reuse_prior_nodes(nodes, ctx, guards, run)
+        """Find candidates, then run every stage, with guards after each one (§5.3)."""
+        prior, complete = self._prior_nodes(ctx, guards, run)
+        if complete and self._reuse_alone_suffices(ctx, prior):
+            ctx.last_strategy_used = CONVERSATION_REUSE
+            ctx.last_tier_reason = f"{CONVERSATION_REUSE}: follow-up introduces no new terms"
+            nodes = prior
+        else:
+            started = run.trace.elapsed_ms()
+            ctx.last_strategy_used = ""
+            nodes = self._fetch(ctx, strategy)
+            ctx.last_strategy_used = ctx.last_strategy_used or strategy.name
+            run.trace.record_stage(
+                name=ctx.last_strategy_used,
+                kind="strategy",
+                started_ms=started,
+                version=strategy.version,
+                out_count=len(nodes),
+                notes={"reason": ctx.last_tier_reason},
+                nodes=nodes,
+            )
+            nodes = self._merge_prior(self._enforce_guards(nodes, guards, run), prior, ctx)
 
         for stage in stages:
             budget_key = getattr(stage, "deadline_budget_key", None)
@@ -276,7 +288,7 @@ class RetrievalPipeline(Generic[MetaT]):
                     continue
             started = run.trace.elapsed_ms()
             in_count = len(nodes)
-            nodes = self._store_call(stage.name, lambda: stage.process(nodes, ctx))
+            nodes = call_store(stage.name, lambda: stage.process(nodes, ctx))
             run.trace.record_stage(
                 name=stage.name,
                 kind="post_stage",
@@ -286,18 +298,18 @@ class RetrievalPipeline(Generic[MetaT]):
                 out_count=len(nodes),
                 nodes=nodes,
             )
-            nodes = self._enforce_guards(nodes, guards, stage.name, run)
+            nodes = self._enforce_guards(nodes, guards, run)
         return nodes
 
     def _fetch(self, ctx: RetrievalContext[MetaT], strategy: RetrievalStrategy[MetaT]) -> list[RAGNode[MetaT]]:
         if len(ctx.variants) <= 1:
-            return self._store_call(strategy.name, lambda: strategy.retrieve(ctx))
+            return call_store(strategy.name, lambda: strategy.retrieve(ctx))
 
         def run_variant(variant: QueryVariant) -> tuple[list[RAGNode[MetaT]], RetrievalContext[MetaT]]:
             intent = ctx.intent.model_copy(update={"search_query": variant.text})
             # Already on a pool worker: a strategy that waited on this pool could deadlock it
             variant_ctx = ctx.model_copy(update={"intent": intent, "pool": None})
-            return self._store_call(strategy.name, lambda: strategy.retrieve(variant_ctx)), variant_ctx
+            return call_store(strategy.name, lambda: strategy.retrieve(variant_ctx)), variant_ctx
 
         futures = [self.pool.submit(run_variant, variant) for variant in ctx.variants]
         results = [future.result() for future in futures]
@@ -308,29 +320,65 @@ class RetrievalPipeline(Generic[MetaT]):
                 ctx.last_rule = variant_ctx.last_rule
                 ctx.scope_revision = variant_ctx.scope_revision
                 break
-        return fuse_variants(
-            [nodes for nodes, _ in results],
+        # Only ranked nodes compete across variants; every variant sees the same ordered layers
+        ordered: dict[str, RAGNode[MetaT]] = {}
+        for nodes, _ in results:
+            for node in nodes:
+                if not is_ranked(node):
+                    ordered.setdefault(node.node_id, node)
+        ranked = fuse_variants(
+            [[node for node in nodes if is_ranked(node)] for nodes, _ in results],
             [variant.weight for variant in ctx.variants],
-            ctx.target_limit(),
+            ctx.candidate_limit(),
             ctx.profile.retrieval.rrf_k,
         )
+        return [*ordered.values(), *ranked]
 
-    def _reuse_prior_nodes(
+    def _prior_nodes(
         self,
-        nodes: list[RAGNode[MetaT]],
         ctx: RetrievalContext[MetaT],
         guards: list[Guard],
         run: RequestRun,
-    ) -> list[RAGNode[MetaT]]:
-        """Re-fetch a follow-up's prior nodes under the current filters and guards (§7.7)."""
+    ) -> tuple[list[RAGNode[MetaT]], bool]:
+        """Re-fetch a follow-up's earlier nodes, newest first, under the current filters and guards (§7.7).
+
+        Also returns whether every earlier node came back; one that is gone or now hidden needs a fresh search.
+        """
         state = ctx.request.state
         if not (ctx.intent.is_followup and state and state.prior_nodes and self.store.capabilities().supports_fetch_nodes):
-            return nodes
-        prior_ids = [ref.node_id for ref in state.prior_nodes]
-        fetched = self._store_call("fetch_nodes", lambda: self.store.fetch_nodes(prior_ids, ctx.filters))
-        reused = self._enforce_guards(fetched, guards, "reuse", run)
-        seen = {n.node_id for n in nodes}
-        return [n for n in reused if n.node_id not in seen] + nodes
+            return [], False
+        limits = self.profile.context
+        prior_ids = reusable_node_ids(state, limits.reused_turns, limits.max_reused_nodes)
+        fetched = call_store("fetch_nodes", lambda: self.store.fetch_nodes(prior_ids, ctx.filters))
+        position = {node_id: index for index, node_id in enumerate(prior_ids)}
+        fetched.sort(key=lambda node: position.get(node.node_id, len(position)))
+        guarded = self._enforce_guards(fetched, guards, run)
+        return guarded, len(guarded) == len(prior_ids)
+
+    def _reuse_alone_suffices(self, ctx: RetrievalContext[MetaT], prior: list[RAGNode[MetaT]]) -> bool:
+        """True when a search would add nothing. Ordered layers and a reading position must stay current."""
+        if ctx.request.cursor_offset is not None or not prior or not all(is_ranked(node) for node in prior):
+            return False
+        query = " ".join([ctx.intent.search_query or ctx.request.question, *ctx.intent.exact_terms, *ctx.intent.entity_terms])
+        return not self.followup_terms.introduces_new_terms(query, (self.deps.renderer.prompt_text(n) for n in prior))
+
+    def _merge_prior(
+        self,
+        fresh: list[RAGNode[MetaT]],
+        prior: list[RAGNode[MetaT]],
+        ctx: RetrievalContext[MetaT],
+    ) -> list[RAGNode[MetaT]]:
+        """Give earlier and new passages a fair share of the ranked slots (§7.7)."""
+        ranked_prior = [node for node in prior if is_ranked(node)]
+        if not ranked_prior:
+            return fresh
+        ordered = [node for node in fresh if not is_ranked(node)]
+        ranked_fresh = [node for node in fresh if is_ranked(node)]
+        limit = ctx.candidate_limit() if ctx.rerank_active else ctx.target_limit()
+        merged = fair_interleave([ranked_prior, ranked_fresh], limit)
+        distinct = {node.node_id for node in [*ranked_prior, *ranked_fresh]}
+        ctx.truncated = ctx.truncated or len(distinct) > len(merged)
+        return [*ordered, *merged]
 
     def _relax(
         self,
@@ -346,8 +394,11 @@ class RetrievalPipeline(Generic[MetaT]):
         """Walk the opt-in ladder while results are too few; hard limits stay out of reach (§7.6)."""
         applied: list[str] = []
         state = RelaxationState(ctx.filters, ctx.intent, soft_date, request.filters.min_similarity)
+        budget = self.profile.runtime.stage_budgets.get("relaxation", 0.0)
         for step in self.relaxation_steps:
             if len(nodes) >= self.profile.retrieval.min_results_before_relax:
+                break
+            if run.degradations.skip_for_deadline(run.deadline, f"relaxation:{step.label}", budget):
                 break
             relaxed = step.apply(state)
             if relaxed is None:
@@ -359,41 +410,13 @@ class RetrievalPipeline(Generic[MetaT]):
                 applied.append(step.label)
         return nodes, ctx, applied
 
-    def _hydrate(self, nodes: list[RAGNode[MetaT]], run: RequestRun) -> list[RAGNode[MetaT]]:
-        if not nodes or not self.store.capabilities().supports_hydration:
-            return nodes
-        started = run.trace.elapsed_ms()
-        projection = self.profile.hydration_projection
-        metadata = self._store_call("hydrate", lambda: self.store.hydrate([n.node_id for n in nodes], projection=projection))
-        for node in nodes:
-            if node.node_id in metadata:
-                node.metadata = metadata[node.node_id]
-                node.hydrated = True
-        run.trace.record_stage("hydrate", "post_stage", started, in_count=len(nodes), out_count=len(metadata))
-        return nodes
-
     def _enforce_guards(
         self,
         nodes: list[RAGNode[MetaT]],
         guards: list[Guard],
-        point: str,
         run: RequestRun,
     ) -> list[RAGNode[MetaT]]:
         return apply_guards(nodes, guards, run.trace.record_guard_effect)
-
-    @staticmethod
-    def _store_call(operation: str, call: Callable[[], T]) -> T:
-        """Typed engine errors pass through; anything else from a store becomes RetrievalError (§13.3)."""
-        try:
-            return call()
-        except RAGEngineError:
-            raise
-        except Exception as exc:
-            raise RetrievalError(
-                f"Retrieval operation '{operation}' failed: {type(exc).__name__}",
-                stage="retrieval",
-                cause=exc,
-            ) from exc
 
 
 def apply_guards(

@@ -5,6 +5,8 @@ granularity names (D-15).
 """
 from __future__ import annotations
 
+from typing import Any
+
 # Built-in trait names
 TRAIT_ATOMIC = "atomic"
 TRAIT_ORDERED = "ordered"
@@ -53,3 +55,21 @@ _DEFAULT_REGISTRY = GranularityRegistry()
 register_granularity = _DEFAULT_REGISTRY.register_granularity
 get_traits = _DEFAULT_REGISTRY.get_traits
 has_trait = _DEFAULT_REGISTRY.has_trait
+
+
+def is_ranked(node: Any) -> bool:
+    """True for nodes competing on relevance; ordered layers have token budgets instead (§9.2, §10.1)."""
+    return not has_trait(node.granularity, TRAIT_ORDERED)
+
+
+def limit_ranked(nodes: list[Any], limit: int) -> list[Any]:
+    """Keep at most `limit` ranked nodes, leaving every ordered node in place."""
+    kept: list[Any] = []
+    ranked = 0
+    for node in nodes:
+        if is_ranked(node):
+            if ranked >= limit:
+                continue
+            ranked += 1
+        kept.append(node)
+    return kept

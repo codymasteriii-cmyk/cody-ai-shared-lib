@@ -5,7 +5,7 @@ Pydantic v2 models per §3.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Generic, Literal, TypeVar
 from pydantic import BaseModel, Field, model_validator
 
@@ -30,6 +30,11 @@ class FilterPatch(BaseModel):
 MetaT = TypeVar("MetaT", bound=BaseModel, default=DefaultNodeMeta)
 ExtT = TypeVar("ExtT", bound=BaseModel, default=NoIntentExt)
 
+
+def as_utc(value: datetime) -> datetime:
+    """Treat a naive datetime as UTC, so naive and aware values can be compared (§5.1)."""
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
 ScoreKind = Literal["cosine", "bm25", "rrf", "rerank", "fused", "none"]
 
 
@@ -45,7 +50,6 @@ class SourceSpan(BaseModel):
     breadcrumb: list[str] = Field(default_factory=list)
     char_start: int = 0
     char_end: int = 0
-    position_ratio: float = 0.0
 
 
 class RAGNode(BaseModel, Generic[MetaT]):
@@ -75,7 +79,6 @@ class RAGNode(BaseModel, Generic[MetaT]):
 
     embedding: list[float] | None = None
     flags: list[str] = Field(default_factory=list)
-    hydrated: bool = True
     search_tokens: list[str] | None = None
     snippet: str | None = None
     snippet_kind: Literal["match_excerpt", "summary"] | None = None
@@ -89,10 +92,21 @@ class RAGNode(BaseModel, Generic[MetaT]):
         return data
 
 
+def node_class_for(metadata: BaseModel) -> type[RAGNode[Any]]:
+    """Return the RAGNode class that accepts this metadata.
+
+    Inside the library `RAGNode[MetaT]` resolves to the TypeVar's default, which would reject an
+    app's own metadata class, so nodes built here are parametrized by the value's real type.
+    """
+    return RAGNode[type(metadata)]  # type: ignore[misc,return-value]
+
+
 # ── Filters (§3.6) ─────────────────────────────────────────────────────────────
 
 class RAGFilterSpec(BaseModel):
     """Store-level query filter specifications built from query request, guards, and intent."""
+    model_config = {"extra": "forbid"}  # a misspelled filter must fail, not silently widen the search
+
     doc_ids: list[str] | None = None
     tenant_or_user_id: str | None = None
     domain_id: str | None = None
@@ -104,32 +118,6 @@ class RAGFilterSpec(BaseModel):
     date_field: str | None = None
     min_similarity: float | None = None
     custom: dict[str, Any] = Field(default_factory=dict)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _populate_filter_aliases(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            if "tenant_or_user_id" not in data and "tenant_id" in data:
-                data["tenant_or_user_id"] = data["tenant_id"]
-            if "doc_ids" not in data and "document_ids" in data:
-                data["doc_ids"] = data["document_ids"]
-        return data
-
-    @property
-    def tenant_id(self) -> str | None:
-        return self.tenant_or_user_id
-
-    @tenant_id.setter
-    def tenant_id(self, val: str | None) -> None:
-        self.tenant_or_user_id = val
-
-    @property
-    def document_ids(self) -> list[str] | None:
-        return self.doc_ids
-
-    @document_ids.setter
-    def document_ids(self, val: list[str] | None) -> None:
-        self.doc_ids = val
 
     @property
     def is_empty_scope(self) -> bool:
@@ -148,14 +136,13 @@ class RAGFilterSpec(BaseModel):
         return copied
 
     def _narrow(self, key: str, value: Any) -> None:
-        if key in ("tenant_id", "tenant_or_user_id", "domain_id", "date_field"):
-            attr = "tenant_or_user_id" if key == "tenant_id" else key
-            current = getattr(self, attr)
+        if key in ("tenant_or_user_id", "domain_id", "date_field"):
+            current = getattr(self, key)
             if current is None:
-                setattr(self, attr, value)
+                setattr(self, key, value)
             elif current != value:
                 self.doc_ids = []
-        elif key in ("doc_ids", "document_ids"):
+        elif key == "doc_ids":
             self.doc_ids = list(value) if self.doc_ids is None else [d for d in self.doc_ids if d in value]
         elif key == "categories":
             self.categories = list(value) if self.categories is None else [c for c in self.categories if c in value]
@@ -186,6 +173,8 @@ class RAGFilterSpec(BaseModel):
             return
         old_start, old_end = self.date_range_utc
         new_start, new_end = value
+        old_start, old_end = _utc_or_none(old_start), _utc_or_none(old_end)
+        new_start, new_end = _utc_or_none(new_start), _utc_or_none(new_end)
         start = max(old_start, new_start) if (old_start and new_start) else (old_start or new_start)
         end = min(old_end, new_end) if (old_end and new_end) else (old_end or new_end)
         self.date_range_utc = (start, end)
@@ -197,6 +186,10 @@ class RAGFilterSpec(BaseModel):
             self.doc_ids = []
         else:
             self.custom[key] = value
+
+
+def _utc_or_none(value: datetime | None) -> datetime | None:
+    return as_utc(value) if value is not None else None
 
 
 # ── Conversation State & History (§3.7, §7.7) ─────────────────────────────────
@@ -264,7 +257,7 @@ class StageUsage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     cached_tokens: int = 0
-    calls: int = 0
+    calls: int = 1
     latency_ms: float = 0.0
     cost_usd: float | None = None
     price_table_version: str | None = None
@@ -276,6 +269,7 @@ class StageUsage(BaseModel):
 class UsageTotal(StageUsage):
     """Aggregated resource consumption across an entire RAG request."""
     stage: str = "total"
+    calls: int = 0
     cost_complete: bool = True
     unpriced_models: list[str] = Field(default_factory=list)
 
@@ -323,7 +317,7 @@ class QueryIntent(BaseModel, Generic[ExtT]):
 
     # Lexical signals
     entity_terms: list[str] = Field(default_factory=list)
-    entity_mode: Literal["boost", "require", "ignore"] = "boost"
+    entity_mode: Literal["require", "ignore"] = "ignore"
     exact_terms: list[str] = Field(default_factory=list)
     negation: bool = False
 
@@ -413,7 +407,7 @@ class RAGSectionInput(BaseModel, Generic[MetaT]):
     text: str
     char_start: int = 0
     existing_summary: str | None = None
-    metadata: MetaT = Field(default_factory=dict)  # type: ignore
+    metadata: MetaT = Field(default_factory=DefaultNodeMeta)  # type: ignore[assignment]
 
 
 class RAGDocumentInput(BaseModel, Generic[MetaT]):
@@ -426,11 +420,24 @@ class RAGDocumentInput(BaseModel, Generic[MetaT]):
 
 
 class PreparedNode(BaseModel, Generic[MetaT]):
-    """Result of engine.prepare_nodes() for app-side insertion (§6.4.1, RAG-ING-13)."""
+    """One node ready for app-side insertion: always has a real vector (§6.4.1, RAG-ING-13)."""
     node: RAGNode[MetaT]
     vector: list[float]
     fingerprint: Any
-    usage: StageUsage | None = None
+
+
+class FailedNode(BaseModel):
+    """A node in a batch that could not be embedded, and why (§6.4.1)."""
+    node_id: str
+    reason: str
+
+
+class PreparedBatch(BaseModel, Generic[MetaT]):
+    """What prepare_nodes() produced: the good nodes, the failed ones, and what the call cost."""
+    prepared: list[PreparedNode[MetaT]] = Field(default_factory=list)
+    failed: list[FailedNode] = Field(default_factory=list)
+    usage: list[StageUsage] = Field(default_factory=list)
+    degradations: list[Degradation] = Field(default_factory=list)
 
 
 class IngestionProgress(BaseModel):
@@ -441,7 +448,6 @@ class IngestionProgress(BaseModel):
     sections_total: int
     passages_upserted: int
     passages_skipped_unchanged: int = 0
-    passages_failed: int = 0
     summary_status: Literal["generated", "provided", "skipped", "failed"] = "skipped"
     usage: list[StageUsage] = Field(default_factory=list)
     degradations: list[Degradation] = Field(default_factory=list)

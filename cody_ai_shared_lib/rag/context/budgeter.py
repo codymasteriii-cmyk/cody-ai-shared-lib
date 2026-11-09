@@ -1,12 +1,13 @@
-"""Token budgets per prompt zone and history trimming (§10.1, §10.2, AC-RAG-38)."""
+"""Token budgets per prompt zone and history selection (§10.1, §10.2, AC-RAG-38)."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Sequence
 
 from ..models import ChatTurn
 from ..profile import ContextConfig
-from ..text.analyzer import estimate_tokens
+from ..text.analyzer import CjkAwareAnalyzer, TextAnalyzer, estimate_tokens
 
 
 @dataclass
@@ -19,11 +20,34 @@ class BudgetAllocation:
     retrieved_budget: int
 
 
-class TokenBudgeter:
-    """Computes token budgets per zone and trims content to fit (§10.1, AC-RAG-38)."""
+def truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """Cut text proportionally so its estimated size fits, marking the cut."""
+    tokens = estimate_tokens(text)
+    if tokens <= max_tokens:
+        return text
+    return text[: max(1, int(len(text) * max_tokens / tokens * 0.95))] + "…"
 
-    def __init__(self, config: ContextConfig):
+
+def _turn_pairs(history: Sequence[ChatTurn]) -> list[list[ChatTurn]]:
+    """Group turns into exchanges; each user turn starts a new one."""
+    pairs: list[list[ChatTurn]] = []
+    for turn in history:
+        if turn.role == "user" or not pairs:
+            pairs.append([])
+        pairs[-1].append(turn)
+    return pairs
+
+
+def _render_pair(pair: Sequence[ChatTurn]) -> str:
+    return "\n".join(f"{turn.role.capitalize()}: {turn.content or ''}" for turn in pair)
+
+
+class TokenBudgeter:
+    """Computes token budgets per zone and selects the history that fits (§10.1, §10.2, AC-RAG-38)."""
+
+    def __init__(self, config: ContextConfig, analyzer: TextAnalyzer | None = None):
         self.config = config
+        self.analyzer = analyzer or CjkAwareAnalyzer()
 
     def allocate(
         self,
@@ -38,7 +62,7 @@ class TokenBudgeter:
             - self.config.question_reserve_tokens
             - self.config.answer_reserve_tokens,
         )
-        hist_b = int(usable * self.config.history_ratio) if has_history else 0
+        hist_b = min(int(usable * self.config.history_ratio), self.config.reserved_history_tokens) if has_history else 0
         sum_b = int(usable * self.config.summary_ratio) if has_summaries else 0
         win_b = int(usable * self.config.local_window_ratio) if has_local_window else 0
         ret_b = usable - hist_b - sum_b - win_b
@@ -50,60 +74,53 @@ class TokenBudgeter:
             retrieved_budget=max(128, ret_b),
         )
 
-    def format_history_with_decay(
+    def _tokens(self, text: str) -> set[str]:
+        return set(self.analyzer.tokenize(self.analyzer.normalize(text)))
+
+    def _retention(self, pair_text: str, question_tokens: set[str], age: int) -> float:
+        """Retention(i) = e^(-λ·Δt) + α·VocabOverlap(i, question) (§10.2)."""
+        overlap = len(self._tokens(pair_text) & question_tokens) / len(question_tokens) if question_tokens else 0.0
+        return math.exp(-self.config.history_decay_lambda * age) + self.config.history_overlap_alpha * overlap
+
+    def select_history(
         self,
         history: Sequence[ChatTurn],
         rolling_summary: str | None,
         budget_tokens: int,
+        question: str = "",
     ) -> tuple[str, int]:
-        """Format conversation history applying exponential turn decay (§10.2).
-
-        Returns:
-            (formatted_history_text, tokens_used)
-        """
+        """Return (history text, tokens used): recent exchanges always, older ones by score (§10.2)."""
         if budget_tokens <= 0 or (not history and not rolling_summary):
             return "", 0
 
-        lines: list[str] = []
-        used_tokens = 0
+        pairs = [_render_pair(pair) for pair in _turn_pairs(history)]
+        keep = max(1, self.config.min_recent_turns_kept)
+        recent, older = pairs[-keep:], pairs[:-keep]
 
-        if rolling_summary:
-            sum_line = f"[Prior Conversation Summary]: {rolling_summary}"
-            sum_tok = estimate_tokens(sum_line)
-            if sum_tok <= budget_tokens:
-                lines.append(sum_line)
-                used_tokens += sum_tok
+        if sum(estimate_tokens(text) for text in recent) > budget_tokens:
+            each = max(1, budget_tokens // len(recent))
+            recent = [truncate_to_tokens(text, each) for text in recent]
+        used = sum(estimate_tokens(text) for text in recent)
 
-        if not history:
-            return "\n".join(lines), used_tokens
+        summary_line = f"[Prior Conversation Summary]: {rolling_summary}" if rolling_summary else ""
+        if summary_line:
+            summary_tokens = estimate_tokens(summary_line)
+            if used + summary_tokens <= budget_tokens:
+                used += summary_tokens
+            else:
+                summary_line = ""
 
-        recent_full = max(1, self.config.recent_turns_full * 2)  # pairs -> individual messages
-        decay = self.config.turn_decay
-        cutoff = self.config.turn_summary_cutoff_tokens
+        question_tokens = self._tokens(question)
+        best_first = sorted(
+            range(len(older)),
+            key=lambda i: (-self._retention(older[i], question_tokens, len(older) - i + keep - 1), -i),
+        )
+        kept: set[int] = set()
+        for index in best_first:
+            tokens = estimate_tokens(older[index])
+            if used + tokens <= budget_tokens:
+                kept.add(index)
+                used += tokens
 
-        # Walk from newest to oldest so newest turns get priority
-        selected_Newest_first: list[str] = []
-        for rev_idx, turn in enumerate(reversed(history)):
-            age_pairs = rev_idx // 2
-            content = turn.content or ""
-            toks = estimate_tokens(content)
-
-            if rev_idx >= recent_full and toks > cutoff:
-                allowed_toks = max(32, int(toks * (decay ** age_pairs)))
-                if allowed_toks < toks:
-                    # Trim proportionally by character length
-                    ratio = allowed_toks / max(1, toks)
-                    max_chars = max(40, int(len(content) * ratio))
-                    content = content[:max_chars] + "…"
-                    toks = estimate_tokens(content)
-
-            formatted = f"{turn.role.capitalize()}: {content}"
-            line_toks = estimate_tokens(formatted)
-            if used_tokens + line_toks > budget_tokens:
-                break
-            selected_Newest_first.append(formatted)
-            used_tokens += line_toks
-
-        selected_Newest_first.reverse()
-        lines.extend(selected_Newest_first)
-        return "\n".join(lines), used_tokens
+        lines = ([summary_line] if summary_line else []) + [older[i] for i in sorted(kept)] + recent
+        return "\n".join(lines), used

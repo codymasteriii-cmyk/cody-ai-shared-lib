@@ -114,9 +114,9 @@ class Deadline:
         """True when an optional stage of this cost still fits in the remaining time."""
         return self.remaining_seconds() >= stage_budget_seconds
 
-    def check(self, stage: str, is_optional: bool = False) -> None:
-        """Enforce deadline; raises DeadlineExceeded if a required stage cannot complete."""
-        if self.is_expired() and not is_optional:
+    def check(self, stage: str) -> None:
+        """Raise DeadlineExceeded when no time is left for a required stage."""
+        if self.is_expired():
             raise DeadlineExceeded(
                 f"Deadline of {self.deadline_seconds:.1f}s exceeded before required stage '{stage}'",
                 stage=stage,

@@ -388,10 +388,8 @@ def test_cjk_aware_analyzer_tokenization_and_sentences():
 def test_build_tsquery():
     groups = [
         TokenGroup(tokens=["李小", "小明"], mode="phrase", origin="exact_term"),
-        TokenGroup(tokens=["ai", "tech"], mode="all", origin="entity"),
         TokenGroup(tokens=["search", "find"], mode="any", origin="free_text"),
     ]
     query_str = build_tsquery(groups)
     assert "(李小 <-> 小明)" in query_str
-    assert "(ai & tech)" in query_str
     assert "(search | find)" in query_str

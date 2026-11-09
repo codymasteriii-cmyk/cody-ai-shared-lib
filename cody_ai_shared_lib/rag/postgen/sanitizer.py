@@ -38,7 +38,7 @@ class OutputSanitizer:
         if not text:
             return ""
 
-        # 1. Keep images and links only on trusted hosts; otherwise keep the text and drop the URL (§11.6)
+        # Keep images and links only on trusted hosts; otherwise keep the text and drop the URL (§11.6)
         permitted_hosts = self._collect_allowed_hosts(nodes)
         if allowed_link_hosts:
             permitted_hosts.update(h.lower() for h in allowed_link_hosts if h)
@@ -48,31 +48,30 @@ class OutputSanitizer:
             return bool(host) and any(host == h or host.endswith("." + h) for h in permitted_hosts)
 
         cleaned = re.sub(
-            r"!\[(.*?)\]\(\s*<?([^)]*?)>?\s*\)",
+            r"!\[(.*?)\]\(\s*<?((?:[^()]|\([^()]*\))*?)>?\s*\)",
             lambda m: m.group(0) if _is_trusted(m.group(2)) else m.group(1),
             text,
         )
         cleaned = re.sub(
-            r"(?<!!)\[([^\]]+)\]\(\s*<?((?:https?:)?//[^)]*?)>?\s*\)",
+            r"(?<!!)\[([^\]]+)\]\(\s*<?((?:[^()]|\([^()]*\))*?)>?\s*\)",
             lambda m: m.group(0) if _is_trusted(m.group(2)) else m.group(1),
             cleaned,
-            flags=re.IGNORECASE,
         )
 
-        # 3. Strip fence tags: <data-...>, <history-...>, <question-...>, <node...>, </node>
+        # Strip fence tags, including a scrubbed copy: <data-...>, <history-...>, <question-...>, <node...>, </node>
         cleaned = re.sub(
-            r"<\s*/?\s*(?:sanitized-)?(?:data|history|question)-[a-zA-Z0-9_\-]+\s*>",
+            r"[<‹]\s*/?\s*(?:data|history|question)-[a-zA-Z0-9_\-]+\s*>",
             "",
             cleaned,
             flags=re.IGNORECASE,
         )
-        cleaned = re.sub(r"<\s*/?\s*node\b[^>]*>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"[<‹]\s*/?\s*node\b[^>]*>", "", cleaned, flags=re.IGNORECASE)
 
-        # 4. Strip raw fence_id if leaked
+        # Strip the raw fence id if it leaked
         if fence_id:
             cleaned = cleaned.replace(fence_id, "")
 
-        # 5. Strip any residual [[answer_found=...]] control flags
+        # Strip any residual [[answer_found=...]] control flags
         cleaned = re.sub(r"\[\[\s*answer_found\s*=\s*[^\]]*\]\]", "", cleaned, flags=re.IGNORECASE)
 
         return cleaned.strip()

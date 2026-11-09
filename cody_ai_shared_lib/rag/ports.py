@@ -6,13 +6,15 @@ The library contains no SQL, table name, or database client (D-01).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Generic, Protocol, get_origin, runtime_checkable
+from typing import Any, Callable, Generic, Protocol, TypeVar, get_origin, runtime_checkable
 from pydantic import BaseModel, Field
 
-from .errors import MissingRequiredScopeError, UnsupportedFilterError
+from .errors import MissingRequiredScopeError, RAGEngineError, RetrievalError, UnsupportedFilterError
 from .models import FilterPatch, MetaT, RAGFilterSpec, RAGNode
 from .render import NodeRenderer
 from .text.analyzer import TokenGroup
+
+T = TypeVar("T")
 
 
 # ── Storage Capabilities & Signatures (§4.1, §4.4) ─────────────────────────────
@@ -52,7 +54,6 @@ class StoreCapabilities(BaseModel):
     supports_local_window: bool = False
     supports_full_scope_fetch: bool = False
     supports_sequential_boundary: bool = False
-    supports_hydration: bool = False
     supports_fetch_nodes: bool = False
     supports_fingerprints: bool = False
     supports_delete: bool = False
@@ -79,13 +80,31 @@ class Fingerprint(BaseModel):
 _FILTER_KEY_ALIASES = {"tenant_id": "tenant_or_user_id", "document_ids": "doc_ids", "doc_id": "doc_ids"}
 
 
+def filter_value(filters: RAGFilterSpec, key: str) -> Any:
+    """The value a store's required filter key has in these filters, or None."""
+    value = getattr(filters, _FILTER_KEY_ALIASES.get(key, key), None)
+    return value if value is not None else filters.custom.get(key)
+
+
+def call_store(operation: str, call: Callable[[], T]) -> T:
+    """Typed engine errors pass through; anything else from a store becomes RetrievalError (§13.3)."""
+    try:
+        return call()
+    except RAGEngineError:
+        raise
+    except Exception as exc:
+        raise RetrievalError(
+            f"Store operation '{operation}' failed: {type(exc).__name__}",
+            stage="store",
+            cause=exc,
+        ) from exc
+
+
 def validate_scope(filters: RAGFilterSpec, capabilities: StoreCapabilities) -> None:
     """Fail closed on missing required keys and on unknown or wrongly typed custom filters (§3.6, §5.6)."""
     missing = []
     for key in capabilities.required_filter_keys:
-        value = getattr(filters, _FILTER_KEY_ALIASES.get(key, key), None)
-        if value is None:
-            value = filters.custom.get(key)
+        value = filter_value(filters, key)
         if value is None or value in ("", [], {}):
             missing.append(key)
     if missing:
@@ -107,7 +126,8 @@ def validate_scope(filters: RAGFilterSpec, capabilities: StoreCapabilities) -> N
 # ── RAGStore Port (§4.2, §4.3, §4.4) ──────────────────────────────────────────
 
 class RAGStore(ABC, Generic[MetaT]):
-    """Synchronous storage port for node retrieval, hydration, and lifecycle operations."""
+    """Synchronous storage port. Retrieval methods return complete rows: everything guards, the
+    renderer and stages need. How a row is produced (one query or several) is the adapter's concern."""
 
     @abstractmethod
     def capabilities(self) -> StoreCapabilities:
@@ -182,10 +202,6 @@ class RAGStore(ABC, Generic[MetaT]):
     def fetch_nodes(self, node_ids: list[str], filters: RAGFilterSpec) -> list[RAGNode[MetaT]]:
         """Fetch specific nodes by IDs, enforcing current filters."""
         raise NotImplementedError("fetch_nodes not supported by this store")
-
-    def hydrate(self, node_ids: list[str], projection: str) -> dict[str, MetaT]:
-        """Hydrate full metadata for previously returned light nodes."""
-        raise NotImplementedError("hydrate not supported by this store")
 
     def upsert_section_nodes(
         self,

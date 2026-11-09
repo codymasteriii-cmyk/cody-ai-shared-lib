@@ -44,7 +44,7 @@ class HybridRRFStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
                 "HybridRRFStrategy requires 'supports_vector_search' and keyword or native hybrid search"
             )
 
-        top_k = ctx.target_limit() + 1
+        top_k = ctx.candidate_limit()
         query_vector = embed_query(ctx)
         if is_zero_vector(query_vector):
             return keyword_fallback(ctx, top_k)

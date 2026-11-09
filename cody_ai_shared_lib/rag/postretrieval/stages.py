@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
+from ..granularity import limit_ranked
 from ..models import RAGNode, ScoreKind
 from ..registry import ComponentDeps
 from .boosters import RecencyBooster, ScoreFusionStage
@@ -11,17 +12,15 @@ from .threshold import ThresholdFilter
 
 
 class TopKStage:
-    """Truncates ranked results to the request's target size (§8.10)."""
+    """Truncates ranked results to the request's target size; ordered layers are not counted (§8.10)."""
     name: ClassVar[str] = "top_k"
     version: ClassVar[str] = "1.0.0"
     accepts_score_kinds: ClassVar[frozenset[ScoreKind] | None] = None
 
     def process(self, nodes: list[RAGNode[Any]], ctx: Any) -> list[RAGNode[Any]]:
-        limit = ctx.target_limit()
-        if ctx.last_strategy_used == "full_context" or len(nodes) <= limit:
-            return nodes
-        ctx.truncated = True
-        return nodes[:limit]
+        kept = limit_ranked(nodes, ctx.target_limit())
+        ctx.truncated = ctx.truncated or len(kept) < len(nodes)
+        return kept
 
 
 class RerankStage:
@@ -50,10 +49,12 @@ def _build_rerank_stage(deps: ComponentDeps, argument: str | None = None) -> Rer
 
 
 BUILTIN_STAGES = {
-    "threshold": lambda deps, argument=None: ThresholdFilter(min_similarity=deps.profile.retrieval.min_similarity or 0.0),
+    "threshold": lambda deps, argument=None: ThresholdFilter(
+        min_similarity=deps.profile.retrieval.min_similarity or 0.0, kind=argument or "cosine"
+    ),
     "identity_dedup": lambda deps, argument=None: IdentityDeduplicator(key=argument),
     "offset_dedup": lambda deps, argument=None: OffsetDeduplicator(),
-    "score_fusion": lambda deps, argument=None: ScoreFusionStage(),
+    "score_fusion": lambda deps, argument=None: ScoreFusionStage(feature=argument),
     "rerank": _build_rerank_stage,
     "recency": lambda deps, argument=None: RecencyBooster(clock=deps.clock),
     "top_k": lambda deps, argument=None: TopKStage(),

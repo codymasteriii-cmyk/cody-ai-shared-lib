@@ -5,7 +5,7 @@
   - AC-RAG-19: SecondaryQueryFanOut and fair interleaving for comparisons.
   - AC-RAG-35: RecencyBooster and ScoreFusionStage determinism under fixed clock.
   - AC-RAG-63: Snippets in keyword_only and prompt exclusion.
-  - §8.10: Feed search sizing with 2,000 results and hydration card projection.
+  - §8.10: Feed search sizing with 2,000 results.
 """
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -49,7 +49,6 @@ def _setup_news_engine(clock=None, store_caps=None, relaxation=()):
         supports_native_hybrid_rpc=True,
         returns_raw_scores=True,
         returns_snippets=True,
-        supports_hydration=True,
     )
     caps = caps.model_copy(update={"supports_keyword_fts": True})
     store = InMemoryRAGStore(
@@ -108,9 +107,9 @@ def test_temporal_resolver_and_applied_filters():
     assert ret.applied_filters.date_range_utc[0] == intent.range_start_utc
     assert ret.applied_filters.date_range_utc[1] == intent.range_end_utc
 
-    # 2. Reversed range repair in TemporalExtractor
-    from cody_ai_shared_lib.rag.intent.temporal import TemporalExtractor
-    extractor = TemporalExtractor(clock=clock)
+    # 2. Reversed range repair in TemporalResolver
+    from cody_ai_shared_lib.rag.intent.temporal import TemporalResolver
+    extractor = TemporalResolver(clock=clock)
     res = extractor.resolve_range(
         start=datetime(2026, 11, 10, tzinfo=timezone.utc),
         end=datetime(2026, 11, 5, tzinfo=timezone.utc),
@@ -256,15 +255,13 @@ def test_snippet_return_and_prompt_exclusion():
 
 
 def test_feed_search_sizing_and_2000_results():
-    """§8.10: news_search variant supports up to 2,000 results with card projection and truncated flag."""
+    """§8.10: news_search variant supports up to 2,000 results and the truncated flag."""
     bindings = ModelBindings(generation=["gemini-3.5-flash-lite"], embedding="gemini-embedding-2")
     profile = news_search(models=bindings)
-    assert profile.hydration_projection == "card"
     assert profile.retrieval.retrieve_max_results == 2000
 
     caps = StoreCapabilities(
         supports_vector_search=True,
-        supports_hydration=True,
     )
     caps = caps.model_copy(update={"supports_keyword_fts": True})
     store = InMemoryRAGStore(
@@ -301,5 +298,3 @@ def test_feed_search_sizing_and_2000_results():
     assert len(ret.nodes) == 2000
     # More existed -> truncated flag is True
     assert ret.truncated is True
-    # Hydration was performed with card projection
-    assert ret.nodes[0].hydrated is True

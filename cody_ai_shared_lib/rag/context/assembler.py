@@ -9,13 +9,13 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Generic, Sequence
 
-from ..granularity import GRANULARITY_FULL_DOC, GRANULARITY_LOCAL_WINDOW, TRAIT_SUMMARY, has_trait
+from ..granularity import GRANULARITY_FULL_DOC, GRANULARITY_LOCAL_WINDOW, TRAIT_ATOMIC, TRAIT_SUMMARY, has_trait
 from ..models import MetaT, RAGNode, RAGQueryRequest
 from ..ports import NodeRenderer
 from ..postgen.citations import CitationFormatter, RefCitationFormatter
 from ..profile import EngineProfile
-from ..text.analyzer import estimate_tokens
-from .budgeter import TokenBudgeter
+from ..text.analyzer import TextAnalyzer, estimate_tokens
+from .budgeter import TokenBudgeter, truncate_to_tokens
 from .fence import ContextFencer, escape_xml_attr
 
 ASSEMBLER_VERSION = "1.0.0"
@@ -49,30 +49,28 @@ class ContextAssembler(Generic[MetaT]):
         renderer: NodeRenderer[MetaT],
         fencer: ContextFencer | None = None,
         formatter: CitationFormatter | None = None,
+        analyzer: TextAnalyzer | None = None,
     ):
         self.profile = profile
         self.renderer = renderer
         self.fencer = fencer or ContextFencer()
         self.formatter = formatter or RefCitationFormatter(renderer)
-        self.budgeter = TokenBudgeter(profile.context)
+        self.budgeter = TokenBudgeter(profile.context, analyzer)
 
     @staticmethod
     def _document_order(node: RAGNode[MetaT]) -> tuple[str, int, int]:
         return (node.span.doc_id, node.span.section_seq, node.span.char_start)
 
-    def _render_node_xml(self, idx: int, node: RAGNode[MetaT]) -> str:
+    def _render_node_xml(self, idx: int, node: RAGNode[MetaT], max_tokens: int | None = None) -> str:
         """Format one node inside the data fence (§10.4); node.snippet is never included (AC-RAG-63)."""
         label = escape_xml_attr(self.formatter.label(node))
         meta_str = escape_xml_attr(self.renderer.format_meta(node.metadata))
         marker = escape_xml_attr(self.formatter.marker(node, idx))
-        body_clean = self.fencer.sanitize_content(self.renderer.prompt_text(node))
-        node_id = escape_xml_attr(node.node_id)
-        doc_id = escape_xml_attr(node.span.doc_id)
-        header = f"[Source {idx}] (Node ID: {node_id}, Doc: {doc_id})"
-        return (
-            f'<node ref="{marker}" id="{node_id}" doc="{doc_id}" label="{label}" meta="{meta_str}">\n'
-            f"{header}\n{body_clean}\n</node>"
-        )
+        body = self.renderer.prompt_text(node)
+        if max_tokens is not None:
+            body = truncate_to_tokens(body, max_tokens)
+        body_clean = self.fencer.sanitize_content(body)
+        return f'<node ref="{marker}" label="{label}" meta="{meta_str}">\n{body_clean}\n</node>'
 
     def _effective_grounding(self, guards: Sequence[Any]) -> str:
         """A guard that forces strict grounding overrides the profile (D-05, AC-RAG-39)."""
@@ -80,21 +78,30 @@ class ContextAssembler(Generic[MetaT]):
             return "strict"
         return self.profile.generation.grounding_mode
 
-    def _instructions(self, request: RAGQueryRequest) -> str:
-        instructions = (
-            request.custom_instruction
-            or "Answer the user question accurately based on the provided context."
-        )
+    def _instructions(self, request: RAGQueryRequest, default: str) -> str:
+        """Persona first, then the request's instruction or the default (§10.6)."""
+        parts = [self.profile.generation.system_preamble, request.custom_instruction or default]
+        text = "\n\n".join(part for part in parts if part)
         for key, value in request.system_prompt_variables.items():
-            instructions = instructions.replace(f"{{{key}}}", self.fencer.sanitize_content(str(value)))
-        return instructions
+            text = text.replace(f"{{{key}}}", self.fencer.sanitize_content(str(value)))
+        return text
+
+    def _fence_for(self, request: RAGQueryRequest, fence_id: str | None, untrusted: list[str]) -> str:
+        """The conversation's fence id, or a stable one for a stateless call, unless content collides (§10.4)."""
+        preferred = fence_id or (request.state.fence_id if request.state and request.state.fence_id else None)
+        if preferred is None:
+            filters = request.filters
+            preferred = self.fencer.stable_id(
+                f"{request.tenant_id}|{request.document_id}|{filters.tenant_or_user_id}|{filters.domain_id}|{filters.doc_ids}"
+            )
+        return self.fencer.ensure_collision_free_id(untrusted, preferred_id=preferred)
 
     @staticmethod
     def _guard_rules(guards: Sequence[Any]) -> list[str]:
         return [rule for guard in guards for rule in guard.prompt_rules()]
 
     def _prompt_version(self, grounding_mode: str) -> str:
-        source = f"{ASSEMBLER_VERSION}|{grounding_mode}|{self.formatter.name}"
+        source = f"{ASSEMBLER_VERSION}|{grounding_mode}|{self.formatter.name}|{self.profile.generation.system_preamble}"
         return hashlib.sha256(source.encode("utf-8")).hexdigest()[:12]
 
     def _grounding_rule(self, grounding_mode: str, fence_id: str) -> str:
@@ -128,13 +135,12 @@ class ContextAssembler(Generic[MetaT]):
         active_guards = list(guards if guards is not None else request.guards)
         grounding_mode = self._effective_grounding(active_guards)
 
-        preferred_fence = fence_id or (request.state.fence_id if request.state and request.state.fence_id else None)
-        untrusted = [n.text for n in nodes] + [t.content for t in request.history] + [request.question]
-        active_fence_id = self.fencer.ensure_collision_free_id(untrusted, preferred_id=preferred_fence)
+        untrusted = [self.renderer.prompt_text(n) for n in nodes] + [t.content for t in request.history] + [request.question]
+        active_fence_id = self._fence_for(request, fence_id, untrusted)
 
         system_prompt = "\n\n".join(
             [
-                self._instructions(request),
+                self._instructions(request, "Answer the user question accurately based on the provided context."),
                 self._grounding_rule(grounding_mode, active_fence_id),
                 FLAG_INSTRUCTION,
                 self.formatter.instructions(),
@@ -160,8 +166,8 @@ class ContextAssembler(Generic[MetaT]):
             has_summaries=bool(summary_nodes),
             has_local_window=bool(window_nodes),
         )
-        history_text, history_used = self.budgeter.format_history_with_decay(
-            request.history, rolling_summary, allocation.history_budget
+        history_text, history_used = self.budgeter.select_history(
+            request.history, rolling_summary, allocation.history_budget, request.question
         )
 
         included: list[tuple[int, RAGNode[MetaT]]] = []
@@ -178,8 +184,15 @@ class ContextAssembler(Generic[MetaT]):
             for idx, node in candidates:
                 block = self._render_node_xml(idx, node)
                 tokens = estimate_tokens(block)
-                if used and used + tokens > budget:
-                    break
+                if used + tokens > budget:
+                    if used:
+                        break
+                    if has_trait(node.granularity, TRAIT_ATOMIC):
+                        continue  # §10.1: an atomic node goes in whole or not at all
+                    block = self._render_node_xml(idx, node, max_tokens=budget)
+                    tokens = estimate_tokens(block)
+                    if "truncated_by_budget" not in node.flags:
+                        node.flags.append("truncated_by_budget")
                 accepted.append((idx, node, block, tokens))
                 used += tokens
             return accepted
@@ -203,7 +216,7 @@ class ContextAssembler(Generic[MetaT]):
         ranked_used = sum(item[3] for item in fitted_ranked)
         for idx, node, block, _ in fitted_ranked:
             included.append((idx, node))
-            if node.granularity == GRANULARITY_FULL_DOC and "truncated_by_guard" not in node.flags:
+            if node.granularity == GRANULARITY_FULL_DOC and not {"truncated_by_guard", "truncated_by_budget"} & set(node.flags):
                 # Whole Tier 0 sections stay in the cacheable prefix (§10.3)
                 stable_blocks.append((self._document_order(node), block))
             else:
@@ -259,23 +272,36 @@ class ContextAssembler(Generic[MetaT]):
         fence_id: str | None = None,
         guards: Sequence[Any] | None = None,
     ) -> AssembledPrompt[MetaT]:
-        """Prompt for the no-retrieval route. Guard rules still apply (§5.2, RAG-RES-4)."""
+        """Prompt for the no-retrieval route, with persona, history and guard rules (§5.2, RAG-RES-4)."""
         active_guards = list(guards if guards is not None else request.guards)
-        preferred_fence = fence_id or (request.state.fence_id if request.state and request.state.fence_id else None)
-        active_fence_id = self.fencer.ensure_collision_free_id([request.question], preferred_id=preferred_fence)
+        untrusted = [t.content for t in request.history] + [request.question]
+        active_fence_id = self._fence_for(request, fence_id, untrusted)
         system_prompt = "\n\n".join(
             [
-                "You are a helpful, polite assistant. Respond conversationally to the user.",
+                self._instructions(request, "You are a helpful, polite assistant. Respond conversationally to the user."),
                 self._fence_rule(active_fence_id),
                 *self._guard_rules(active_guards),
             ]
         )
+        rolling_summary = request.state.rolling_summary if request.state else None
+        allocation = self.budgeter.allocate(
+            has_history=bool(request.history or rolling_summary), has_summaries=False, has_local_window=False
+        )
+        history_text, history_used = self.budgeter.select_history(
+            request.history, rolling_summary, allocation.history_budget, request.question
+        )
         fenced_question, _ = self.fencer.fence_block(request.question, fence_id=active_fence_id, tag_prefix="question")
+        parts: list[str] = []
+        if history_text:
+            fenced_history, _ = self.fencer.fence_block(history_text, fence_id=active_fence_id, tag_prefix="history")
+            parts.extend(["Conversation History:", fenced_history, ""])
+        parts.append(fenced_question)
         return AssembledPrompt(
             system_prompt=system_prompt,
-            user_message=fenced_question,
+            user_message="\n".join(parts),
             fence_id=active_fence_id,
             cache_breakpoints=[len(system_prompt)],
+            zone_tokens={"history": history_used},
             prompt_version=self._prompt_version("conversational"),
             grounding_mode=self._effective_grounding(active_guards),
         )

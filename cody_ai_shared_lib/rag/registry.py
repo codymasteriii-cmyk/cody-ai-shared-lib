@@ -22,7 +22,7 @@ class ComponentDeps:
     renderer: Any
     analyzer: Any
     clock: Any
-    temporal_extractor: Any
+    temporal_resolver: Any
     registry: "ComponentRegistry"
 
 
@@ -107,15 +107,15 @@ def create_default_registry() -> ComponentRegistry:
     from .postretrieval.rerank import JinaCrossEncoderReranker
     from .postretrieval.stages import BUILTIN_STAGES
     from .render import DefaultRenderer
-    from .strategies.adaptive import BUILTIN_PREDICATES, AdaptiveStrategy
+    from .strategies.adaptive import BUILTIN_PREDICATES, AdaptiveRetrievalStrategy
     from .strategies.dense_vector import DenseVectorStrategy
     from .strategies.full_context import FullContextStrategy
-    from .strategies.hierarchical import HierarchicalStrategy
+    from .strategies.hierarchical import HierarchicalSummaryStrategy
     from .strategies.hybrid_rrf import HybridRRFStrategy
     from .strategies.keyword import KeywordFirstStrategy, KeywordOnlyStrategy
     from .strategies.relaxation import BUILTIN_RELAXATIONS
-    from .strategies.transforms import SecondaryQueryFanOut
     from .text.analyzer import CjkAwareAnalyzer
+    from .transforms import SecondaryQueryFanOut
 
     reg = ComponentRegistry()
     reg.register("analyzer", "cjk_aware", CjkAwareAnalyzer)
@@ -124,10 +124,10 @@ def create_default_registry() -> ComponentRegistry:
     reg.register("splitter", "pass_through", PassThroughSplitter)
 
     for strategy in (
-        AdaptiveStrategy,
+        AdaptiveRetrievalStrategy,
         DenseVectorStrategy,
         FullContextStrategy,
-        HierarchicalStrategy,
+        HierarchicalSummaryStrategy,
         HybridRRFStrategy,
         KeywordFirstStrategy,
         KeywordOnlyStrategy,

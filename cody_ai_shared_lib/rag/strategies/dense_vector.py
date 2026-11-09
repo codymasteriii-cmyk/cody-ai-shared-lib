@@ -19,7 +19,7 @@ class DenseVectorStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
         if not self.is_runnable(ctx.store.capabilities()):
             raise StoreCapabilityError("DenseVectorStrategy requires store capability 'supports_vector_search'")
 
-        top_k = ctx.target_limit() + 1
+        top_k = ctx.candidate_limit()
         query_vector = embed_query(ctx)
         if is_zero_vector(query_vector):
             return keyword_fallback(ctx, top_k)

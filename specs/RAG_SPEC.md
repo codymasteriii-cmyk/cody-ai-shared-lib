@@ -2,8 +2,8 @@
 
 | | |
 | :--- | :--- |
-| **Document Version** | 1.1.13-draft |
-| **Status** | Draft, design agreed. Sibling feedback (AUD-01..26, NF-01..40, KB-01..23) was consolidated into C-01..C-39 and folded in; owner decisions Q-01..Q-08, the failure model and the pushbacks (Appendix C) are settled, and all three app agents (AudioReading, NewsIntelligence, KnowledgeBase) agreed through 1.1.8. This file is the only record of the design and its reasoning; the round's working files were removed on 2026-11-08. |
+| **Document Version** | 1.1.14-draft |
+| **Status** | Draft, design agreed. Sibling feedback (AUD-01..26, NF-01..40, KB-01..23) was consolidated into C-01..C-39 and folded in; owner decisions Q-01..Q-08, the failure model and the pushbacks (Appendix C) are settled, and all three app agents (AudioReading, NewsIntelligence, KnowledgeBase) agreed through 1.1.8. Version 1.1.14 changes parts of that agreed contract after the Phase 1–3 review (Appendix B). This file is the only record of the design and its reasoning; the round's working files were removed on 2026-11-08. |
 | **Package Namespace** | `cody_ai_shared_lib.rag` (`cody-ai-shared-lib >= 0.8.0`) |
 | **Target Runtime** | Python 3.11+, synchronous core (matching the rest of `cody_ai_shared_lib`) with a bounded thread pool for independent calls |
 | **Primary Consumers** | **AudioReading** (`audiolib.codymasterai.com`), **NewsIntelligence / Pulse Nexus** (`ai.codymasterai.com`), **KnowledgeBase** |
@@ -39,7 +39,7 @@ This document is written for two readers: the coding agent that builds the engin
 | **§6. Text analysis, ingestion & index lifecycle** | `TextAnalyzer`, splitters, summaries, `BatchEmbedder`, ingestion stages, sync/reconcile |
 | **§7. Query understanding** | `QueryIntent[ExtT]`, routers, Jev gate, LLM rewriter, temporal resolver, conversation reuse, query transforms |
 | **§8. Retrieval strategies & registry** | Tiers 0–4 plus keyword tiers, adaptive rules, registry, `retrieve()` mode, retrieval loop seam |
-| **§9. Post-retrieval stages** | Thresholds, dedup, fusion, rerank, boosters, expansion seams, hydration, guard enforcement |
+| **§9. Post-retrieval stages** | Thresholds, dedup, fusion, rerank, boosters, expansion seams, guard enforcement |
 | **§10. Context assembly & generation** | Token budgets, fencing, cache-friendly layout, grounding modes, generation strategies, model fallback, streaming |
 | **§11. Post-generation: citations & answer checks** | `CitationFormatter`, verification, quote validation, coverage policy, repair, output sanitiser |
 | **§12. Engine profiles & integration recipes** | `EngineProfile`, `ModelBindings`, presets, per-app recipes |
@@ -190,13 +190,13 @@ flowchart TB
 
 | Pattern | Engine class(es) | Role |
 | :--- | :--- | :--- |
-| **Facade** | `RAGEngine[MetaT]` | One entry point (`ingest_document`, `sync_document`, `reconcile`, `prepare_nodes`, `route`, `plan`, `retrieve`, `query`, `stream_query`, `validate`) that hides the pipelines. |
+| **Facade** | `RAGEngine[MetaT]` | One entry point (`ingest_document`, `sync_document`, `reconcile`, `prepare_node`, `prepare_nodes`, `route`, `plan`, `retrieve`, `query`, `stream_query`, `validate`) that hides the pipelines. |
 | **Hexagonal port & adapter** | `RAGStore[MetaT]`, `StoreCapabilities`, `InMemoryRAGStore` | Decouples the engine from tables and RPCs. Apps write adapters; the lib ships a pure-Python reference adapter and a conformance kit. |
 | **Capability negotiation** | `StoreCapabilities`, `requires=` on strategies | The engine checks at construction time that every configured strategy can run on the store, and downgrades or raises when it cannot. |
 | **Strategy** | `RetrievalStrategy`, `TextSplitter`, `IntentRouter`, `Reranker`, `GenerationStrategy`, `CitationFormatter`, `TextAnalyzer` | Interchangeable algorithms behind uniform interfaces. |
 | **Rule-based composite** | `AdaptiveRetrievalStrategy` | Walks an ordered list of `(predicate, strategy)` rules from the profile; the first rule that matches wins. |
 | **Chain of responsibility** | `QueryTransform`, `PostRetrievalStage`, `PostGenerationStage`, `IngestionStage` | Ordered, named, profile-declared stages. |
-| **Template method** | `QueryPipeline`, `IngestionPipeline` | Fixed skeletons: `route → transform → retrieve → post-process → hydrate → guard → assemble → generate → post-generate` and `split → ingestion stages → embed → upsert`. |
+| **Template method** | `QueryPipeline`, `IngestionPipeline` | Fixed skeletons: `route → transform → retrieve → post-process → guard → assemble → generate → post-generate` and `split → ingestion stages → embed → upsert`. |
 | **Protocol (app-supplied policy)** | `Guard`, `NodeRenderer`, `BudgetGuard`, `RAGObserver`, `Cache`, `Clock` | The engine fixes *where* a decision is applied; the app decides *what* it is. |
 | **Registry** | `ComponentRegistry` | Named components that apps register at startup; profiles refer to components by name. |
 | **Gateway** | `ModelGateway` | The single path for every billable model call. Usage, budget checks, model fallback, caching and eval record/replay attach here once. |
@@ -230,7 +230,7 @@ This table is the concrete form of principle 3. A new app needing new behaviour 
 
 | Interface | Engine owns | App supplies | Example |
 | :--- | :--- | :--- | :--- |
-| `RAGStore` + `StoreCapabilities` (§4) | Port, capability checks, required-scope check, conformance kit | Tables, RPCs, SQL, scope binding, hydration projections | News wraps `match_intelligence_dynamic` |
+| `RAGStore` + `StoreCapabilities` (§4) | Port, capability checks, required-scope check, conformance kit | Tables, RPCs, SQL, scope binding, which fields each row carries | News wraps `match_intelligence_dynamic` |
 | `custom` filter contract (§3.6) | Type check against declared keys | Meaning of each predicate | News `favorites_only` |
 | `Guard` (§5) | Push-down, re-verification, invariants (narrow only, never relaxed) | Custom visibility rules | KB "not superseded"; a future embargo |
 | `NodeRenderer` (§3.4) | Which view each stage reads | Embed / rerank / prompt texts, labels, breadcrumb, meta, timestamp, features, flags | News three-view row; KB breadcrumb + claim |
@@ -273,11 +273,11 @@ cody_ai_shared_lib/
     ├── text/analyzer.py                # TextAnalyzer, CjkAwareAnalyzer, estimate_tokens (§6.1)
     ├── ingestion/                      # splitter.py, summarizer.py, embedder.py, stages.py, pipeline.py, sync.py (§6)
     ├── intent/                         # models.py, heuristic.py, jev_gate.py, llm_rewriter.py, router.py, temporal.py (§7)
-    ├── transforms/                     # QueryTransform, SecondaryQueryFanOut, LexiconExpander, HyDE seam (§7.8)
-    ├── strategies/                     # base.py, full_context.py, keyword.py, dense_vector.py, hybrid_rrf.py,
-    │                                   # hierarchical.py, graph.py, adaptive.py, loop.py (seam) (§8)
-    ├── rerankers/                      # base.py, rrf.py, threshold.py, dedup.py, fusion.py, boosters.py,
-    │                                   # jina.py (stage over rerank.py), expansion.py (seam), mmr.py (seam) (§9)
+    ├── transforms/                     # base.py (QueryTransform, QueryVariant), fanout.py, fusion.py; LexiconExpander, HyDE seam later (§7.8)
+    ├── strategies/                     # context.py, full_context.py, keyword.py, dense_vector.py, hybrid_rrf.py,
+    │                                   # hierarchical.py, adaptive.py, relaxation.py, graph and loop seams later (§8)
+    ├── postretrieval/                  # base.py, threshold.py, dedup.py, rerank.py, boosters.py, stages.py;
+    │                                   # expansion and MMR seams later (§9)
     ├── context/                        # budgeter.py, conversation.py, compressor.py, fence.py, assembler.py (§10)
     ├── generation/                     # GenerationStrategy, StuffStrategy, structured seam, streaming (§10)
     ├── postgen/                        # citations.py, quotes.py, policy.py, repair.py, sanitizer.py (§11)
@@ -398,7 +398,6 @@ class RAGNode(BaseModel, Generic[MetaT]):
 
     embedding: list[float] | None = None  # only when requested (MMR, eval); never by default
     flags: list[str] = Field(default_factory=list)  # e.g. "suspect_injection", "truncated_by_guard"
-    hydrated: bool = True              # False when the store returned a light node (§4.3)
     search_tokens: list[str] | None = None  # set by the engine at ingestion for stores with uses_analyzer_tokens (§6.1)
     snippet: str | None = None         # store-produced display text for this hit (§3.4 snippet rule)
     snippet_kind: Literal["match_excerpt", "summary"] | None = None
@@ -482,6 +481,11 @@ class RAGQueryRequest(BaseModel):
     state: "ConversationState | None" = None                       # untrusted (§7.7)
     cursor_offset: int | None = None              # reading/playback position for local windowing
     doc_total_chars: int | None = None            # cheap Tier 0 pre-check hint only (§8.2)
+
+    tenant_id: str | None = None                  # narrows filters.tenant_or_user_id; a conflict is an empty scope
+    document_id: str | None = None                # narrows filters.doc_ids; a conflict is an empty scope
+    custom_instruction: str | None = None         # replaces the default instruction for this request
+    metadata: dict[str, Any] = Field(default_factory=dict)         # opaque; `message_id` is echoed in `done`
 
     router_override: str | None = None            # "auto" | "none" | registered router name
     strategy_override: str | None = None          # registered strategy name; None = profile default
@@ -626,7 +630,6 @@ class StoreCapabilities(BaseModel):
     supports_local_window: bool = False
     supports_full_scope_fetch: bool = False    # Tier 0 (renamed from supports_full_doc_fetch)
     supports_sequential_boundary: bool = False # max_char_offset(_by_doc) enforced in the query
-    supports_hydration: bool = False           # §4.3
     supports_fetch_nodes: bool = False         # §4.3, needed for conversation reuse
     supports_fingerprints: bool = False        # §4.4
     supports_delete: bool = False              # §4.4
@@ -697,22 +700,22 @@ class RAGStore(ABC, Generic[MetaT]):
         raise NotImplementedError
 ```
 
-### 4.3 Hydration and node fetch
+### 4.3 Complete rows and node fetch
 ```python
     def fetch_nodes(self, node_ids: list[str], filters: RAGFilterSpec) -> list[RAGNode[MetaT]]:
-        """Fetch specific nodes, still applying filters. Missing or filtered ids are omitted."""
-        raise NotImplementedError
-
-    def hydrate(self, node_ids: list[str], projection: str) -> dict[str, MetaT]:
-        """Return full metadata for light nodes. projection is an app-defined name
-        ("context", "card"); the engine passes profile.hydration_projection."""
+        """Return these nodes, applying the current filters."""
         raise NotImplementedError
 ```
-- When `supports_hydration=True`, retrieval methods MAY return light nodes (`hydrated=False`, short or empty `text`).
-- The engine hydrates exactly once, after rerank, dedup and budgeting, and only for nodes that will enter the prompt or the response.
-- A store that always returns full nodes declares `supports_hydration=False`.
+- **Every retrieval method returns complete rows:** everything the guards, the renderer and the post-retrieval stages need. The engine makes one call for a search and never loads fields in a second step.
+- **The contract between app and engine:**
+  - `RAGNode[MetaT]` fixes the core (id, text, span, scores). `MetaT` is the app's own class and may hold any field, including full article text. The engine carries it through every stage without reading it.
+  - The adapter decides which fields each row carries and how it gets them: one query, or an RPC followed by a field load. An app wanting different fields for different calls builds one adapter per field set, and one engine per adapter, and calls whichever fits.
+  - The renderer (§3.4) is how the engine reads app content: `embed_text`, `rerank_text`, `prompt_text`, `timestamp` and `features`. Which fields drive rerank, recency or the prompt is therefore the app's choice.
+  - Column names never pass through the engine (D-01).
+  - The built-in guards are the one exception to "the engine reads no app field by name". `TemporalGuard` reads its configured date field and `TenantGuard` and `ScopeGuard` read `tenant_id`, `domain_id` and `category`. An app using one of them exposes those fields in `MetaT`, or supplies its own guard (§5).
+- An app that wants to load more fields after trimming registers its own post-retrieval stage at the position it needs (§8.8).
 
-> **Rationale:** Carrying tens of KB of `full_article_text` through every stage matters on a 512 MB host (NF-16). `fetch_nodes` is also how conversation reuse re-reads prior nodes under the current guards (§7.7).
+> **Rationale:** An earlier draft had the engine load fields in a separate `hydrate` step, to avoid carrying `full_article_text` through every stage on a 512 MB host (NF-16). Neither News flow loads that column, and the separate step ran after rerank and recency, which need those fields. Memory stays the caller's choice: an adapter that loads full text accepts the cost. `fetch_nodes` is how conversation reuse re-reads prior nodes under the current guards (§7.7).
 
 ### 4.4 Lifecycle methods
 ```python
@@ -769,7 +772,7 @@ class Fingerprint(BaseModel):
 6. A zero-vector query is rejected.
 7. **Filtered recall.** A small target document among many distractors still returns `k` rows under document and offset filters.
 8. Native hybrid stores return raw scores when `returns_raw_scores=True`.
-9. `hydrate` and `fetch_nodes` honour filters.
+9. `fetch_nodes` honours filters.
 10. CJK keyword search: `keyword_search("张三")` finds a node containing 张三 (§6.1).
 11. A keyword-only hit from a native-hybrid store (no `vector_score`) survives the profile's cosine floor (§9.1).
 12. **Atomic section writes.** While one thread writes a section with `upsert_section_nodes`, a concurrent reader sees either none or all of its passages and summaries (RAG-ING-10).
@@ -946,10 +949,10 @@ class TextAnalyzer(Protocol):
     ```python
     class TokenGroup(BaseModel):
         tokens: list[str]
-        mode: Literal["any", "all", "phrase"]   # OR, AND, or adjacent in order
+        mode: Literal["any", "phrase"]   # OR, or adjacent in order
         origin: Literal["free_text", "exact_term", "entity"]
     ```
-    `exact_terms` and `entity_terms` with `entity_mode="require"` become `"phrase"` groups (李小明 becomes `李小 <-> 小明`, which a passage containing only 小明 does not match). Boosted entities become `"all"` groups. The remaining free text is one `"any"` group.
+    `exact_terms` and `entity_terms` with `entity_mode="require"` become `"phrase"` groups (李小明 becomes `李小 <-> 小明`, which a passage containing only 小明 does not match). The remaining free text is one `"any"` group. Groups are joined with AND.
   - **Token safety.** Analyzer tokens contain only letters, digits and CJK characters (no tsquery operators or quotes). The lib ships `rag.text.build_tsquery(groups) -> str`; the adapter passes its result as a query parameter and never concatenates it into SQL text.
   - **Version changes.** If the analyzer changes, `fts_signature` no longer matches, and `needs_reindex` reports the FTS column as stale separately from the embeddings (§6.6).
   - **PGroonga** is an alternative for a store whose Supabase plan offers it: the store then leaves `uses_analyzer_tokens` off and searches raw text. AudioReading decides between the two on measured results in P2 (§12.3).
@@ -996,8 +999,7 @@ class TextAnalyzer(Protocol):
 - Embeds `renderer.embed_text(node)` through `ModelGateway` with `task_type="RETRIEVAL_DOCUMENT"`.
 - **RAG-ING-4 (zero-vector guard).** `generate_embedding` returns `[0.0]*768` for failed items.
   - Zero vectors MUST NOT be upserted.
-  - Some nodes zero: those nodes are skipped and reported (`IngestionProgress.passages_failed`, degradation DG-08, ERROR log).
-  - Every node in a non-empty section zero: raise `EmbeddingProviderError`, so the job can retry from its checkpoint.
+  - On the engine-write path (`ingest_document`, `sync_document`) one section is one unit. If any of its nodes fails, the engine raises `EmbeddingProviderError` naming them in `failed_node_ids`, before anything of that section is written, so a document never has holes. The job retries from its checkpoint.
   - `generate_embedding` itself is unchanged; it still returns zero vectors so that index alignment is kept for callers like News's ingestion job.
 - Usable without `IngestionPipeline` (News embeds rows in its own pipeline).
 
@@ -1007,12 +1009,22 @@ class PreparedNode(BaseModel, Generic[MetaT]):
     node: RAGNode[MetaT]               # with content_hash, token_estimate, search_tokens filled
     vector: list[float]
     fingerprint: Fingerprint           # content_hash, embedding_signature, fts_signature
-    usage: StageUsage
 
-engine.prepare_nodes(nodes: list[RAGNode[MetaT]]) -> list[PreparedNode[MetaT]]
+class FailedNode(BaseModel):
+    node_id: str
+    reason: str
+
+class PreparedBatch(BaseModel, Generic[MetaT]):
+    prepared: list[PreparedNode[MetaT]]
+    failed: list[FailedNode]
+    usage: list[StageUsage]
+    degradations: list[Degradation]
+
+engine.prepare_node(node: RAGNode[MetaT]) -> PreparedNode[MetaT]               # one unit: succeeds or raises
+engine.prepare_nodes(nodes: list[RAGNode[MetaT]]) -> PreparedBatch[MetaT]      # per node: returns the good ones
 ```
 - **RAG-ING-13.** `prepare_nodes` computes, for each node, everything `upsert_section_nodes` would persist: the embedding of `renderer.embed_text(node)`, the fingerprint (§6.6), `token_estimate` and, for stores with `uses_analyzer_tokens`, `search_tokens`. It uses the profile's own renderer, analyzer and embedder, so the values are **identical** to the engine's by construction. It writes nothing.
-- The zero-vector rule (RAG-ING-4) and the budget guard (RAG-ING-12) apply: a node whose embedding fails is returned with `vector=[]` and an ERROR log, never with a zero vector; a `BudgetExceeded` propagates with the usage of calls already made (RAG-OPS-1).
+- **Failure is per node.** `prepare_node` is for one article or entry: it either succeeds completely or raises `EmbeddingProviderError`. `prepare_nodes` judges each node on its own: failed nodes are listed in `failed` (ERROR log, DG-08) and the good ones are returned, so the caller keeps those and retries only the rest. It raises only when no node succeeded (`failed_node_ids` names them), when the whole embedding call fails, or on `BudgetExceeded`, with the usage of calls already made (RAG-OPS-1). A failed node has no vector and no fingerprint, so it can never be stored as current.
 - **Use it when the app owns the insert.** An app that writes a row in its own transaction, together with its own columns (for example KnowledgeBase's entry row with `proposal_id` and `claim_id`), calls `prepare_nodes`, then inserts vector, fingerprint and tokens with its row. `sync_document` and `reconcile` then see that row as current. Apps that let the engine write keep using `upsert_section_nodes`; both paths produce the same stored values.
 
 > **Rationale:** `sync_document` and `reconcile` decide what to re-embed by comparing stored fingerprints with freshly computed ones. An app that inserts its own rows had no way to compute a matching fingerprint, and a formula that differed even slightly (hashing the raw column instead of the rendered embed text) would make every row look stale, so `reconcile` would re-embed everything (KnowledgeBase closing reply). Passing app columns through `upsert_section_nodes` instead was rejected: the lib would perform an app's domain insert, against D-01.
@@ -1057,7 +1069,6 @@ class IngestionProgress(BaseModel):
     sections_total: int
     passages_upserted: int
     passages_skipped_unchanged: int = 0
-    passages_failed: int = 0           # zero-vector nodes skipped (DG-08)
     summary_status: Literal["generated", "provided", "skipped", "failed"] = "skipped"
     usage: list[StageUsage] = Field(default_factory=list)
     degradations: list[Degradation] = Field(default_factory=list)
@@ -1119,7 +1130,7 @@ class QueryIntent(BaseModel, Generic[ExtT]):
 
     # Lexical signals
     entity_terms: list[str] = Field(default_factory=list)       # max 8
-    entity_mode: Literal["boost", "require", "ignore"] = "boost"
+    entity_mode: Literal["require", "ignore"] = "ignore"
     exact_terms: list[str] = Field(default_factory=list)        # quoted strings, identifiers
     negation: bool = False
 
@@ -1132,7 +1143,7 @@ class QueryIntent(BaseModel, Generic[ExtT]):
   - fan-out (`secondary_queries`);
   - conversation reuse (`is_followup`);
   - temporal resolution;
-  - entity boosting;
+  - entity matching (`entity_terms`, `entity_mode`);
   - fusion weights (`exact_terms`, `negation`);
   - routing (`route`, `scope`).
   Everything else goes in `ext`.
@@ -1161,8 +1172,9 @@ class IntentRouter(Protocol):
   - `"auto"` (`HybridIntentRouter`): heuristic, then Jev if enabled, then LLM.
 - Selection order:
   1. `request.router_override`;
-  2. the profile's `router` (a registry name or an instance);
-  3. `"auto"`.
+  2. the engine's router: the object passed to `RAGEngine(router=...)`, otherwise the registered router named by `profile.router.name` (default `"auto"`).
+
+  A profile is frozen and fingerprinted as JSON, so it holds only a name; an instance goes to the constructor.
 - **`engine.route(request) -> QueryIntent`** is public. **`engine.query(request, intent=...)`** and **`engine.retrieve(request, intent=...)`** accept a precomputed intent and skip routing. A supplied intent is re-validated and clamped.
 - An intent can never widen access. Every constraint it yields is soft and is intersected with hard filters (§5.5).
 - The `LLMIntentRouter` takes `intent_schema=MyIntent` (a subclass carrying `ext`) and an app prompt fragment. An app extends the JSON schema by subclassing, not by forking the router.
@@ -1213,6 +1225,8 @@ class IntentRouter(Protocol):
   - It runs only when results are empty or below `min_results`.
   - Each applied step is recorded in `relaxations`.
   - It touches **only soft constraints**; hard filters and guards are unreachable to it (D-04).
+  - `drop_required_entities` sets `entity_mode` to `"ignore"`. It only matters for stores using analyzer tokens (§6.1); other stores receive no entity groups. `exact_terms` are never relaxed.
+  - A step that does not fit the remaining deadline is skipped (DG-10).
 
 > **Rationale:** News's tested date logic moves into the lib because every dated corpus needs it (NF-10). The ladder is opt-in, so KB's fail-loud preference is unaffected (NF-14 vs KB-05).
 
@@ -1221,6 +1235,7 @@ class IntentRouter(Protocol):
 class NodeRef(BaseModel):
     node_id: str
     revision: str | None = None
+    turn: int = 0                          # the turn that used this node
 
 class ConversationState(BaseModel):
     """Opaque to the app. Returned by query(); passed back on the next turn. Untrusted."""
@@ -1232,10 +1247,13 @@ class ConversationState(BaseModel):
     turn_count: int = 0
     profile_fingerprint: str | None = None
 ```
-- **Size bounds (RAG-CTX-3).** `prior_nodes` keeps the node refs of the last `profile.context.state.reused_turns` turns (default 3), at most `max_reused_nodes` (default 24); `rolling_summary` is at most `rolling_summary_max_tokens` (default 400); the serialized state is at most `state_max_bytes` (default 16 KB). The engine prunes the oldest node refs first, then shortens the summary. The trace records `state_size_bytes`. A 200-turn thread stays within the cap.
-- **Follow-up reuse.** When `intent.is_followup` is set, the engine re-fetches `prior_nodes` through `store.fetch_nodes(ids, current_effective_filters)`, runs **every guard** on them (§5.3), and adds a fresh retrieval only when the question introduces new terms.
+- **Size bounds (RAG-CTX-3).** `prior_nodes` keeps one ref per node, from the last `profile.context.reused_turns` turns (default 3), at most `max_reused_nodes` (default 24); `rolling_summary` is at most `rolling_summary_max_tokens` (default 400); the serialized state is at most `state_max_bytes` (default 16 KB). The engine prunes the oldest node refs first, then shortens the summary. The trace records `state_size_bytes`. A 200-turn thread stays within the cap.
+- **Follow-up reuse.** When `intent.is_followup` is set, the engine re-fetches `prior_nodes` through `store.fetch_nodes(ids, current_effective_filters)`, newest first and capped again on input, and runs **every guard** on them (§5.3). Then:
+  - **No new terms:** the prior nodes are used and no search runs. A term is new when a `TextAnalyzer` token of the rewritten query appears in none of the prior nodes, ignoring common function and continuation words. This is a local comparison with no model call.
+  - **New terms:** a fresh retrieval runs and `fair_interleave` gives prior and fresh passages an equal share of the ranked slots.
+  - **A fresh retrieval also runs** when any prior node is gone or hidden, when a prior node is an `ordered` layer, or when the request has a `cursor_offset`, because those layers follow the reader. Ordered layers always come from the fresh retrieval.
 - **Untrusted inputs.**
-  - History turn count, per-turn size and roles are capped by `profile.context.history`.
+  - The history zone is capped (§10.1), and the router sees at most the last 3 turns, each capped and fenced.
   - History is fenced like retrieved data (§10.4).
   - State fields are validated and capped.
   - A tampered state can make an answer worse but cannot widen scope: every id is re-fetched under current filters and guards, and the fence id is re-checked against content.
@@ -1261,6 +1279,16 @@ class QueryTransform(Protocol):
     version: str
     def transform(self, request: RAGQueryRequest, intent: QueryIntent,
                   ctx: "TransformContext") -> list[QueryVariant]: ...
+
+@dataclass
+class TransformContext:
+    profile: "EngineProfile"
+    analyzer: TextAnalyzer
+    gateway: "ModelGateway"            # a transform that calls a model reports its spend through the trackers
+    usage_tracker: "UsageTracker"
+    degradation_tracker: "DegradationTracker"
+    deadline: "Deadline"
+    budget_guard: "BudgetGuard | None" = None
 ```
 - Built-ins:
   - `SecondaryQueryFanOut` (**on by default**): one variant per `secondary_queries` item. This fixes Tier 2 ignoring the second subject of a comparison (NF-03).
@@ -1269,6 +1297,7 @@ class QueryTransform(Protocol):
 - Variants are retrieved through the same strategy, run in parallel (§13.4), and merged by the shared `fuse_variants` helper:
   - weighted RRF across variants;
   - then `fair_interleave`, so each variant keeps at least `⌈k / n_variants⌉` slots when it has candidates.
+  - Only ranked nodes are fused. `ordered` layers (§3.3) are the same for every variant and are kept once.
 - Tiers 1, 2 and 3 all use the helper.
 
 ---
@@ -1413,7 +1442,7 @@ default_registry = ComponentRegistry()   # built-ins pre-registered
 - The reranker runs only if it is enabled for the variant.
 - The `suggested_top_k` clamp does not apply. The result size is bounded by `profile.retrieval.retrieve_max_results`, and `truncated` is set when more results existed.
 - Guards, required scope and the trace all apply.
-- **Feed search is in scope (Q-08, D-21).** `retrieve()` MUST support NewsIntelligence's feed search: router `none`, explicit UI filters as hard filters, a store-side `min_similarity` floor (§9.1), no rerank, light rows with a `"card"` hydration projection, and up to `retrieve_max_results` (2,000 for the `news_search` variant) with `truncated`.
+- **Feed search is in scope (Q-08, D-21).** `retrieve()` MUST support NewsIntelligence's feed search: router `none`, explicit UI filters as hard filters, a store-side `min_similarity` floor (§9.1), no rerank, rows carrying the feed's fields (§4.3), and up to `retrieve_max_results` (2,000 for the `news_search` variant) with `truncated`.
 - **Boundary.** The engine returns a *relevance-ranked, filtered* list for a text query. Features of a search product stay in the app: re-sorting by date, pagination, facet counts, saved searches, and filter-only browsing with no query text (that is a plain SQL query, not retrieval).
 
 ### 8.11 Retrieval loop **[seam]**
@@ -1454,7 +1483,8 @@ class PostRetrievalStage(Protocol[MetaT]):
     accepts_score_kinds: frozenset[ScoreKind] | None   # None = any
     def process(self, nodes: list[RAGNode[MetaT]], ctx: RetrievalContext[MetaT]) -> list[RAGNode[MetaT]]: ...
 ```
-- `profile.post_stages` lists stage names in order. The engine always appends `hydrate` (when the store supports it) and `guard_enforcement`, which must run last and cannot be removed.
+- `profile.post_stages` lists stage names in order. The engine always appends `guard_enforcement`, which must run last and cannot be removed.
+- `top_k`, rerank and variant fusion apply only to ranked nodes. Nodes with the `ordered` trait (summaries, local windows, Tier 0 text) have token budgets instead (§10.1) and are never counted or cut by them.
 - Guards also run after every stage (§5.3).
 - Each stage records `in_count`, `out_count`, and (in verbose traces) the dropped node ids with a reason.
 
@@ -1464,13 +1494,12 @@ class PostRetrievalStage(Protocol[MetaT]):
 3. `offset_dedup`
 4. `score_fusion` (when configured)
 5. `rerank`
-6. `recency` / `entity_boost` (when configured)
+6. `recency` (when configured)
 7. `top_k`
-8. `hydrate`
-9. `guard_enforcement`
+8. `guard_enforcement`
 
-### 9.1 `ThresholdFilter(kind, min_score)`
-- Drops nodes whose signal of the declared kind is below `min_score`. A threshold of `kind="cosine"` reads `vector_score`, never the fused `score`.
+### 9.1 `ThresholdFilter(min_similarity, kind="cosine")`
+- Drops nodes whose signal of the declared kind is below `min_similarity`. In a profile, `threshold(kind)` selects the kind; the value comes from `retrieval.min_similarity`. A threshold of `kind="cosine"` reads `vector_score`, never the fused `score`.
 - **A node with no value for the declared signal passes** (it was not scored on that signal). In a hybrid result, a keyword-only hit has `vector_score=None` and is kept by a cosine threshold.
 - **Hybrid profiles express the cosine floor store-side**, through `RAGFilterSpec.min_similarity` (default from `profile.retrieval.min_similarity`), which the store applies to the vector branch only. `ThresholdFilter(kind="cosine")` is for dense-only profiles. This keeps today's NewsIntelligence behaviour, where the full-text branch has no similarity gate.
 - A threshold configured for a kind the pipeline cannot produce raises `ProfileConfigError` at construction.
@@ -1488,6 +1517,7 @@ class Reranker(Protocol):
     def rerank(self, query: str, nodes: list[RAGNode], top_n: int, ctx: RetrievalContext) -> list[RAGNode]: ...
 ```
 - Reranks only nodes with the `rerankable` trait. `ordered` nodes keep their positions in their own budget zone.
+- **Candidate pool.** When a rerank stage is active, strategies fetch `retrieval.rerank_candidates` nodes (default `top_k × 3`, limited by the store's `max_top_k`) and the reranker returns `top_k`.
 - Sends `renderer.rerank_text(node)` with the primary query. For comparisons, it reranks per variant and merges with `fair_interleave`, so the second subject is not crowded out.
 - Sets `rerank_score`, and `score_kind="rerank"`.
 - **Jina built-in.** The model id comes from `ModelBindings.reranker` (no default model in the lib). Endpoint `https://api.jina.ai/v1/rerank`, timeout `profile.reranker_timeout_seconds` (4.0 s).
@@ -1496,10 +1526,6 @@ class Reranker(Protocol):
 ### 9.4 Fusion and boosters **[v1]**
 - **`ScoreFusionStage(weights)`.** Combines min-max-normalized signals: semantic, keyword, rerank, recency, and any app `renderer.features(meta)` such as News priority or KB confidence. The result is written as `score` with `score_kind="fused"`, and the weights are recorded in the trace.
 - **`RecencyBooster(half_life_days, weight)`.** Multiplies by `1 + weight · 2^(-age/half_life)`, using `renderer.timestamp` and `clock.now()`.
-- **`EntityBooster`.** Follows `intent.entity_mode`:
-  - `boost`: adds weight for each matched entity term.
-  - `require`: drops nodes with no match. This is a soft constraint, so the relaxation ladder can lift it.
-  - `ignore`: does nothing.
 - Weights come from the profile and are tuned with evaluation data. The lib never hardcodes app-specific weights.
 
 > **Rationale:**
@@ -1513,10 +1539,8 @@ class Reranker(Protocol):
 
 The interfaces and store methods ship in v1; the built-in implementations come later.
 
-### 9.6 Hydration
-- When `supports_hydration` is true, `hydrate` runs once on the nodes that survived budgeting (§10.1).
-- It fills `metadata` and `text` per `profile.hydration_projection`.
-- The trace records the hydrated count.
+### 9.6 Removed
+The separate hydration step was removed in 1.1.14. Retrieval methods return complete rows (§4.3).
 
 ### 9.7 `GuardEnforcementStage` (mandatory)
 Runs every guard's `verify` on every node, one final time, before assembly.
@@ -1529,7 +1553,7 @@ Runs every guard's `verify` on every node, one final time, before assembly.
 `profile.context.max_context_tokens` is split into zones. All sizes are in estimated tokens (§6.1).
 
 1. **Instructions:** system rules, guard rules, grounding rules, citation instructions, persona. About 10%, minimum 1,500.
-2. **History:** up to `history_budget_ratio` (15%), capped at 4,000.
+2. **History:** up to `context.history_ratio` (15%), capped at `context.reserved_history_tokens` (default 8,000).
 3. **Question:** the actual size.
 4. **Data:** the rest. When several layers are present, it is subdivided by trait:
    - `summary` nodes: up to 25%;
@@ -1537,14 +1561,14 @@ Runs every guard's `verify` on every node, one final time, before assembly.
    - ranked nodes (`passage`, `article`, `entry`, `full_doc`): the remainder.
    Unused sub-budget flows to ranked nodes.
 
-`atomic` nodes are included whole or not at all. The verbose trace records tokens per zone.
+`atomic` nodes are included whole or not at all. A first non-atomic node larger than its zone is truncated to fit and flagged `truncated_by_budget`. The verbose trace records tokens per zone.
 
 ### 10.2 History: exponential turn decay and rolling summary
 - When history exceeds its zone, each older turn pair `i` at age `Δt` is scored:
   $$\text{Retention}(i) = e^{-\lambda \Delta t} + \alpha \cdot \text{VocabOverlap}(i, \text{question}), \quad \lambda = 0.35,\ \alpha = 0.40$$
   The overlap is measured with `TextAnalyzer` tokens.
-- The last `min_recent_turns_kept` pairs (default 2) are always kept. Older turns are kept by score, in chronological order.
-- **Optional rolling summary.** When `context.history.summarize_overflow` is set, dropped turns are condensed into `ConversationState.rolling_summary`.
+- The last `context.min_recent_turns_kept` pairs (default 2) are always kept, shortened if they alone exceed the zone. Older turns are kept by score, in chronological order. The constants are `context.history_decay_lambda` and `context.history_overlap_alpha`.
+- **Rolling summary [later].** Condensing dropped turns into `ConversationState.rolling_summary` is not built yet. A summary already in the state is included.
 
 ### 10.3 Prompt layout for caching (RAG-CTX-1)
 The assembler **MUST** order the prompt as follows:
@@ -1567,10 +1591,10 @@ The assembler returns `cache_breakpoints` (after blocks 1 and 2). `ModelGateway`
 > - With a moving spoiler boundary, the prefix changes only when the reader crosses a section boundary (D-07).
 
 ### 10.4 Fencing untrusted content (RAG-SEC-1)
-- **Fence id.** A random 10-character base32 id is used in **both** tags: `<data-k7f2q9xw3m>` … `</data-k7f2q9xw3m>`. History and the question have their own fences (`<history-…>`, `<question-…>`) using the same id.
+- **Fence id.** A random 16-character hex id (64 bits) is used in **both** tags: `<data-9f3a1c07e2b84d65>` … `</data-9f3a1c07e2b84d65>`. History and the question have their own fences (`<history-…>`, `<question-…>`) using the same id.
 - **Lifetime.**
   - With conversation state, the id is kept in `ConversationState.fence_id`.
-  - Stateless calls use an id derived from `scope_stats().revision` and a per-process secret.
+  - Stateless calls use an id derived from the request's scope (tenant, document, domain) and a per-engine secret, so calls on the same scope share a prefix.
   - The id is **not** regenerated per request (D-06).
 - **Collision check.** Every request scans all fenced content (after normalization) for the fence id. On a collision, a new id is generated and stored in the returned state; this costs one cache miss and is rare.
 - **No HTML escaping.** Content is inserted verbatim, so `AT&T` and `a < b` stay intact.
@@ -1608,7 +1632,7 @@ The assembler returns `cache_breakpoints` (after blocks 1 and 2). `ModelGateway`
   - `stream_mode="buffered"` and non-streaming generation apply the same rules to the whole text. A flag anywhere other than the start is not parsed.
 - **Spoiler directive** (from `SequentialBoundaryGuard.prompt_rules()`):
   > *"SPOILER GUARD ACTIVE: the reader has reached position {B} and you have only been given text before it. Do not reveal, infer or hint at later events, fates or conclusions, even from prior knowledge of this work. If asked what happens later, say that answering would spoil sections beyond their current position."*
-- **RAG-RES-4 (empty retrieval).** When no nodes survive, the engine still generates (or, with `route=no_retrieval`, answers conversationally) under the grounding rules. It returns `answer_found="no"` with no citations and never invents sources.
+- **RAG-RES-4 (empty retrieval).** When a search finds nothing, the engine still generates under the grounding rules and returns `answer_found="no"` with no citations; it never invents sources. With `route=no_retrieval` no search ran: the engine answers conversationally with persona and history, and returns `answer_found=None` and `abstained=False`.
 
 > **Rationale:**
 > - News answers from general knowledge with a label; KB and Audio must not. A flag is better than prompt-only behaviour because a UI can show a "couldn't find it" state (NF-07, KB-10).
@@ -1780,14 +1804,14 @@ class EngineProfile(BaseModel):
     router: "RouterConfig"           # router name, enable_jev, enable_temporal_extraction, jev_timeout
     retrieval: "RetrievalConfig"     # default strategy, adaptive_rules, top_k, full_context_max_tokens,
                                      # local_window_radius_chars, always_include_summaries, rrf_k,
-                                     # fusion_weights, retrieve_max_results, relaxation
+                                     # fusion_weights, retrieve_max_results, relaxation, rerank_candidates
     transforms: list[str]
-    post_stages: list[str]
+    post_stages: list[str]           # names; arguments in parentheses, e.g. score_fusion(confidence)
     context: "ContextConfig"         # max_context_tokens, zone ratios, history caps, decay params
     generation: "GenerationConfig"   # strategy, temperature, system_preamble, grounding_mode,
                                      # fallback label, stream_mode
     citations: "CitationConfig"      # formatter, verify_quotes, policy, on_unverified
-    post_generation: list[str]
+    post_generation: list[str]       # seam: a non-empty list fails validation until these stages run
     ingestion: "IngestionConfig"     # splitter, sizes, summaries, ingestion stages
     guards: list[str] = []           # registered guard names always applied
     renderer: str = "default"
@@ -1798,7 +1822,6 @@ class EngineProfile(BaseModel):
     cache: "CacheConfig"
     trace_level: Literal["light", "verbose"] = "light"
     allowed_link_hosts: frozenset[str] = frozenset()
-    hydration_projection: str = "context"
     injection_scanner: str | None = None
     variants: dict[str, dict] = {}   # named overrides, e.g. {"search": {...}}
 
@@ -1837,7 +1860,7 @@ class EngineProfile(BaseModel):
 | `max_context_tokens` | 160,000 | 32,000 | 160,000 |
 | Grounding | strict (forced while the spoiler guard is on) | labelled_fallback | strict |
 | Citations | `ref`, verify offsets | `ref` | `ref` (or app formatter), `verify_quotes` on, coverage policy `flag` |
-| `fallbacks` | defaults | defaults (News may add `query_embedding: keyword`, see §18) | fail-loud: `rerank`, `jev`, `deadline`, `cache`, `ingest_embedding` set to `"raise"`; `observer_errors="raise"` |
+| `fallbacks` | defaults | defaults (News may add `query_embedding: keyword`, see §18) | fail-loud: `rerank`, `jev`, `deadline`, `cache` set to `"raise"`; `observer_errors="raise"` |
 | Stream mode | native | buffered (chat is not streamed yet) | native |
 
 > **Rationale:**
@@ -1879,8 +1902,9 @@ class EngineProfile(BaseModel):
 
 ### 12.4 Recipe B: NewsIntelligence
 1. **Adapter.** `PulseArchiveRAGStore(RAGStore[PulseArticleMeta])` wraps `match_intelligence_dynamic` and `fetch_deep_articles_by_ids`.
-   - Capabilities: native hybrid with raw scores, hydration (light rows first, `full_article_text` only after budgeting), `required_filter_keys={"domain_id"}`, `supported_custom_filters={"favorites_only": bool}`, `supported_date_fields={"created_at"}` with `time_basis="created_at = ingestion time"` (feed publication dates are read at ingestion only to skip old items and are not stored).
+   - Capabilities: native hybrid with raw scores, `required_filter_keys={"domain_id"}`, `supported_custom_filters={"favorites_only": bool}`, `supported_date_fields={"created_at"}` with `time_basis="created_at = ingestion time"` (feed publication dates are read at ingestion only to skip old items and are not stored).
    - The existing RPC is kept. It only has to pass `RAGStoreContractTests` (adding the raw-score columns if `returns_raw_scores` is declared); it does not have to be rewritten to the §4.7 template.
+   - The adapter keeps News's RPC followed by a field load and returns complete rows (§4.3): one adapter with the chat fields, one with the feed fields.
 2. **Renderer.** `PulseRenderer` provides the three existing views (embed, rerank, prompt), a URL key for dedup, `created_at` for recency, and priority as a feature.
 3. **Chat.**
    ```python
@@ -1933,7 +1957,7 @@ class EngineProfile(BaseModel):
       variant: str | None
   ```
   - `CallContext` is the same object the trace records for the call, so a guard's decision can be matched to its trace entry. A per-user cap reads `ctx.tenant_or_user_id`.
-  - It is passed to `RAGEngine(budget_guard=...)` or per request. Caps, running totals and accounting tables stay in the app; the guard reads the app's own running total to decide.
+  - It is passed to `RAGEngine(budget_guard=...)`. Caps, running totals and accounting tables stay in the app; the guard reads the app's own running total to decide.
   - With `enforces_cost=True`, engine construction fails if any bound model has no price (§13.3), because a dollar limit could not be checked for it.
   - Ingestion calls go through the guard too (RAG-ING-12).
   - **The app decides, the engine does not guess.** `"skip"` on an optional stage (Jev, rerank, extra variants, rolling summary, ingestion summary) skips it as degradation DG-11. `"skip"` on a required stage raises `ProfileConfigError`. Raising `BudgetExceeded` aborts the request, and the exception reaches the caller.
@@ -2011,7 +2035,7 @@ class RAGTrace(BaseModel):
 | **DG-05** | Intent output parses but has out-of-range values | Clamp to range or default | on | WARNING | n/a |
 | **DG-06** | Reranker error or timeout | Keep incoming order, truncated to `top_k` | on | ERROR | n/a |
 | **DG-07** | Query embedding is a zero vector | Keyword search instead | **opt-in** | ERROR | Raise `EmbeddingProviderError` (also the default without opt-in) |
-| **DG-08** | Some nodes in an ingested section embed to zero | Skip those nodes, report `passages_failed` | on | ERROR | Whole section zero: raise `EmbeddingProviderError` |
+| **DG-08** | Some nodes in a `prepare_nodes` batch fail to embed | Return the good nodes and list the failed ones | on | ERROR | No node succeeded: raise `EmbeddingProviderError` |
 | **DG-09** | Output truncated (`finish_reason="length"`) | Retry once with a larger allowance or the next model | on | WARNING | Raise `GenerationError(reason="truncated")` |
 | **DG-10** | Deadline: an optional stage will not fit in the remaining time | Skip that optional stage (Jev, rerank, extra variants, HyDE, rolling summary) | on | ERROR | A required stage past the deadline: raise `DeadlineExceeded` |
 | **DG-11** | `BudgetGuard` returns `"skip"` for an optional stage | Skip that stage | app decides | WARNING | Guard raises: `BudgetExceeded` reaches the caller |
@@ -2019,7 +2043,7 @@ class RAGTrace(BaseModel):
 | **DG-13** | Observer raises | Continue | on (`observer_errors="log"`) | ERROR with traceback | `observer_errors="raise"`: propagate |
 | **DG-14** | Summarizer fails at ingestion (after DG-01, DG-02) | Continue without a summary, `summary_status="failed"` | **opt-in** | ERROR | Raise `RAGStageError("summarizer")` (also the default without opt-in) |
 
-- `profile.fallbacks` turns opt-in rows on (`{"query_embedding": "keyword", "summarizer": "skip"}`) and can turn any default-on row off (`{"rerank": "raise"}`). Keys are `rerank`, `jev`, `intent`, `generation`, `summarizer`, `query_embedding`, `ingest_embedding`, `cache`, `observer`, and `deadline` (DG-10); unknown keys fail `validate()`.
+- `profile.fallbacks` turns opt-in rows on (`{"query_embedding": "keyword", "summarizer": "skip"}`) and can turn any default-on row off (`{"rerank": "raise"}`). Keys are `rerank`, `jev`, `summarizer`, `query_embedding`, `cache`, and `deadline` (DG-10); unknown keys fail `validate()`. Model lists and `observer_errors` control the generation and observer rows.
 - **Not failures, so not in the table:** empty retrieval (a normal `answer_found="no"` result, RAG-RES-4), citations that fail verification (removed or flagged per §11.2), fence-id rotation on collision (§10.4), and an opt-in relaxation step (§7.6, reported in `relaxations`).
 - **Never degradable** (always raise, whatever `fallbacks` says): store errors (`RetrievalError`, wrapping the cause), missing required scope, unsupported filters, guard errors, embedding-space mismatch, configuration errors, blocked output, and a stream that breaks after it started.
 
@@ -2176,7 +2200,8 @@ engine.retrieve(request, intent=None) -> RAGRetrievalResult            # retriev
 engine.generate_from_nodes(request, nodes, intent=None) -> RAGResponse # generation over given nodes;
                                                                        # guards still applied (§5.3 #6)
 engine.verify_answer(answer_text, response_or_turn) -> list[RAGCitation]  # post-generation chain only
-engine.prepare_nodes(nodes) -> list[PreparedNode]                       # embed + fingerprint, no write (§6.4.1)
+engine.prepare_node(node) -> PreparedNode                               # one unit, or raises (§6.4.1)
+engine.prepare_nodes(nodes) -> PreparedBatch                            # good nodes plus failed ones, no write (§6.4.1)
 ```
 Every built-in stage class can also be constructed and run standalone with a hand-built context. The tests in §16 do exactly this.
 
@@ -2295,7 +2320,7 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-01** | Splitter | RAG-ING-1/2 | English, Chinese and mixed text split near 1,200 / 150 on sentence boundaries; `section.text[local_start:local_end] == node.text` for every node. |
 | **AC-RAG-02** | Splitter | §6.2 Markdown | Headings 1–6 become `breadcrumb`. Fenced code and tables are never cut mid-block below `max_atomic_chars`. Oversized tables split by rows with the header repeated. Offsets are exact. |
 | **AC-RAG-03** | Splitter | §6.2 pass-through | One input unit yields one node, with a span covering the unit. |
-| **AC-RAG-04** | Ingestion | RAG-ING-4 | A zero vector for one node excludes that node from upsert. All-zero vectors for a non-empty section raise `EmbeddingProviderError`. |
+| **AC-RAG-04** | Ingestion | RAG-ING-4 | A zero vector for any node raises `EmbeddingProviderError` naming it, and nothing of that section is written. |
 | **AC-RAG-05** | Ingestion | RAG-ING-5/6 | `start_section_seq=3` skips sections 0–2. The callback fires per section with correct counts. A second call with later sections appends without changing earlier offsets. |
 | **AC-RAG-06** | Lifecycle | §6.6 sync | `sync_document` embeds only changed nodes, deletes vanished ones, skips unchanged ones (`passages_skipped_unchanged`), and preserves their node ids. |
 | **AC-RAG-07** | Lifecycle | RAG-ING-7 | A store whose `embedding_space()` differs from the engine's embedder fails `validate()`, and a query raises `EmbeddingSignatureMismatch`. |
@@ -2327,7 +2352,7 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-33** | Dedup | §9.2 | `IdentityDeduplicator(url)` keeps one node per URL, the highest scored. |
 | **AC-RAG-34** | Rerank | §9.3, RAG-RES-2 | `article` nodes are reranked. `ordered` nodes keep their order. HTTP 500, a timeout or a missing key keeps the incoming order and records a degradation. |
 | **AC-RAG-35** | Boosters | §9.4 | Recency and fusion scores are deterministic under a fixed clock, and the weights are recorded. |
-| **AC-RAG-36** | Hydration | §9.6 | Light nodes are hydrated exactly once, only for nodes that survive budgeting. |
+| **AC-RAG-36** | Complete rows | §4.3 | Fields an adapter loaded, including full article text in `MetaT`, reach rerank and the prompt through the renderer, with no second load by the engine. |
 | **AC-RAG-37** | Fencing | RAG-SEC-1 | A forged `</data-ID>`, a zero-width-split `</ data>`, and the real fence id embedded in content are all neutralized. The id is on both tags. `AT&T` and `a < b` are not escaped. A collision rotates the id. |
 | **AC-RAG-38** | Layout | §10.3, D-07 | Over two turns with `B` moving inside the same section, the system and stable-data blocks are byte-identical. Crossing a section boundary changes them. |
 | **AC-RAG-39** | Grounding | §10.5, D-05 | `labelled_fallback` is overridden to strict while a sequential guard is active. `[[answer_found=no]]` is parsed and stripped, and sets `abstained=True` in strict mode. `[[answer_found=partial]]` gives `"partial"` with `abstained=False`. A missing flag yields `None`. |
@@ -2353,7 +2378,7 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-59** | Summary units | RAG-ING-9, §5.2 | One 60,000-character section with the boundary at 55,000: a recap query's context contains unit summaries covering the earlier part, the local window, and no text or summary after the boundary. |
 | **AC-RAG-60** | Threshold | §9.1, §4.6 #11 | In a native-hybrid store, a keyword-only hit (`vector_score=None`) survives a cosine `ThresholdFilter` and the store-side floor. |
 | **AC-RAG-61** | Budget | §13.1 | A test guard reads `ctx.tenant_or_user_id` and returns `"skip"` for rerank for one user only; other users are reranked. |
-| **AC-RAG-62** | Profile | §12.1, §12.2 | `validate()` rejects a profile whose Tier 0 gate plus reserved zones exceeds `max_context_tokens`. The `knowledge_base()` preset raises on an observer exception and on a partially zero-vector section. |
+| **AC-RAG-62** | Profile | §12.1, §12.2 | `validate()` rejects a profile whose Tier 0 gate plus reserved zones exceeds `max_context_tokens`. The `knowledge_base()` preset raises on an observer exception. |
 | **AC-RAG-63** | Snippet | §3.4, §4.6 #14 | With a store that sets `snippet` in `keyword_search`, `retrieve()` with `keyword_only` returns the store's snippet unchanged; a store without snippets returns `None`. No snippet text appears in any prompt. |
 | **AC-RAG-64** | CJK tokens | RAG-ING-11, §4.6 #13 | `search_tokens` are set at ingestion; `exact_terms` arrive as `"phrase"` groups; `build_tsquery` output contains no operator characters from token text; an analyzer version change makes `needs_reindex` report `fts_stale=True` and `embeddings_stale=False`. |
 | **AC-RAG-65** | Ingestion budget | RAG-ING-12 | Five sections with a guard that raises during the third: sections one and two are stored, their callbacks ran and their usage is reported, nothing of section three is written, and the exception propagates. A guard returning `"skip"` for the summary yields `summary_status="skipped"`. |
@@ -2362,9 +2387,13 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-68** | Cost totals | §13.1 | A request with one unpriced stage returns the sum of the others, `cost_complete=False` and the model in `unpriced_models`. A guard with `enforces_cost=True` and an unpriced bound model fails engine construction; a guard reading `ctx.est_cost_usd` stops a request at a dollar limit. |
 | **AC-RAG-69** | Pricing modules | §15 | A listed model's `LLMUsage.cost_usd` equals tokens times the table price, with `price_table_version`; the same holds for `JevClient`, `generate_embedding_with_usage` (`estimated=True`) and `rerank.py`; an unlisted model gives `None`; an override takes precedence; `usage_total.cost_usd` equals the sum of the module-reported costs. |
 | **AC-RAG-70** | Usage on failure | RAG-OPS-1, RAG-OPS-2 | For each of a truncated generation, a blocked generation, all models failing, a section failing mid-ingestion, and a stream closed after two deltas, the app receives a usage total (on the exception, the `error` event, or `RAGStream.usage_total`) equal to the calls actually made. A timeout attempt appears with `billing="unknown"`. A guard reading `ctx.request_spent` stops a request at its third paid call. An `LLMClient` structured-output parse failure raises with the call's usage attached. |
-| **AC-RAG-71** | Prepared nodes | RAG-ING-13, §4.6 #15 | A row inserted by the app from `prepare_nodes` is skipped by `sync_document` and `reconcile` (no re-embedding); changing the node's text makes it stale; the fingerprints equal those `upsert_section_nodes` would write. A failed embedding returns `vector=[]`, never a zero vector. |
+| **AC-RAG-71** | Prepared nodes | RAG-ING-13, §4.6 #15 | A row inserted by the app from `prepare_nodes` is skipped by `sync_document` and `reconcile` (no re-embedding); changing the node's text makes it stale; the fingerprints equal those `upsert_section_nodes` would write. In a batch, a failed node is listed in `failed` with no vector or fingerprint, and the good nodes are returned; a batch with no success raises. |
 | **AC-RAG-72** | Flag streaming | §10.5 | `Based on…` is released at its first character with `answer_found=None`; `[Source](u)` at its second. `\n[[answer_found=partial]]\nText` emits only `Text` and sets the flag, under any chunking down to one character per chunk. `[[answer_found=maybe]]` is removed, logged at WARNING and gives `None`. A flag-like text that never closes is released at 32 characters; one still held at end of stream is released as a last delta. |
 | **AC-RAG-73** | Sentence cut | §5.2 rule 2, RAG-ING-2 | With `B` mid-sentence in English, Chinese and mixed text, the node ends at the last complete sentence before `B`, including closing quotes (`他说：“走吧。”`); `3.14` is not treated as a sentence end. `span.char_end` matches the shortened text and never exceeds `B`. A passage and a local window at the same `B` get the same cut. With no sentence end before `B`, or one more than `max_snap_back_chars` back, the cut is exactly `B`. A second guard pass changes nothing. The canary test (AC-RAG-23) passes with this cut. |
+| **AC-RAG-74** | Ranked limits | §9, §9.3 | With 30 summaries, a local window and passages, `top_k=8` keeps every summary and the window and cuts only passages. Tier 0 returns the whole scope under any strategy override or secondary query. A rerank stage receives `top_k × 3` candidates. |
+| **AC-RAG-75** | Follow-up reuse | §7.7 | A follow-up with no new terms runs no search or embedding. One with new terms shares the ranked slots evenly with prior passages. A request with `cursor_offset` always gets a current local window. Repeated and oversized `prior_nodes` are capped on input. |
+| **AC-RAG-76** | History | §10.1, §10.2 | The history zone is capped by `reserved_history_tokens`. The last two exchanges are always present, shortened if oversized. Older turns are chosen by retention score and stay in chronological order. |
+| **AC-RAG-77** | Per-node preparation | §6.4.1 | `prepare_node` raises on failure. `prepare_nodes` returns the good nodes and names the failed ones, and raises only when none succeeded. |
 
 ### 16.2 Delivery phases (Q-04)
 Delivery follows production need: first what both production apps share, then AudioReading (which has no RAG today), then the NewsIntelligence migration, then KnowledgeBase (still in development, so the easiest to adapt) and everything else. Each step ends with every existing `cody-ai-shared-lib` test and every new `tests/rag/` test passing.
@@ -2374,7 +2403,7 @@ Delivery follows production need: first what both production apps share, then Au
 **P1 · Shared foundation (needed by Audio and News)**
 - Lib-wide model-module changes (§15): `finish_reason`, usage with cost on `LLMClient`, `JevClient`, `generate_embedding_with_usage` and the new `rerank.py`; `pricing.py` with the central table, estimates and overrides; output-limit policy.
 - Build: `errors`, `models` (complete), `granularity`, `render`, `ports` (complete signatures), `memory_store`, `testing/contract`, `guards` (all built-ins), required scope and `custom` filter checks, `registry`, `profile` with `validate()` and `fingerprint()`, `text/analyzer` with `estimate_tokens`, `gateway` (usage, budget guard, model fallback), `runtime` (deadline, pool, clock, rng), `trace` (light and verbose), `degradation` (agreed-degradation table, `fallbacks`), logging policy.
-- Query path: routers `none`, `heuristic`, `llm`, `auto`; `QueryIntent[ExtT]`; public `route()`; Tier 1 and Tier 2 (native and Path B); threshold, offset and identity dedup, Jina rerank, hydration, guard enforcement; budgeter and turn decay; fence; `stuff` generation; grounding modes; `ref` citation formatter and verifier; output sanitizer; `query()` and `retrieve()` (buffered).
+- Query path: routers `none`, `heuristic`, `llm`, `auto`; `QueryIntent[ExtT]`; public `route()`; Tier 1 and Tier 2 (native and Path B); threshold, offset and identity dedup, Jina rerank, guard enforcement; budgeter and turn decay; fence; `stuff` generation; grounding modes; `ref` citation formatter and verifier; output sanitizer; `query()` and `retrieve()` (buffered).
 - Tests: AC-RAG-09, 12, 13, 15, 16, 20, 25–28, 31–34, 36, 37, 39–41, 43, 44, 46, 47, 49, 50, 51, 53, 55–57, 60–62, 68–70.
 
 **P2 · AudioReading adoption**
@@ -2385,7 +2414,7 @@ Delivery follows production need: first what both production apps share, then Au
 - Tests: AC-RAG-01, 04–08, 10, 22–24, 29, 30, 38, 45, 48, 54, 58, 59, 64–67, 71–73.
 
 **P3 · NewsIntelligence migration (chat first, then feed search)**
-- Build: native hybrid raw-score handling, `"card"`/`"context"` hydration projections, temporal resolver with `date_field` and `applied_filters`, relaxation ladder, `SecondaryQueryFanOut`, recency booster, score fusion, `PassThroughSplitter` and standalone embedder, `retrieve()` sizing for the feed (§8.10), named profile variants (`news_chat`, `news_search`).
+- Build: native hybrid raw-score handling, temporal resolver with `date_field` and `applied_filters`, relaxation ladder, `SecondaryQueryFanOut`, recency booster, score fusion, `PassThroughSplitter` and standalone embedder, `retrieve()` sizing for the feed (§8.10), named profile variants (`news_chat`, `news_search`).
 - News builds its adapter, renderer and router extension, and runs the contract kit in its CI.
 - Tests: AC-RAG-03, 17–19, 35, 63, plus a 2,000-result `retrieve()` test.
 
@@ -2550,7 +2579,7 @@ Each entry: the decision, the alternative rejected, and why. Sections refer here
 | C-09 granularity traits | §3.3, D-15 | C-29 usage, budget | §13.1 |
 | C-10 parent summaries | §3.4, §6.3, §8.6 | C-30 trace, observer | §13.2, D-10 |
 | C-11 score semantics | §3.5, §9.1 | C-31 degradation, failure model | §13.3, D-09 |
-| C-12 hydration | §4.3, §9.6 | C-32 model fallback | §10.7 |
+| C-12 complete rows (hydration until 1.1.14) | §4.3 | C-32 model fallback | §10.7 |
 | C-13 intent, routers | §7.1, §7.2 | C-33 profile | §12.1, D-12 |
 | C-14 Jev default off | §7.4, D-14 | C-34 caching | §10.3, §13.5 |
 | C-15 retrieve() mode | §8.10 | C-35 splitters, embedder | §6.2, §6.4 |
@@ -2586,6 +2615,7 @@ Each entry: the decision, the alternative rejected, and why. Sections refer here
 | **1.1.11-draft** | 2026-11-08 | cody-ai-shared-lib agent | Moved reference SQL templates from `specs/sql/` to package data files in `cody_ai_shared_lib/rag/sql/` (§4.7, §16.2), shipping them inside the package as data files to copy while resolving flat-layout package discovery (Q-01 still holds). Added `[tool.setuptools.package-data]` and updated AC-RAG-67. Marked `specs/archive/RAG_SPEC_1.0.0-draft.md` as superseded. |
 | **1.1.12-draft** | 2026-11-08 | cody-ai-shared-lib agent | Minor contract alignment from Phase 1–3 code review: added `"degradation"` to `RAGStreamEvent.event` in §3.11 (matching §10.8); added `doc_id: str | None = None` to `ReindexStatus` in §6.6; noted single-argument `(ctx: CallContext)` support on `BudgetGuard.before_call` in §13.1. |
 | **1.1.13-draft** | 2026-11-08 | cody-ai-shared-lib agent | `BudgetGuard.before_call` returns to the single five-argument signature; the optional one-argument form added in 1.1.12 is removed. |
+| **1.1.14-draft** | 2026-11-08 | cody-ai-shared-lib agent | Owner decisions after the Phase 1–3 review; **changes the contract the app agents agreed through 1.1.8.** Separate hydration removed: retrieval methods return complete rows, and apps choose fields through their adapter and renderer (§4.3). Embedding failures are all-or-nothing per section or single node, and per node in `prepare_nodes`, which now returns `PreparedBatch` (§6.4, §6.4.1, DG-08); `ingest_embedding` and `passages_failed` removed. `entity_mode="boost"` and `EntityBooster` removed; the default is `"ignore"`. `retrieval.rerank_candidates` added; `top_k`, rerank and variant fusion limit only ranked nodes. Follow-up reuse rule defined (§7.7). History capped by `reserved_history_tokens`, default 8,000. `no_retrieval` returns `answer_found=None`. Fence id is 16 hex; stateless ids derive from the request scope. `fallbacks` keys `intent`, `generation` and `observer` removed. `router` selection and layout corrected to match the code; `transforms/` and `postretrieval/` are the package names; `TransformContext` defined. Acceptance criteria added and revised. |
 
 ## Appendix C. Requests kept in the apps (pushbacks)
 
