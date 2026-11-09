@@ -54,7 +54,9 @@ from typing import Any
 
 from typesafe_sdk import Choice, Noul, Score, TypeSafeClient  # re-exported for callers
 
-__all__ = ["Choice", "Noul", "Score", "JevClient", "JevResult", "NoulAnswer"]
+from .pricing import PRICE_TABLE_VERSION, compute_cost
+
+__all__ = ["Choice", "Noul", "Score", "JevClient", "JevResult", "JevUsage", "NoulAnswer"]
 
 logger = logging.getLogger("shared-jev")
 
@@ -78,15 +80,29 @@ def _is_retryable(exc: Exception) -> bool:
 
 
 @dataclass
+class JevUsage:
+    """Usage accounting for a Jev call."""
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float | None = None
+    price_table_version: str | None = None
+    estimated: bool = False
+
+
+@dataclass
 class JevResult:
     """Return value of JevClient.system_one(): every question's raw SDK answer object
     (each carries the type-specific value — .noul / .choice / .score — plus
-    .confidence), alongside call metadata."""
+    .confidence), alongside call metadata and cost tracking."""
     answers: dict[str, Any]
     tokens_in: int
     tokens_out: int
     ms: float
     model: str
+    cost_usd: float | None = None
+    price_table_version: str | None = None
+    estimated: bool = False
+    usage: JevUsage | None = None
 
 
 @dataclass
@@ -108,9 +124,8 @@ class JevClient:
     mirroring LLMClient in llm.py); the underlying SDK client is created lazily on
     first use.
 
-    Reads TYPESAFE_API_KEY and TYPESAFE_BASE_URL from the environment by default;
-    override per-instance via the api_key/base_url constructor arguments (e.g. a
-    project that needs to call two different TypeSafe accounts/gateways).
+    Reads TYPESAFE_API_KEY (or VERCEL_API_KEY) and TYPESAFE_BASE_URL from the
+    environment by default; override per-instance via constructor arguments.
     """
 
     def __init__(
@@ -132,10 +147,10 @@ class JevClient:
 
     def _get_client(self) -> TypeSafeClient:
         if self._client is None:
-            api_key = self._api_key or os.getenv("TYPESAFE_API_KEY")
+            api_key = self._api_key or os.getenv("TYPESAFE_API_KEY") or os.getenv("VERCEL_API_KEY")
             if not api_key:
                 raise RuntimeError(
-                    "TYPESAFE_API_KEY is not set. Jev calls cannot be made without it "
+                    "TYPESAFE_API_KEY (or VERCEL_API_KEY) is not set. Jev calls cannot be made without it "
                     "— there is no mock fallback in this shared client; a caller that "
                     "wants a mock/offline mode should implement that itself (see the "
                     "benchmark project's jev_client.py for a worked example of a mock "
@@ -183,7 +198,25 @@ class JevClient:
                 tokens_in, tokens_out = self._extract_usage(resp)
                 answers = {key: resp.answers.get(key) for key in questions}
                 logger.debug(f"[Jev] {model} succeeded (attempt {attempt + 1}), {ms:.0f}ms.")
-                return JevResult(answers=answers, tokens_in=tokens_in, tokens_out=tokens_out, ms=ms, model=model)
+                cost_usd = compute_cost("jev", input_tokens=tokens_in, output_tokens=tokens_out)
+                usage = JevUsage(
+                    input_tokens=tokens_in,
+                    output_tokens=tokens_out,
+                    cost_usd=cost_usd,
+                    price_table_version=PRICE_TABLE_VERSION,
+                    estimated=False,
+                )
+                return JevResult(
+                    answers=answers,
+                    tokens_in=tokens_in,
+                    tokens_out=tokens_out,
+                    ms=ms,
+                    model=model,
+                    cost_usd=cost_usd,
+                    price_table_version=PRICE_TABLE_VERSION,
+                    estimated=False,
+                    usage=usage,
+                )
 
             except Exception as exc:
                 last_exc = exc
