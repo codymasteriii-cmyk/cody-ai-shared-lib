@@ -288,7 +288,7 @@ cody_ai_shared_lib/
 
 > **Dependency note:**
 > - Declare `pydantic>=2.0.0` explicitly in `pyproject.toml`. The only other new runtime dependency allowed is `httpx` or `requests` for Jina, whichever the lib already uses.
-> - Optional extras, never imported by the core:
+> - Optional extras, never imported by the core (declared in `pyproject.toml` since 1.2.0):
 >   - `[rag-cjk]` for `jieba`;
 >   - `[rag-eval]` reserved for the future evaluation system (postponed, Q-06).
 > - The 512 MB hosts (News, Audio) MUST be able to import `cody_ai_shared_lib.rag` without any extra.
@@ -840,6 +840,14 @@ The kit writes the way the engine does: through `upsert_section` with a `Section
 16. **Scoped store** (with `make_scoped_store`). Over one shared store, the view for user A raises `ScopeViolationError` on a read naming user B and on a write for user B. The view for user B sees none of A's rows, and cannot write into or delete A's document. A still sees exactly its own rows (§5.6).
 17. **Stats match the full scope** (stores with `supports_full_scope_fetch`). `scope_stats(f).char_count` equals the text `fetch_full_scope(f)` returns, and `total_tokens` is positive exactly when that text is non-empty (§4.2, INT-06).
 18. **Full-scope granularity** (stores with `supports_full_scope_fetch`). A two-section scope returns at least two nodes, in document order, without overlap; when the kit wrote the scope, no node crosses a section boundary (§4.2, INT-07).
+19. **Summary layer** (stores with `supports_parent_summaries`). Ranked searches never return summaries; under a boundary, `fetch_parent_summaries` admits a summary only when `char_end <= B` (1.2.0).
+20. **Per-document boundaries** (stores with `supports_sequential_boundary`). `max_char_offset_by_doc` applies a separate boundary per document.
+21. **Partial writes never delete.** A write holding only one changed passage of a section leaves the section's other passages readable (§4.4.1).
+22. **Ordering.** Distinct cosine scores come back in descending order, ranks start at 1, and a tie keeps the same order across calls.
+23. **Deletes and revisions.** `delete_nodes`, `delete_sections`, `current_revisions` and `fetch_nodes` behave as declared.
+24. **Atomic passages and summary.** While a section with passages and a summary is written, a reader never sees part of the passages.
+
+Checks 17 and 18 seed engine-shaped data: the splitter's overlapping passages (1.2.0).
 
 The kit also ships:
 - `BrokenStore`, a deliberately wrong store that must fail the kit; the lib's own tests also show that checks 15, 17 and 18 fail a store that computes its own fingerprints, reports zero stats for served text, or returns one node for a whole scope;
@@ -858,13 +866,15 @@ The lib ships `cody_ai_shared_lib/rag/sql/` inside the package as data files to 
 
 | File | Pattern it captures |
 | :--- | :--- |
-| `hybrid_search.sql` | Vector and full-text branches, each filtered **before** its limit, with per-branch caps (`top_k × 2`), RRF in SQL, and raw `vector_score`/`keyword_score` returned next to `rrf_score`; the cosine floor applied to the vector branch only |
-| `vector_search.sql` | Filtered top-k by cosine that returns `k` rows for a small target document (exact scan when `doc_id` is fixed, or iterative index scan), the filtered-recall trap of §4.6 #7 |
-| `sequential_boundary.sql` | `char_start < boundary` predicates, per-document boundaries via a `(doc_id, boundary)` array argument, and summary rows admitted only when `char_end <= boundary` |
-| `fingerprints.sql` | Columns `content_hash`, `embedding_model`, `embedding_dim`, `fts_signature`, `token_estimate`, `revision`, plus the fingerprint query used by `sync_document` |
-| `upsert_section.sql` | One RPC that writes a section's passages and summaries in a single transaction, because supabase-py cannot run a multi-statement transaction from Python (RAG-ING-10) |
-| `indexes.sql` | HNSW on the embedding column, GIN on the FTS column, b-tree on `(doc_id, char_start)` and on the tenant or scope column |
+| `hybrid_search.sql` | Vector and full-text branches over one scoped set (owner, domain, documents, per-document boundary, **passages only**), each limited to `match_count × 2` after filtering; RRF in SQL with raw `vector_score`/`keyword_score` and ranks; the cosine floor on the vector branch only; snippets via `ts_headline` |
+| `vector_search.sql` | Filtered top-k by cosine over passages only, with a mandatory owner predicate and per-document boundaries; pgvector ≥ 0.8 iterative index scans so a small target document still returns `k` rows (check 7) |
+| `sequential_boundary.sql` | `fetch_parent_summaries`: summaries admitted only when `char_end <= B` (single or per-document boundary), optional level, document order |
+| `fingerprints.sql` | Table with owner columns (`tenant_or_user_id`, `domain_id`), summary columns (`is_summary`, `parent_kind`, `unit_seq`), and the fingerprint as given (`content_hash`, nullable `embedding_signature`, `fts_signature`), plus `get_document_fingerprints`, which returns the stored values and never rebuilds them |
+| `upsert_section.sql` | `upsert_section(doc, seq, owner, passages, unit_summaries, section_summary)`: one transaction, `INSERT … ON CONFLICT (id) DO UPDATE`, **never deletes**, refuses a document or row another owner holds; a separate owner-scoped `delete_nodes` |
+| `indexes.sql` | HNSW on the embedding column, GIN on the FTS column, b-tree on `(tenant_or_user_id, doc_id, is_active)` and `(doc_id, char_start)`, a partial index for summaries |
 | `cjk_fts.sql` | Two options for Chinese keyword search: a `simple`-config `tsvector` over `TextAnalyzer` tokens, or PGroonga where the Supabase plan offers it |
+
+Every template function (1.2.0) is `SECURITY DEFINER` with `SET search_path = public, pg_temp`, raises when the owner is missing, and slices text by reference with chunk-relative offsets (`p.char_start - c.char_start`). A test in the lib pins these rules.
 
 Every template MUST also show:
 - **Text by reference.** A variant where the passages table stores only offsets, and the text is sliced from a parent table (AudioReading's `audiolib_passages` over `audiolib_article_chunks`).
@@ -977,7 +987,7 @@ See §10.3 and D-07.
   - `custom` keys must agree. A conflict yields an **empty scope**, and the engine returns the empty-retrieval answer (RAG-RES-4).
   - **Empty scope is explicit (1.2.0).** A conflict sets `RAGFilterSpec.empty_scope`; the engine then makes no store call, `retrieve` returns no nodes, and `plan()` returns strategy `none` with reason "empty scope". This is distinct from a caller leaving a required key out, which still raises `MissingRequiredScopeError` (§5.6).
   - **Date windows (1.2.0).** The intent's soft window is **intersected** with the caller's hard range, never dropped because one is set. When the two do not overlap, the hard range alone applies: a soft constraint never empties a hard scope. The guard enforces only the hard range, and relaxation widens or drops the soft window back to the hard range, never past it.
-- **Narrow-only inference.** An app-supplied `FilterInferencer` (KB-13) may propose extra filters from the question. Its patch is intersected, never unioned.
+- **Narrow-only inference.** An app-supplied `FilterInferencer` (KB-13) may propose extra filters from the question. Its patch is intersected, never unioned. Interface (1.2.0): `infer(request, intent) -> dict | FilterPatch | None`, passed as `RAGEngine(filter_inferencer=...)` and shared by sibling engines; the proposal goes through `RAGFilterSpec.patch`, so a conflict gives an empty scope, never a wider search.
 - `applied_filters` on the result reports the final effective spec.
 
 > **Rationale:**
@@ -1701,7 +1711,7 @@ The assembler **MUST** order the prompt as follows:
    - history;
    - the question.
 
-The assembler returns `cache_breakpoints` (after blocks 1 and 2). `ModelGateway` maps them to provider cache controls (§15).
+The assembler returns `cache_breakpoints` (after blocks 1 and 2) and, since 1.2.0, `user_blocks`: the user message as ordered `(text, cacheable)` blocks whose texts join to `user_message`, the first holding the stable data. `ModelGateway` passes them to `LLMClient`, which sends Claude content blocks with `cache_control` on the cacheable one (and on the system prompt); providers with implicit prefix caching (Gemini) receive the same joined text, so the stable prefix stays byte-identical (§15).
 
 > **Rationale:**
 > - Tier 0 cost is dominated by re-sending the same document. Provider prompt caching only works on an identical prefix, so the layout must keep that prefix byte-stable (AUD-12, AUD-22, KB-18).
@@ -1827,7 +1837,7 @@ class GenerationStrategy(Protocol):
 
 ### 10.10 Degradation disclosure **[v1]**
 Generation runs inside the engine, so the caller says in advance how an answer should treat degradations that fired before generation (for example, the reranker failed):
-- `profile.generation.degradation_disclosure` (overridable per request): `"silent"` (default) composes the answer normally; the degradations are reported only in the response and the stream. `"note"` adds each degradation's `impact` to the volatile prompt block with an instruction to mention it briefly to the user.
+- `profile.generation.degradation_disclosure` (overridable per request with `RAGQueryRequest.degradation_disclosure`; implemented in 1.2.0): `"silent"` (default) composes the answer normally; the degradations are reported only in the response and the stream. `"note"` adds each degradation's `impact` to the volatile prompt block with an instruction to mention it briefly to the user.
 - For full control, the caller runs `retrieve()` (whose result carries `degradations`), decides, and then calls `generate_from_nodes()` with its own `system_prompt_variables`.
 
 > **Rationale:** The owner wants the caller to decide whether a user hears about a degraded step. A per-request switch covers the common choices; the two-call path covers everything else. The note goes in the volatile block so the cached prefix does not change (§10.3).
@@ -2376,7 +2386,7 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | Provider output-limit policy (e.g. do not send `max_tokens` to Gemini where KB found it harmful; use `max_completion_tokens` for GPT reasoning models) as `LLMClient` behaviour, not a RAG rule | R-11b | P1 |
 | Provider routing for text: direct Google GenAI (`gemini-*`), direct Anthropic (`claude-*`, with `ThinkingBlock` extraction), and direct OpenAI (`gpt-*` using `OPENAI_API_KEY`). Text generation strictly uses these three standard providers; image/video/multimodal models are handled by dedicated modules (§15.2). | Ecosystem-wide LLM access | P1 |
 | `LLMClient.stream(...) -> Iterator[LLMStreamChunk]` (text deltas, then a final chunk with usage, cost and `finish_reason`) | §10.8 native streaming; a profile asking for native streaming without it fails at startup | P2 |
-| Cache breakpoint pass-through (`cache_breakpoints` → Anthropic `cache_control`; Gemini context caching where available) | §10.3; without it the layout still applies, with no explicit cache controls | P2 |
+| Cache breakpoint pass-through (`cache_breakpoints` and `user_blocks` → Anthropic `cache_control` on the system prompt and the stable user block; Gemini context caching where available) | §10.3; without it the layout still applies, with no explicit cache controls | P2 |
 
 ### 15.2 Other model modules
 - **Errors after a billed response (all model modules).** When a module raises after the provider has returned a billed response (for example `LLMClient` failing to parse structured output, or a response blocked after generation), the exception carries the `usage` of that call (`ModelCallError.usage`, with cost). A call that fails without a response (a timeout, a dropped connection) is reported with the estimated input tokens, zero output and `billing="unknown"`, so the caller decides whether to count it. This gives direct callers the same failure-path accounting as RAG (RAG-OPS-1).
@@ -2558,6 +2568,10 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-102** | Summarizer | §6.3 | The prompt forbids prior knowledge and the source arrives fenced. Under `skip`, one failed unit gives `summary_status="partial"`; a `ProfileConfigError` still propagates. A section longer than four units is never sent whole. |
 | **AC-RAG-103** | Errors and config | §12.1, §13.3, §13.8 | Degradation reasons are one line of at most 200 characters. An intent outage raises `GenerationError`, unparseable output `IntentParseError` without the output text. Unknown fallback values and unimplemented citation policies fail validation. The fingerprint ignores dict order. `prepare_nodes` failures carry a reason. Ingestion uses `profile.ingestion.granularity`. |
 | **AC-RAG-104** | Store and stream hygiene | §4.5, §10.8 | `to_jsonl`/`from_jsonl` keep stored fingerprints and owners. `delete_document` counts summaries and clears owners. A paragraph break ends a sentence. `generate_from_nodes` honours `request.variant`. |
+| **AC-RAG-105** | Kit strength | §4.6 | Checks 19–24 pass for the reference store with and without a required tenant; checks 17–18 run on overlapping passages. |
+| **AC-RAG-106** | SQL templates | §4.7 | The upsert template contains no DELETE in `upsert_section` and refuses another owner; every template function pins `search_path` and filters on the owner; searches return passages only with chunk-relative slicing; summaries are admitted by `char_end`; fingerprints are stored, not rebuilt. |
+| **AC-RAG-107** | Caching blocks | §10.3, §15 | With Tier 0 text, `user_blocks` join to `user_message`, the first is cacheable and holds the stable data, the last holds the question; Claude content marks only that block; the gateway passes the blocks to the client. |
+| **AC-RAG-108** | P1 gaps | §5.5, §10.10, §2.5 | `degradation_disclosure="note"` puts the impacts in the volatile part of the prompt, `"silent"` does not. A `FilterInferencer` narrows the scope and cannot widen it. `rag-cjk` and `rag-eval` extras are declared. |
 
 ### 16.2 Delivery phases (Q-04)
 Delivery follows production need: first what both production apps share, then AudioReading (which has no RAG today), then the NewsIntelligence migration, then KnowledgeBase (still in development, so the easiest to adapt) and everything else. Each step ends with every existing `cody-ai-shared-lib` test and every new `tests/rag/` test passing.

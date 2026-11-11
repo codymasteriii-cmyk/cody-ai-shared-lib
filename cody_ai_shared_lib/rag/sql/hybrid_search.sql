@@ -1,19 +1,30 @@
--- Reference SQL: Hybrid RRF Search with Reciprocal Rank Fusion (§4.7, AC-RAG-67)
+-- Reference SQL: hybrid search with Reciprocal Rank Fusion in one round trip (§4.2, §4.7, §9.1)
+-- RAG_SPEC 1.2.0.
 -- StoreCapabilities:
 --   supports_vector_search=True
 --   supports_keyword_fts=True
 --   supports_native_hybrid_rpc=True
 --   returns_raw_scores=True
---   uses_analyzer_tokens=True
+--   uses_analyzer_tokens=True          -- the adapter builds query_tsquery with rag.text.build_tsquery
 --   returns_snippets=True
 --   supports_sequential_boundary=True
+--
+-- Contract (same rules as vector_search.sql):
+--   * Mandatory owner predicate; passages only (never summaries); a passage is a candidate when it
+--     starts before its document's boundary; chunk text sliced with chunk-relative offsets.
+--   * Every filter applies in BOTH branches BEFORE each branch's limit (match_count * 2).
+--   * p_min_similarity applies to the vector branch only, so a keyword-only hit survives (§9.1).
+--   * Raw vector_score / keyword_score and both ranks are returned alongside the RRF score.
 
 CREATE OR REPLACE FUNCTION match_passages_hybrid(
     query_vector vector(768),
     query_tsquery tsquery,
+    p_tenant_or_user_id text,
     match_count int DEFAULT 8,
-    p_doc_id text DEFAULT NULL,
+    p_domain_id text DEFAULT NULL,
+    p_doc_ids text[] DEFAULT NULL,
     p_boundary int DEFAULT NULL,
+    p_boundaries jsonb DEFAULT NULL,          -- {"doc_id": boundary, ...}
     p_min_similarity float DEFAULT 0.60,
     p_rrf_k int DEFAULT 60,
     p_w_vec float DEFAULT 1.0,
@@ -36,101 +47,81 @@ RETURNS TABLE (
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public, pg_temp
 AS $$
 BEGIN
+    IF p_tenant_or_user_id IS NULL OR p_tenant_or_user_id = '' THEN
+        RAISE EXCEPTION 'match_passages_hybrid: owner is required' USING ERRCODE = '42501';
+    END IF;
+    PERFORM set_config('hnsw.iterative_scan', 'relaxed_order', true);   -- pgvector >= 0.8
+
     RETURN QUERY
     WITH
-    -- Active row and boundary filter applied BEFORE per-branch limit
-    -- Text-by-reference variant: content sliced from parent table parent_chunks
-    -- (e.g. audiolib_passages over audiolib_article_chunks)
-    vector_candidates AS (
-        SELECT
-            p.id,
-            p.doc_id,
-            p.section_id,
-            p.section_seq,
-            p.char_start,
-            p.char_end,
-            -- text by reference: SUBSTRING(c.text FROM (p.char_start + 1) FOR (p.char_end - p.char_start))
-            COALESCE(p.text, SUBSTRING(c.text FROM (p.char_start + 1) FOR (p.char_end - p.char_start))) AS content,
-            NULL::text AS snippet,
-            (1.0 - (p.embedding <=> query_vector))::float AS vector_score,
-            ROW_NUMBER() OVER (ORDER BY p.embedding <=> query_vector ASC) AS rank
+    scoped AS (
+        -- Every hard filter, once, before either branch ranks or limits anything
+        SELECT p.*
         FROM passages p
-        LEFT JOIN parent_chunks c ON c.id = p.parent_chunk_id
         WHERE
-            -- Active row predicate
-            p.is_active = TRUE AND {active_predicate}
-            AND (p_doc_id IS NULL OR p.doc_id = p_doc_id)
-            AND (p_boundary IS NULL OR p.char_start < p_boundary)
-            AND (1.0 - (p.embedding <=> query_vector)) >= p_min_similarity
-        ORDER BY p.embedding <=> query_vector ASC
+            p.tenant_or_user_id = p_tenant_or_user_id
+            AND (p_domain_id IS NULL OR p.domain_id = p_domain_id)
+            AND p.is_active = TRUE AND {active_predicate}
+            AND p.is_summary = FALSE
+            AND (p_doc_ids IS NULL OR p.doc_id = ANY(p_doc_ids))
+            AND (COALESCE((p_boundaries->>p.doc_id)::int, p_boundary) IS NULL
+                 OR p.char_start < COALESCE((p_boundaries->>p.doc_id)::int, p_boundary))
+    ),
+    vector_branch AS (
+        SELECT s.id,
+               (1.0 - (s.embedding <=> query_vector))::float AS v_score,
+               ROW_NUMBER() OVER (ORDER BY s.embedding <=> query_vector ASC)::int AS v_rank
+        FROM scoped s
+        WHERE s.embedding IS NOT NULL
+          AND (1.0 - (s.embedding <=> query_vector)) >= p_min_similarity
+        ORDER BY s.embedding <=> query_vector ASC
         LIMIT match_count * 2
     ),
-    fts_candidates AS (
-        SELECT
-            p.id,
-            p.doc_id,
-            p.section_id,
-            p.section_seq,
-            p.char_start,
-            p.char_end,
-            COALESCE(p.text, SUBSTRING(c.text FROM (p.char_start + 1) FOR (p.char_end - p.char_start))) AS content,
-            -- Snippet expression placeholder
-            {snippet_expr} AS snippet,
-            ts_rank_cd(p.fts_search_tokens, query_tsquery)::float AS keyword_score,
-            ROW_NUMBER() OVER (ORDER BY ts_rank_cd(p.fts_search_tokens, query_tsquery) DESC) AS rank
-        FROM passages p
-        LEFT JOIN parent_chunks c ON c.id = p.parent_chunk_id
-        WHERE
-            p.is_active = TRUE AND {active_predicate}
-            AND (p_doc_id IS NULL OR p.doc_id = p_doc_id)
-            AND (p_boundary IS NULL OR p.char_start < p_boundary)
-            AND p.fts_search_tokens @@ query_tsquery
-        ORDER BY ts_rank_cd(p.fts_search_tokens, query_tsquery) DESC
+    keyword_branch AS (
+        SELECT s.id,
+               ts_rank_cd(s.fts_search_tokens, query_tsquery)::float AS k_score,
+               ROW_NUMBER() OVER (ORDER BY ts_rank_cd(s.fts_search_tokens, query_tsquery) DESC, s.id)::int AS k_rank
+        FROM scoped s
+        WHERE s.fts_search_tokens @@ query_tsquery
+        ORDER BY ts_rank_cd(s.fts_search_tokens, query_tsquery) DESC, s.id
         LIMIT match_count * 2
     ),
     fused AS (
-        SELECT
-            COALESCE(v.id, f.id) AS id,
-            COALESCE(v.doc_id, f.doc_id) AS doc_id,
-            COALESCE(v.section_id, f.section_id) AS section_id,
-            COALESCE(v.section_seq, f.section_seq) AS section_seq,
-            COALESCE(v.char_start, f.char_start) AS char_start,
-            COALESCE(v.char_end, f.char_end) AS char_end,
-            COALESCE(v.content, f.content) AS content,
-            COALESCE(f.snippet, v.snippet) AS snippet,
-            v.vector_score,
-            f.keyword_score,
-            v.rank::int AS vector_rank,
-            f.rank::int AS keyword_rank,
-            (
-                COALESCE(p_w_vec / (p_rrf_k + v.rank), 0.0) +
-                COALESCE(p_w_fts / (p_rrf_k + f.rank), 0.0)
-            )::float AS rrf_score
-        FROM vector_candidates v
-        FULL OUTER JOIN fts_candidates f ON v.id = f.id
+        SELECT COALESCE(v.id, k.id) AS id,
+               v.v_score, k.k_score, v.v_rank, k.k_rank,
+               (COALESCE(p_w_vec / (p_rrf_k + v.v_rank), 0.0)
+                + COALESCE(p_w_fts / (p_rrf_k + k.k_rank), 0.0))::float AS rrf
+        FROM vector_branch v
+        FULL OUTER JOIN keyword_branch k ON k.id = v.id
     )
     SELECT
-        fused.id,
-        fused.doc_id,
-        fused.section_id,
-        fused.section_seq,
-        fused.char_start,
-        fused.char_end,
-        fused.content,
-        fused.snippet,
-        fused.vector_score,
-        fused.keyword_score,
-        fused.vector_rank,
-        fused.keyword_rank,
-        fused.rrf_score
-    FROM fused
-    ORDER BY fused.rrf_score DESC
+        p.id,
+        p.doc_id,
+        p.section_id,
+        p.section_seq,
+        p.char_start,
+        p.char_end,
+        COALESCE(p.text, SUBSTRING(c.text FROM (p.char_start - c.char_start + 1) FOR (p.char_end - p.char_start))) AS content,
+        CASE WHEN f.k_rank IS NULL THEN NULL
+             ELSE ts_headline('simple',
+                    COALESCE(p.text, SUBSTRING(c.text FROM (p.char_start - c.char_start + 1) FOR (p.char_end - p.char_start))),
+                    query_tsquery, 'MaxFragments=1, MaxWords=30, MinWords=10')
+        END AS snippet,
+        f.v_score,
+        f.k_score,
+        f.v_rank,
+        f.k_rank,
+        f.rrf
+    FROM fused f
+    JOIN passages p ON p.id = f.id
+    LEFT JOIN parent_chunks c ON c.id = p.parent_chunk_id
+    ORDER BY f.rrf DESC, p.id
     LIMIT match_count;
 END;
 $$;
 
--- Security / Execution Rights (§4.7)
 REVOKE EXECUTE ON FUNCTION match_passages_hybrid FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION match_passages_hybrid TO service_role;

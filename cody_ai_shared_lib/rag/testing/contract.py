@@ -1,7 +1,7 @@
 """RAGStore conformance kit and BrokenStore fixture (§4.6, AC-RAG-50).
 
 Provides:
-  - RAGStoreContractTests: pytest mixin with the 18 contract checks.
+  - RAGStoreContractTests: pytest mixin with the 24 contract checks.
   - BrokenStore: deliberately non-conforming store that must fail checks.
 
 An app subclasses the mixin and implements `make_store()`. A store that enforces a required scope
@@ -31,6 +31,7 @@ from ..ports import (
     RAGStore,
     SectionWrite,
     StoreCapabilities,
+    SummaryWrite,
 )
 from ..text.analyzer import TokenGroup
 
@@ -372,7 +373,10 @@ class RAGStoreContractTests:
             return seeded, None
         first = "First section text. It has two sentences."
         second = "Second section text. It also has two."
-        self.write(store, "fs_doc", [_node("fs_0", first, "fs_doc", 0, 0)], [[0.1] * DIM], section_seq=0)
+        # Engine-shaped: the splitter's passages overlap, so section 0 arrives as two overlapping passages (K7)
+        p0 = _node("fs_0", first[:30], "fs_doc", 0, 0)
+        p1 = _node("fs_0b", first[20:], "fs_doc", 20, 0)
+        self.write(store, "fs_doc", [p0, p1], [[0.1] * DIM, [0.1] * DIM], section_seq=0)
         self.write(store, "fs_doc", [_node("fs_1", second, "fs_doc", len(first), 1)], [[0.1] * DIM], section_seq=1)
         ranges = [(0, 0, len(first)), (1, len(first), len(first) + len(second))]
         return self.make_filters("fs_doc"), ranges
@@ -408,3 +412,135 @@ class RAGStoreContractTests:
             for node in nodes:
                 seq, start, end = next(r for r in ranges if r[0] == node.span.section_seq)
                 assert start <= node.span.char_start and node.span.char_end <= end, "no node crosses a section"
+
+
+    # ── helpers for the 1.2.0 checks below ─────────────────────────────────────
+    def write_with_summary(
+        self,
+        store: RAGStore[Any],
+        doc_id: str,
+        passages: list[RAGNode[Any]],
+        summary: RAGNode[Any],
+        section_seq: int = 0,
+    ) -> int:
+        """A section write with a section summary, as the engine sends it (§4.4.1)."""
+        write = SectionWrite[Any](
+            doc_id=doc_id,
+            section_seq=section_seq,
+            owner=self.make_owner(),
+            passages=[
+                PreparedNode[Any](node=n, vector=[0.1] * DIM, fingerprint=self.fingerprint_for(store, n))
+                for n in passages
+            ],
+            section_summary=SummaryWrite[Any](
+                node=summary, vector=[0.1] * DIM, fingerprint=self.fingerprint_for(store, summary)
+            ),
+        )
+        return store.upsert_section(write)
+
+    @staticmethod
+    def _summary(node_id: str, doc_id: str, start: int, end: int, seq: int = 0) -> RAGNode[Any]:
+        return RAGNode(
+            node_id=node_id, text="A summary of the section.", is_summary=True, granularity="parent_summary",
+            parent_kind="section", level=1,
+            span=SourceSpan(doc_id=doc_id, section_seq=seq, char_start=start, char_end=end),
+        )
+
+    # ── Check 19: summaries are admitted by their end, ranked searches never return them (K1) ──
+    def test_check_19_summary_boundary_and_ranked_search(self):
+        store = self.make_store()
+        caps = store.capabilities()
+        if not caps.supports_parent_summaries:
+            return
+        first = _node("sb_p0", "First section text.", "sb_doc", 0, 0)
+        second = _node("sb_p1", "Second section text.", "sb_doc", 100, 1)
+        self.write_with_summary(store, "sb_doc", [first], self._summary("sb_doc#s0_sum", "sb_doc", 0, 100, 0), 0)
+        self.write_with_summary(store, "sb_doc", [second], self._summary("sb_doc#s1_sum", "sb_doc", 100, 200, 1), 1)
+
+        hits = store.vector_search([0.1] * DIM, self.make_filters("sb_doc"), top_k=10)
+        assert hits and not any(h.is_summary for h in hits), "ranked searches never return summaries (§4.2)"
+
+        if caps.supports_sequential_boundary:
+            # The reader is inside section 1 (boundary 150): its summary ends at 200 and must not appear
+            visible = store.fetch_parent_summaries(self.make_filters("sb_doc", max_char_offset=150))
+            assert [s.node_id for s in visible] == ["sb_doc#s0_sum"], "summaries are admitted only if char_end <= B"
+
+    # ── Check 20: per-document boundaries ───────────────────────────────────────
+    def test_check_20_per_document_boundaries(self):
+        store = self.make_store()
+        if not store.capabilities().supports_sequential_boundary:
+            return
+        self.write(store, "pd_a", [_node("pd_a0", "A early.", "pd_a", 0), _node("pd_a1", "A late.", "pd_a", 500)],
+                   [[0.1] * DIM, [0.1] * DIM])
+        self.write(store, "pd_b", [_node("pd_b0", "B early.", "pd_b", 0), _node("pd_b1", "B late.", "pd_b", 500)],
+                   [[0.1] * DIM, [0.1] * DIM])
+        filters = self.make_filters(doc_ids=["pd_a", "pd_b"], max_char_offset_by_doc={"pd_a": 100, "pd_b": 1000})
+        got = {h.node_id for h in store.vector_search([0.1] * DIM, filters, top_k=10)}
+        assert got == {"pd_a0", "pd_b0", "pd_b1"}
+
+    # ── Check 21: a partial section write keeps the section's other rows (H4) ──
+    def test_check_21_partial_write_never_deletes(self):
+        store = self.make_store()
+        p0, p1 = _node("pw_0", "Kept passage.", "pw_doc", 0), _node("pw_1", "Changed passage.", "pw_doc", 50)
+        self.write(store, "pw_doc", [p0, p1], [[0.1] * DIM, [0.1] * DIM])
+        changed = _node("pw_1", "Changed passage, new text.", "pw_doc", 50)
+        self.write(store, "pw_doc", [changed], [[0.1] * DIM])            # what sync sends: only the change
+        got = {h.node_id for h in store.vector_search([0.1] * DIM, self.make_filters("pw_doc"), top_k=10)}
+        assert got == {"pw_0", "pw_1"}, "upsert_section never deletes (§4.4.1)"
+
+    # ── Check 22: ordering by score with distinct scores and a tie (K2) ─────────
+    def test_check_22_ordering_with_a_tie(self):
+        store = self.make_store()
+        query = [1.0] + [0.0] * (DIM - 1)
+        near = [1.0, 0.2] + [0.0] * (DIM - 2)
+        far = [1.0, 1.0] + [0.0] * (DIM - 2)
+        nodes = [_node("or_far", "far", "or_doc", 0), _node("or_t1", "tie one", "or_doc", 10),
+                 _node("or_t2", "tie two", "or_doc", 20)]
+        self.write(store, "or_doc", nodes, [far, near, near])
+        first = store.vector_search(query, self.make_filters("or_doc"), top_k=3)
+        second = store.vector_search(query, self.make_filters("or_doc"), top_k=3)
+        assert [h.node_id for h in first][-1] == "or_far"
+        assert all(a.score >= b.score for a, b in zip(first, first[1:]))
+        assert [h.node_id for h in first] == [h.node_id for h in second], "ties are stable"
+        assert [h.vector_rank for h in first] == [1, 2, 3]
+
+    # ── Check 23: deletes and revisions behave as declared (K3, K4) ─────────────
+    def test_check_23_deletes_and_revisions(self):
+        store = self.make_store()
+        caps = store.capabilities()
+        nodes = [_node(f"dl_{i}", f"Text {i}", "dl_doc", i * 10, seq=i) for i in range(3)]
+        for i, node in enumerate(nodes):
+            node.revision = "r1"
+            self.write(store, "dl_doc", [node], [[0.1] * DIM], section_seq=i)
+        if caps.supports_revisions:
+            assert store.current_revisions(["dl_0"]) == {"dl_0": "r1"}
+        if caps.supports_delete:
+            assert store.delete_nodes(["dl_0"]) == 1
+            assert store.delete_sections("dl_doc", 2) == 1
+            assert set(store.get_fingerprints("dl_doc")) == {"dl_1"}
+        if caps.supports_fetch_nodes:
+            assert [n.node_id for n in store.fetch_nodes(["dl_1"], self.make_filters("dl_doc"))] == ["dl_1"]
+
+    # ── Check 24: a reader sees a section's passages and summary together (K6) ──
+    def test_check_24_atomic_passages_and_summary(self):
+        store = self.make_store()
+        if not store.capabilities().supports_parent_summaries:
+            return
+        passages = [_node(f"at_{i}", f"Atomic text {i}", "at_doc", i * 10) for i in range(4)]
+        summary = self._summary("at_doc#s0_sum", "at_doc", 0, 40)
+        stop = []
+        seen: list[tuple[int, int]] = []
+
+        def reader():
+            while not stop:
+                hits = store.vector_search([0.1] * DIM, self.make_filters("at_doc"), top_k=10)
+                sums = store.fetch_parent_summaries(self.make_filters("at_doc"))
+                seen.append((len(hits), len(sums)))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future = executor.submit(reader)
+            self.write_with_summary(store, "at_doc", passages, summary)
+            stop.append(True)
+            future.result()
+        # Two calls are not one snapshot, but a reader must never see a partial set of passages
+        assert all(n in (0, 4) for n, _ in seen)

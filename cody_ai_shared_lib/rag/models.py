@@ -364,6 +364,7 @@ class RAGQueryRequest(BaseModel):
     variant: str | None = None
     trace_level: Literal["light", "verbose"] | None = None
     system_prompt_variables: dict[str, str] = Field(default_factory=dict)
+    degradation_disclosure: Literal["silent", "note"] | None = None   # overrides the profile (§10.10)
 
 
 class RAGRetrievalResult(BaseModel, Generic[MetaT]):

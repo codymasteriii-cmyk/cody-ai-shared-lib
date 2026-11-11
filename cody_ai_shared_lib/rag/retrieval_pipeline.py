@@ -28,6 +28,8 @@ CONVERSATION_REUSE = "conversation_reuse"
 
 class RetrievalPipeline(Generic[MetaT]):
     """Turns a request and intent into guarded, ranked nodes."""
+    filter_inferencer: Any = None   # set by RAGEngine (§5.5)
+
 
     def __init__(
         self,
@@ -69,6 +71,12 @@ class RetrievalPipeline(Generic[MetaT]):
                 "doc_ids": [request.document_id] if request.document_id else None,
             }
         )
+
+        inferencer = getattr(self, "filter_inferencer", None)
+        if inferencer is not None:
+            proposed = inferencer.infer(request, intent)
+            if proposed:
+                filters = filters.patch(proposed)       # narrow-only: intersected, never unioned (§5.5)
 
         floor = self.profile.retrieval.min_similarity
         if floor is not None:

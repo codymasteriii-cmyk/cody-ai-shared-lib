@@ -89,6 +89,9 @@ class GenerationConfig(BaseModel):
     grounding_mode: Literal["strict", "labelled_fallback"] = "strict"
     fallback_label: str = "Not from your sources:"
     stream_mode: Literal["native", "buffered"] = "buffered"
+    # §10.10: "silent" reports degradations only in the response; "note" also tells the model, so the
+    # answer can mention them briefly. Overridable per request.
+    degradation_disclosure: Literal["silent", "note"] = "silent"
 
 
 class CitationConfig(BaseModel):

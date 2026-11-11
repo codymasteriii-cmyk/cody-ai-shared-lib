@@ -152,6 +152,7 @@ class RAGEngine(Generic[MetaT]):
         router: IntentRouter | None = None,
         variant_name: str | None = None,
         fencer: ContextFencer | None = None,
+        filter_inferencer: Any = None,
     ):
         self.profile = profile
         self._variant_name = variant_name
@@ -246,6 +247,8 @@ class RAGEngine(Generic[MetaT]):
         self.pipeline: RetrievalPipeline[MetaT] = RetrievalPipeline(
             self._deps, store, self._pool, self.cache, budget_guard, self._explicit_guards
         )
+        self.filter_inferencer = filter_inferencer          # §5.5: narrow-only, app-supplied
+        self.pipeline.filter_inferencer = filter_inferencer
         self.router: IntentRouter = router or self.registry.get("router", profile.router.name)(self._deps)
         if router is None and profile.router.name == "auto" and not profile.models.intent:
             # Valid, but say so once: "auto" without an intent model is heuristic-only routing (§7)
@@ -361,6 +364,7 @@ class RAGEngine(Generic[MetaT]):
             router=self._explicit_router,
             variant_name=variant_name,
             fencer=self.fencer,
+            filter_inferencer=self.filter_inferencer,
         )
 
     def with_store(self, store: RAGStore[MetaT]) -> "RAGEngine[MetaT]":
@@ -386,6 +390,7 @@ class RAGEngine(Generic[MetaT]):
             router=self._explicit_router,
             variant_name=self._variant_name,
             fencer=self.fencer,
+            filter_inferencer=self.filter_inferencer,
         )
 
     def _variant_engine(self, name: str) -> "RAGEngine[MetaT]":
@@ -513,7 +518,13 @@ class RAGEngine(Generic[MetaT]):
             return prompt, retrieval, guards, "generation_no_retrieval"
 
         retrieval, guards = self.pipeline.run(request, intent, "query", run)
-        return self.assembler.assemble_prompt(request, retrieval.nodes, state_fence, guards), retrieval, guards, "generation"
+        disclosure = request.degradation_disclosure or self.profile.generation.degradation_disclosure
+        notes = (
+            list(dict.fromkeys(d.impact for d in run.degradations.degradations if d.impact))
+            if disclosure == "note" else None
+        )
+        prompt = self.assembler.assemble_prompt(request, retrieval.nodes, state_fence, guards, service_notes=notes)
+        return prompt, retrieval, guards, "generation"
 
     def _generation_context(self, request: RAGQueryRequest, run: RequestRun, stage: str) -> GenerationContext:
         return GenerationContext(

@@ -40,6 +40,10 @@ class AssembledPrompt(Generic[MetaT]):
     user_message: str
     fence_id: str
     cache_breakpoints: list[int] = field(default_factory=list)
+    # The user message as ordered (text, cacheable) blocks; "".join of the texts == user_message.
+    # The first block holds the stable data (Tier 0 sections, admitted summaries) when there is any,
+    # so a provider that supports it can cache that prefix (§10.3, §15).
+    user_blocks: list[tuple[str, bool]] = field(default_factory=list)
     included_nodes: list[RAGNode[MetaT]] = field(default_factory=list)
     turn_map: dict[str, str] = field(default_factory=dict)
     zone_tokens: dict[str, int] = field(default_factory=dict)
@@ -137,8 +141,13 @@ class ContextAssembler(Generic[MetaT]):
         nodes: list[RAGNode[MetaT]],
         fence_id: str | None = None,
         guards: Sequence[Any] | None = None,
+        service_notes: Sequence[str] | None = None,
     ) -> AssembledPrompt[MetaT]:
-        """Build the 3-block prompt per §10.1–§10.5."""
+        """Build the 3-block prompt per §10.1–§10.5.
+
+        service_notes: impacts of degradations to disclose (§10.10). They go in the volatile part, after
+        the data, so the cacheable prefix does not change.
+        """
         active_guards = list(guards if guards is not None else request.guards)
         grounding_mode = self._effective_grounding(active_guards)
 
@@ -252,15 +261,28 @@ class ContextAssembler(Generic[MetaT]):
         if history_text:
             fenced_history, _ = self.fencer.fence_block(history_text, fence_id=active_fence_id, tag_prefix="history")
             user_parts.extend(["Conversation History:", fenced_history, ""])
+        if service_notes:
+            user_parts.extend([
+                "Service notes (mention briefly to the user that the answer may be less complete):",
+                *[f"- {note}" for note in service_notes],
+                "",
+            ])
         fenced_question, _ = self.fencer.fence_block(request.question, fence_id=active_fence_id, tag_prefix="question")
         user_parts.extend(["Question:", fenced_question])
 
         included.sort(key=lambda item: item[0])
+        user_message = "\n".join(user_parts)
+        user_blocks: list[tuple[str, bool]] = [(user_message, False)]
+        if stable_rendered:
+            stable_prefix = f"Retrieved Context:\n<data-{active_fence_id}>\n{data_blocks[0]}"
+            if user_message.startswith(stable_prefix):
+                user_blocks = [(stable_prefix, True), (user_message[len(stable_prefix):], False)]
         return AssembledPrompt(
             system_prompt=system_prompt,
-            user_message="\n".join(user_parts),
+            user_message=user_message,
             fence_id=active_fence_id,
             cache_breakpoints=cache_breakpoints,
+            user_blocks=user_blocks,
             included_nodes=[node for _, node in included],
             turn_map={self.formatter.marker(node, idx): node.node_id for idx, node in included},
             zone_tokens={

@@ -389,6 +389,20 @@ class RAGStore(ABC, Generic[MetaT]):
         raise NotImplementedError("fetch_linked not supported by this store")
 
 
+# ── FilterInferencer Protocol (§5.5) ──────────────────────────────────────────
+
+@runtime_checkable
+class FilterInferencer(Protocol):
+    """App-supplied: proposes extra filters from the question (KB-13).
+
+    The engine intersects the proposal with the request's filters (`RAGFilterSpec.patch`), so it can
+    only narrow the search; a conflict gives an empty scope and the not-found answer, never a wider one.
+    """
+
+    def infer(self, request: Any, intent: Any) -> dict[str, Any] | FilterPatch | None:
+        ...
+
+
 # ── Guard Protocol (§5) ────────────────────────────────────────────────────────
 
 @runtime_checkable

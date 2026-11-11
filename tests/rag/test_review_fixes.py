@@ -618,3 +618,124 @@ def test_generate_from_nodes_honours_the_request_variant():
     node = RAGNode(node_id="n1", text="Some text.", span=SourceSpan(doc_id="d"))
     eng.generate_from_nodes(RAGQueryRequest(question="q", variant="alt"), [node])
     assert calls == ["alt"]
+
+
+# ── SQL templates (H4, H5) ─────────────────────────────────────────────────
+
+import re as _re  # noqa: E402
+
+SQL_DIR = ROOT / "cody_ai_shared_lib" / "rag" / "sql"
+
+
+def _sql(name: str) -> str:
+    return (SQL_DIR / name).read_text(encoding="utf-8")
+
+
+def _functions(sql: str) -> list[str]:
+    return _re.findall(r"CREATE OR REPLACE FUNCTION (.*?)\$\$;", sql, flags=_re.S)
+
+
+def test_the_upsert_template_never_deletes_and_refuses_another_owner():
+    sql = _sql("upsert_section.sql")
+    upsert = next(f for f in _functions(sql) if f.startswith("upsert_section("))
+    assert "DELETE" not in upsert.upper()
+    assert "ON CONFLICT (id) DO UPDATE" in upsert and "belongs to another owner" in upsert
+    assert "p_unit_summaries" in upsert and "unit_seq" in upsert and "embedding_signature" in upsert
+
+
+def test_every_template_function_pins_search_path_and_checks_the_owner():
+    for name in ("upsert_section.sql", "vector_search.sql", "hybrid_search.sql", "sequential_boundary.sql",
+                 "fingerprints.sql"):
+        for body in _functions(_sql(name)):
+            assert "SET search_path = public, pg_temp" in body, (name, body[:40])
+            assert "tenant_or_user_id" in body, (name, body[:40])
+
+
+def test_search_templates_return_passages_only_and_slice_chunks_relatively():
+    for name in ("vector_search.sql", "hybrid_search.sql"):
+        sql = _sql(name)
+        assert "p.is_summary = FALSE" in sql
+        assert "c.text FROM (p.char_start + 1)" not in sql          # the old global-offset slice
+        assert "(p.char_start - c.char_start + 1)" in sql
+        assert "hnsw.iterative_scan" in sql
+
+
+def test_summaries_are_admitted_by_their_end_and_signatures_are_stored_not_rebuilt():
+    assert "p.char_end <= COALESCE(" in _sql("sequential_boundary.sql")
+    fingerprints = _sql("fingerprints.sql")
+    assert "RETRIEVAL_DOCUMENT|1.0.0" not in fingerprints
+    assert "embedding_signature text," in fingerprints              # nullable, stored as given
+
+
+# ── Caching, P1 gaps (H7, G2, G4, G10) ────────────────────────────────────
+
+
+def test_the_stable_data_block_is_sent_to_claude_as_a_cacheable_content_block():
+    from cody_ai_shared_lib.llm import _claude_user_content
+
+    store = InMemoryRAGStore()
+    eng = engine(profile(), store)
+    tier0 = RAGNode(node_id="b#s0p0", text="The whole chapter.", span=SourceSpan(doc_id="b"),
+                    granularity="full_doc", flags=["full_scope"])
+    prompt = eng.assembler.assemble_prompt(RAGQueryRequest(question="q"), [tier0])
+
+    assert "".join(text for text, _ in prompt.user_blocks) == prompt.user_message
+    assert prompt.user_blocks[0][1] is True and "The whole chapter." in prompt.user_blocks[0][0]
+    assert "Question:" in prompt.user_blocks[-1][0] and prompt.user_blocks[-1][1] is False
+
+    content = _claude_user_content(prompt.user_message, prompt.user_blocks)
+    assert content[0]["cache_control"] == {"type": "ephemeral"} and "cache_control" not in content[1]
+    assert _claude_user_content("plain", [("other", True)]) == "plain"        # blocks must add up
+
+
+def test_the_gateway_passes_blocks_only_to_clients_that_get_them():
+    seen = {}
+
+    class BlockLLM(FakeLLM):
+        def generate_with_usage(self, **kwargs):
+            seen.update(kwargs)
+            return super().generate_with_usage(**kwargs)
+
+    store = InMemoryRAGStore()
+    eng = engine(profile(), store, llm=BlockLLM("Answer [1]."))
+    eng.ingest_document(document("Some text here. " * 10))
+    eng.query(RAGQueryRequest(question="what", document_id="b"))
+    assert seen.get("user_blocks") and "".join(t for t, _ in seen["user_blocks"]) == seen["user_message"]
+
+
+def test_degradation_notes_reach_the_prompt_only_when_asked():
+    store = InMemoryRAGStore()
+    eng = engine(profile(), store)
+    note = ["The reranker was skipped"]
+    silent = eng.assembler.assemble_prompt(RAGQueryRequest(question="q"), [])
+    noted = eng.assembler.assemble_prompt(RAGQueryRequest(question="q"), [], service_notes=note)
+    assert "Service notes" not in silent.user_message
+    assert "The reranker was skipped" in noted.user_message
+    assert noted.user_message.index("Service notes") > noted.user_message.index("</data-")   # volatile part
+
+
+def test_a_filter_inferencer_can_only_narrow():
+    class Inferencer:
+        def __init__(self, patch):
+            self.patch = patch
+
+        def infer(self, request, intent):
+            return self.patch
+
+    store = InMemoryRAGStore()
+    for doc in ("a", "b"):
+        store.upsert_section_nodes(doc, 0, [RAGNode(node_id=f"{doc}1", text="t", span=SourceSpan(doc_id=doc))],
+                                   [[0.1] * 768])
+    narrowing = engine(profile(), store, filter_inferencer=Inferencer({"doc_ids": ["a"]}))
+    assert {n.node_id for n in narrowing.retrieve(RAGQueryRequest(question="t")).nodes} == {"a1"}
+
+    widening = engine(profile(), store, filter_inferencer=Inferencer({"doc_ids": ["a", "b"]}))
+    request = RAGQueryRequest(question="t", filters=RAGFilterSpec(doc_ids=["b"]))
+    assert {n.node_id for n in widening.retrieve(request).nodes} == {"b1"}      # cannot add "a"
+    assert widening.with_store(store).filter_inferencer is widening.filter_inferencer
+
+
+def test_optional_extras_are_declared():
+    extras = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["optional-dependencies"]
+    assert "rag-cjk" in extras and any(dep.startswith("jieba") for dep in extras["rag-cjk"])
+    assert "rag-eval" in extras

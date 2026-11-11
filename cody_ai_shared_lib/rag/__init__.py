@@ -100,6 +100,7 @@ from .models import (
 )
 from .ports import (
     EmbeddingSpace,
+    FilterInferencer,
     Fingerprint,
     Guard,
     OwnerScope,
@@ -240,6 +241,7 @@ __all__ = [
     "ScopeStats",
     "StoreCapabilities",
     "Fingerprint",
+    "FilterInferencer",
     "OwnerScope",
     "SectionWrite",
     "SummaryWrite",
