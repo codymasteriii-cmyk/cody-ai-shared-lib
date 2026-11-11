@@ -131,3 +131,109 @@ def test_the_embedder_uses_the_task_type_the_store_declares():
     store._embedding_space = store.embedding_space().model_copy(update={"task_type_documents": "SEMANTIC_SIMILARITY"})
     eng = engine(profile(), store)
     assert eng.embedder.task_type == "SEMANTIC_SIMILARITY"
+
+
+# ── Isolation and guards (H3, M25, M23, M24, M18) ────────────────────────
+
+import pytest  # noqa: E402
+
+from cody_ai_shared_lib.rag import (  # noqa: E402
+    MissingRequiredScopeError,
+    OwnerScope,
+    RAGFilterSpec,
+    RAGNode,
+    RAGQueryRequest,
+    ScopeViolationError,
+    SourceSpan,
+)
+from cody_ai_shared_lib.rag.guards import TemporalGuard  # noqa: E402
+
+from .test_integration_round2 import tenant_store  # noqa: E402
+
+
+def test_a_scoped_store_cannot_overwrite_another_owners_document():
+    store = tenant_store("tenant_or_user_id")
+    a, b = OwnerScope(tenant_or_user_id="A"), OwnerScope(tenant_or_user_id="B")
+    engine(profile(), store.scoped(a)).ingest_document(document("Secret of A. " * 30), owner=a)
+
+    with pytest.raises(ScopeViolationError):
+        engine(profile(), store.scoped(b)).ingest_document(document("Overwritten by B. " * 30), owner=b)
+    assert store.doc_owner("b") == a
+    assert all(n.text.startswith("Secret of A") for n in store._nodes.values())
+
+
+def test_the_base_store_never_moves_a_document_to_another_owner():
+    store = tenant_store("tenant_or_user_id")
+    engine(profile(), store).ingest_document(document("Secret of A. " * 30), owner=OwnerScope(tenant_or_user_id="A"))
+    with pytest.raises(ScopeViolationError):
+        engine(profile(), store).ingest_document(document("By B. " * 30), owner=OwnerScope(tenant_or_user_id="B"))
+
+
+def test_rows_without_an_owner_never_match_a_required_tenant():
+    store = tenant_store("tenant_or_user_id")
+    node = RAGNode(node_id="legacy", text="Legacy row", span=SourceSpan(doc_id="d"))
+    store.upsert_section_nodes("d", 0, [node], [[0.1] * 768])          # written before owners existed
+    assert store.vector_search([0.1] * 768, RAGFilterSpec(tenant_or_user_id="u1"), top_k=5) == []
+
+    open_store = InMemoryRAGStore()                                     # no required tenant: unchanged
+    open_store.upsert_section_nodes("d", 0, [node], [[0.1] * 768])
+    assert len(open_store.vector_search([0.1] * 768, RAGFilterSpec(tenant_or_user_id="u1"), top_k=5)) == 1
+
+
+def _reader():
+    from cody_ai_shared_lib.rag import ModelBindings, long_form_reader
+    from cody_ai_shared_lib.rag.profile import GenerationConfig
+
+    return long_form_reader(
+        ModelBindings(generation=["m1"], summary=["s1"], embedding="gemini-embedding-2"),
+        generation=GenerationConfig(grounding_mode="strict", stream_mode="buffered"),   # the fake LLM cannot stream
+    )
+
+
+def test_a_profile_that_requires_the_spoiler_guard_rejects_a_request_without_a_boundary():
+    eng = engine(_reader(), InMemoryRAGStore(), llm=FakeLLM("A short summary."))
+    with pytest.raises(MissingRequiredScopeError, match="max_char_offset"):
+        eng.retrieve(RAGQueryRequest(question="what happened", document_id="b"))
+
+
+def test_spoiler_protection_off_is_the_document_length_not_a_missing_boundary():
+    store = InMemoryRAGStore()
+    eng = engine(_reader(), store, llm=FakeLLM("A short summary."))
+    eng.ingest_document(document("Sentence number one is here. " * 40))
+    request = RAGQueryRequest(question="what happened", document_id="b", filters=RAGFilterSpec(max_char_offset=10**9))
+    assert eng.retrieve(request).nodes
+
+
+def test_a_per_document_boundary_map_must_cover_every_document_in_scope():
+    eng = engine(_reader(), InMemoryRAGStore(), llm=FakeLLM("A short summary."))
+    partial = RAGFilterSpec(doc_ids=["a", "b"], max_char_offset_by_doc={"a": 100})
+    with pytest.raises(MissingRequiredScopeError, match="max_char_offset_by_doc"):
+        eng.retrieve(RAGQueryRequest(question="q", filters=partial))
+
+
+def test_the_temporal_guard_reads_the_renderer_and_drops_undated_rows_the_store_did_not_filter():
+    from datetime import datetime, timezone
+
+    class StampRenderer:
+        def timestamp(self, meta):
+            return datetime(2026, 1, 5, tzinfo=timezone.utc) if meta.extra.get("dated") else None
+
+    window = (datetime(2026, 1, 1, tzinfo=timezone.utc), datetime(2026, 1, 31, tzinfo=timezone.utc))
+    from cody_ai_shared_lib.rag.models import DefaultNodeMeta as Meta
+
+    dated = RAGNode(node_id="x", text="t", span=SourceSpan(doc_id="d"), metadata=Meta(extra={"dated": True}))
+    undated = RAGNode(node_id="y", text="t", span=SourceSpan(doc_id="d"), metadata=Meta())
+
+    guard = TemporalGuard(window, "published_on", renderer=StampRenderer(), store_applies_filter=False)
+    assert guard.verify(dated) is dated
+    assert guard.verify(undated) is None
+    trusted = TemporalGuard(window, "published_on", renderer=StampRenderer(), store_applies_filter=True)
+    assert trusted.verify(undated) is undated
+
+
+def test_sibling_engines_share_the_fence_secret():
+    eng = engine(profile(), InMemoryRAGStore())
+    sibling = eng.with_store(InMemoryRAGStore())
+    variant = eng.with_profile(profile())
+    assert sibling.fencer is eng.fencer and variant.fencer is eng.fencer
+    assert sibling.fencer.stable_id("user-a|doc-1") == eng.fencer.stable_id("user-a|doc-1")

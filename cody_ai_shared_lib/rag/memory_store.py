@@ -113,6 +113,10 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         """Enforce required filter keys and supported custom filter types."""
         validate_scope(filters, self._capabilities)
 
+    def _is_required(self, key: str) -> bool:
+        required = self._capabilities.required_filter_keys
+        return key in required or (key == "tenant_or_user_id" and "tenant_id" in required)
+
     def _passes_filters(self, node: RAGNode[MetaT], filters: RAGFilterSpec) -> bool:
         """Return True if node matches all criteria in filters."""
         # doc_ids filter
@@ -131,6 +135,8 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                 )
             if node_tenant is None and owner is not None:
                 node_tenant = owner.tenant_or_user_id
+            if node_tenant is None and self._is_required("tenant_or_user_id"):
+                return False                   # fail closed: a row with no owner never matches a required scope
             if node_tenant is not None and node_tenant != filters.tenant_or_user_id:
                 return False
 
@@ -145,6 +151,8 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                 )
             if node_domain is None and owner is not None:
                 node_domain = owner.domain_id
+            if node_domain is None and self._is_required("domain_id"):
+                return False
             if node_domain is not None and node_domain != filters.domain_id:
                 return False
 
@@ -547,6 +555,12 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             (summary.node, summary.vector, summary.fingerprint) if summary is not None else None
         )
         with self._lock:
+            existing = self._doc_owners.get(write.doc_id)
+            if existing is not None and write.owner.as_scope() and existing != write.owner:
+                raise ScopeViolationError(
+                    f"Document {write.doc_id!r} belongs to another owner; a write never moves it (§5.6)",
+                    key="tenant_or_user_id",
+                )
             if write.owner.as_scope():
                 self._doc_owners[write.doc_id] = write.owner
                 for node_id in [e[0].node_id for e in entries] + ([summary.node.node_id] if summary else []):
@@ -844,6 +858,7 @@ class ScopedInMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
 
     def upsert_section(self, write: SectionWrite[MetaT]) -> int:
         self._check_owner(write.owner)
+        self._check_doc(write.doc_id)          # never write into a document another owner holds
         return self.inner.upsert_section(write)
 
     def upsert_section_nodes(self, doc_id, section_seq, nodes, embeddings, summary=None):

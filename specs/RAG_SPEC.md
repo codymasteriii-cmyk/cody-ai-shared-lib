@@ -804,7 +804,7 @@ class SectionWrite(BaseModel, Generic[MetaT]):
   - fingerprints, revisions and deletes;
   - optional embedding return.
 - It is the first subclass of the conformance kit, and the default store for eval runs.
-- **Owners and scoped views (1.2.0).** It records the owner of every `upsert_section` write and applies it to tenant and domain filters, so a row written for one user is invisible to another. `store.scoped(owner)` returns `ScopedInMemoryRAGStore`, a view of the same data bound to one owner: the reference implementation of the §5.6 pattern, which refuses a read, write, fingerprint lookup or delete that names another scope with `ScopeViolationError`.
+- **Owners and scoped views (1.2.0).** It records the owner of every `upsert_section` write and applies it to tenant and domain filters, so a row written for one user is invisible to another. `store.scoped(owner)` returns `ScopedInMemoryRAGStore`, a view of the same data bound to one owner: the reference implementation of the §5.6 pattern, which refuses a read, write, fingerprint lookup or delete that names another scope with `ScopeViolationError`, and any write into a document another owner holds. The base store never moves a document to another owner, and on stores with a required tenant or domain a row without an owner never matches (fail closed); rows written before 1.2.0 on stores without a required scope keep matching.
 
 ### 4.6 Conformance kit (`RAGStoreContractTests`) **[v1]**
 `cody_ai_shared_lib.rag.testing.RAGStoreContractTests` is a pytest mixin. An app subclasses it, provides `make_store()` and seed data, and runs it in its own CI.
@@ -816,7 +816,7 @@ class SectionWrite(BaseModel, Generic[MetaT]):
 | `make_store()` | required | always |
 | `make_owner()` | `OwnerScope()` | the store requires a scope: every kit write is made for this owner |
 | `make_filters(doc_id=None, **extra)` | the owner's keys plus `doc_ids=[doc_id]` | reads need more than the owner's keys |
-| `make_scoped_store(owner)` | `None` (check 16 skipped) | the app builds scoped stores (§5.6) |
+| `make_scoped_store(store, owner)` | `None` (check 16 skipped) | the app builds scoped stores (§5.6): return a view of `store` bound to `owner` |
 | `full_scope_filters()` | `None` (the kit writes its own two-section scope) | the store's full-scope text does not come from kit writes, e.g. a chapter table |
 
 The kit writes the way the engine does: through `upsert_section` with a `SectionWrite`, fingerprints and the owner. It checks:
@@ -836,7 +836,7 @@ The kit writes the way the engine does: through `upsert_section` with a `Section
 13. **CJK precision** (stores with `uses_analyzer_tokens`). In addition to check 10: a three-character name (李小明) is found through a `"phrase"` group; a passage containing only part of the name (小明) does not outrank it; a passage without the name never ranks first (negative control).
 14. **Snippets** (stores with `returns_snippets`). The `snippet` the store produced arrives unchanged; a store without snippets returns `None` without error.
 15. **Fingerprints persisted as given.** `get_fingerprints` returns exactly the `Fingerprint` each node was written with; the store never computes its own (1.2.0). Together with RAG-ING-13 this gives parity: `engine.prepare_nodes` and `upsert_section` carry identical `content_hash`, `embedding_signature`, `fts_signature`, `token_estimate` and `search_tokens`, and a row written from `prepare_nodes` is reported as current by `get_fingerprints` and `needs_reindex`.
-16. **Scoped store** (with `make_scoped_store`). A store built for user A raises `ScopeViolationError` on a read naming user B and on a write for user B, and still serves A (§5.6).
+16. **Scoped store** (with `make_scoped_store`). Over one shared store, the view for user A raises `ScopeViolationError` on a read naming user B and on a write for user B. The view for user B sees none of A's rows, and cannot write into or delete A's document. A still sees exactly its own rows (§5.6).
 17. **Stats match the full scope** (stores with `supports_full_scope_fetch`). `scope_stats(f).char_count` equals the text `fetch_full_scope(f)` returns, and `total_tokens` is positive exactly when that text is non-empty (§4.2, INT-06).
 18. **Full-scope granularity** (stores with `supports_full_scope_fetch`). A two-section scope returns at least two nodes, in document order, without overlap; when the kit wrote the scope, no node crosses a section boundary (§4.2, INT-07).
 
@@ -909,7 +909,7 @@ class Guard(Protocol):
 | Guard | Built from | `to_filter` | `verify` |
 | :--- | :--- | :--- | :--- |
 | `SequentialBoundaryGuard` | `max_char_offset`, `max_char_offset_by_doc` | Boundary fields | §5.2 |
-| `TemporalGuard` | `date_range_utc` set by the **caller** in `request.filters` | Date range and field | Drops nodes whose `renderer.timestamp` is outside the range; a node without a timestamp is kept only if the store applied the filter. |
+| `TemporalGuard` | `date_range_utc` set by the **caller** in `request.filters` | Date range and field | Drops nodes whose date is outside the range. The date is the node's `date_field` value when it has one, else `renderer.timestamp`. A node without a date is kept only if the store applied the filter (`date_field` in `supported_date_fields`). |
 | `TenantGuard` | `tenant_or_user_id` | Tenant field | Drops nodes whose metadata tenant differs, when the renderer exposes it. |
 | `ScopeGuard` | `doc_ids`, `domain_id`, `categories`, `custom` | Those fields | Drops nodes outside them when the values are visible on the node. |
 
@@ -917,6 +917,12 @@ Apps add guards by passing objects in `request.guards`, or by registering a guar
 
 ### 5.2 Sequential boundary semantics (spoiler guard)
 For document `d` with boundary `B` (exclusive: the reader has seen `[0, B)`):
+
+**Who sets `B` (1.2.0, owner decision).** `B` belongs to the app, which alone knows where the user has been:
+- `B` is the **furthest point the user has reached**, not the current player position. Re-listening to an earlier chapter does not lower it, because the user has already heard what comes after. Seeking and skipping are app logic; the engine does not track them.
+- **Spoiler protection off** is `B` = the document's length, not a missing boundary.
+- The engine filters retrieved text, not chat history. `B` must therefore cover everything already discussed in the thread; a boundary lower than an earlier turn's would let that turn's answer reach the prompt.
+- **Fail closed.** When the profile lists `sequential_boundary` in `guards`, a request without `max_char_offset` raises `MissingRequiredScopeError` before any store call. With only `max_char_offset_by_doc`, every document in scope must be in the map. A forgotten boundary is an error, never "no protection".
 
 1. A node with `span.char_start >= B` is dropped.
 2. A node with trait `offset_addressable` and `span.char_end >= B` is **cut at a sentence end** (D-24). This applies to every offset-addressable kind, including `passage`, and to text a store has already stopped at `B` (`local_window`, `full_doc`).
@@ -979,10 +985,10 @@ See §10.3 and D-07.
 ### 5.6 Fail-closed required scope
 If any key in `capabilities().required_filter_keys` is missing (or empty) from the effective filters, the engine **MUST** raise `MissingRequiredScopeError` before any store call. The same keys are required on writes (§6.4.2).
 
-- **Scoped stores (1.2.0).** The engine proves a scope was **stated**; it cannot prove it is the **right** one. Adapters SHOULD therefore be built per request for the authenticated principal, e.g. `store.scoped(tenant_or_user_id=user.id)` with the id taken from the verified session and never from request input, and reject any read or write whose filters or owner name another scope by raising `ScopeViolationError`.
+- **Scoped stores (1.2.0).** The engine proves a scope was **stated**; it cannot prove it is the **right** one. A scoped store also refuses to **write into a document another owner holds**, even when the write names the store's own owner: checking only the owner argument would let user B overwrite user A's document by reusing its id. Adapters SHOULD therefore be built per request for the authenticated principal, e.g. `store.scoped(tenant_or_user_id=user.id)` with the id taken from the verified session and never from request input, and reject any read or write whose filters or owner name another scope by raising `ScopeViolationError`.
   - `ScopeViolationError` is a typed engine error: it passes through the engine unchanged (never wrapped in `RetrievalError`, never degraded), so the app can answer 403 rather than 500.
   - `engine.with_store(scoped_store)` returns a sibling engine over that store that shares the pool, cache, gateway, registry, observers and guards, so a per-request store does not build a new pool and cache per request (§12.1).
-  - The conformance kit checks a scoped store through the `make_scoped_store(owner)` hook (§4.6, check 16).
+  - The conformance kit checks scoped stores through the `make_scoped_store(store, owner)` hook: two views over one store, as two users' requests share one database (§4.6, check 16).
   - *Informative:* for user-facing paths, a Supabase client bound to the user's JWT lets RLS enforce ownership even if adapter code has a bug. Jobs that keep the service-role key rely on the scoped store.
 
 > **Rationale:**
@@ -1946,7 +1952,7 @@ class EngineProfile(BaseModel):
 - `validate()` lists **every** problem at once: missing bindings for enabled stages, unknown component names, threshold/score-kind mismatches, a zone ratio sum above 1, and a Tier 0 gate that does not fit: `full_context_max_tokens` plus the reserved instruction, history and question zones must not exceed `max_context_tokens`.
 - **Model lists.** Each binding is an ordered list. Its models may come from the same provider (for example two Gemini models when an app has only a Gemini key). A one-model list is valid; the backup-model degradation (DG-02) then does not apply, and a failure after retries raises.
 - `fingerprint()` and `version` are recorded in every trace. Named variants (`news_chat`, `news_search`) share one base and differ only in their override block.
-- **Sibling engines.** `engine.with_profile(profile)` and `engine.with_store(store)` (1.2.0) return engines that share the pool, cache, gateway, registry, observers and guards, and differ only in the profile or the store. `with_store` is how an app serves each request from a store scoped to the signed-in user (§5.6) without building a pool per request.
+- **Sibling engines.** `engine.with_profile(profile)` and `engine.with_store(store)` (1.2.0) return engines that share the pool, cache, gateway, registry, observers and guards, and differ only in the profile or the store. They also share the fence secret, so stateless fence ids, and with them the cacheable prompt prefix, stay the same across siblings (D-06). `with_store` is how an app serves each request from a store scoped to the signed-in user (§5.6) without building a pool per request.
 
 > **Rationale:**
 > - The 1.0.0 preset model ids were already out of date compared with what the apps run (KB-07, NF-06).
@@ -2003,7 +2009,8 @@ class EngineProfile(BaseModel):
        question=body.question, request_id=message_id,
        cursor_offset=body.position, doc_total_chars=article["total_length"],
        filters=RAGFilterSpec(doc_ids=[article_id], tenant_or_user_id=user.id,
-                             max_char_offset=body.position if body.spoiler_guard else None),
+                             # furthest point reached; the book's length when spoiler protection is off (§5.2)
+                             max_char_offset=body.furthest_position if body.spoiler_guard else article["total_length"]),
        history=thread_turns, state=thread.rag_state,
    )
    for event in engine.stream_query(req):
@@ -2521,6 +2528,10 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-89** | Sync after upgrade | §6.6 | After an embedding-signature change, `sync_document` clears `embeddings_stale` for passages and summaries, re-embedding kept summaries from their stored text with no summary model call; a store without `fetch_nodes` regenerates them. After an analyzer change, sync clears `fts_stale`. A splitter version change is detected on a store that declares no `splitter_version`. |
 | **AC-RAG-90** | Rows without vectors | §6.6 | With `embed_summaries=False` every summary is written with `embedding_signature=None` and never makes the document stale, also after an upgrade. Switching the profile to embed summaries makes them stale, and sync embeds them. |
 | **AC-RAG-91** | Revision and task type | §6.4, §6.6 | Every node from `ingest_document` carries the document's `revision`, returned by `current_revisions`. The embedder uses the store's `task_type_documents`. |
+| **AC-RAG-92** | Cross-owner writes | §5.6, §4.6 | A store scoped to user B cannot ingest into a document user A owns, and the base store never moves a document to another owner; A's text is unchanged. Kit check 16 runs over two views of one store. |
+| **AC-RAG-93** | Fail-closed scope | §4.5 | On a store with a required tenant, a row with no owner never matches a tenant filter; on a store without one, it still does. |
+| **AC-RAG-94** | Required boundary | §5.2 | With `long_form_reader`, a request without `max_char_offset` raises `MissingRequiredScopeError`; the document length as boundary is accepted; a per-document map missing a document in scope raises. |
+| **AC-RAG-95** | Guard inputs | §5.1, §12.1 | The temporal guard dates a node by its `date_field`, else `renderer.timestamp`, and drops an undated node unless the store applied the filter. `with_store` and `with_profile` siblings share the fence secret. |
 
 ### 16.2 Delivery phases (Q-04)
 Delivery follows production need: first what both production apps share, then AudioReading (which has no RAG today), then the NewsIntelligence migration, then KnowledgeBase (still in development, so the easiest to adapt) and everything else. Each step ends with every existing `cody-ai-shared-lib` test and every new `tests/rag/` test passing.

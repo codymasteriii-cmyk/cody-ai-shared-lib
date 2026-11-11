@@ -369,6 +369,7 @@ def _streaming_engine(chunks: list[str]):
     llm.stream.side_effect = stream
     prof = long_form_reader(
         models=ModelBindings(generation=["gemini-3.5-flash-lite"], summary=["gemini-3.5-flash-lite"], embedding="gemini-embedding-2"),
+        guards=[],   # not a spoiler test; the preset would otherwise require a boundary (M23)
     )
     store = InMemoryRAGStore(embedding_space=EmbeddingSpace(model="gemini-embedding-2", dims=768))
     eng = RAGEngine(profile=prof, store=store, gateway=ModelGateway(llm_client=llm, embedding_client=embedder))

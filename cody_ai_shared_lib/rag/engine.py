@@ -148,6 +148,7 @@ class RAGEngine(Generic[MetaT]):
         pool: Any = None,
         router: IntentRouter | None = None,
         variant_name: str | None = None,
+        fencer: ContextFencer | None = None,
     ):
         self.profile = profile
         self._variant_name = variant_name
@@ -190,7 +191,8 @@ class RAGEngine(Generic[MetaT]):
         )
 
         self.formatter = self.registry.get("formatter", profile.citations.formatter)(self.renderer)
-        self.fencer = ContextFencer(rng=self.rng)
+        # Siblings (with_profile, with_store) share the fencer, so stateless fence ids stay stable (D-06)
+        self.fencer = fencer or ContextFencer(rng=self.rng)
         self.assembler = ContextAssembler(profile, self.renderer, self.fencer, self.formatter, self.analyzer)
         self.conversation_manager = ConversationManager(
             max_reused_turns=profile.context.reused_turns,
@@ -343,6 +345,7 @@ class RAGEngine(Generic[MetaT]):
             pool=self._pool,
             router=self._explicit_router,
             variant_name=variant_name,
+            fencer=self.fencer,
         )
 
     def with_store(self, store: RAGStore[MetaT]) -> "RAGEngine[MetaT]":
@@ -367,6 +370,7 @@ class RAGEngine(Generic[MetaT]):
             pool=self._pool,
             router=self._explicit_router,
             variant_name=self._variant_name,
+            fencer=self.fencer,
         )
 
     def _variant_engine(self, name: str) -> "RAGEngine[MetaT]":

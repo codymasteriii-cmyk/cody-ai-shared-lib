@@ -93,6 +93,8 @@ class RetrievalPipeline(Generic[MetaT]):
             analyzer=self.deps.analyzer,
             profile_guards=self.profile.guards,
             extra_guards=[*self.engine_guards, *self.named_guards, *request.guards],
+            renderer=self.deps.renderer,
+            store_date_fields=self.store.capabilities().supported_date_fields,
         )
 
     def scoped_filters(

@@ -83,7 +83,8 @@ class RAGStoreContractTests:
       - make_store(): required. A clean store.
       - make_owner(): the owner every kit write is made for. Default: no owner.
       - make_filters(doc_id=None, **extra): the read filters. Default: the owner's keys plus doc_ids.
-      - make_scoped_store(owner): a store bound to `owner` (§5.6). Default None: check 16 is skipped.
+      - make_scoped_store(store, owner): a view of `store` bound to `owner` (§5.6). Default None: check 16
+        is skipped. Views of one store share its data, as two users' requests share one database.
       - full_scope_filters(): filters for a multi-section scope the app seeded in make_store(), for a
         store whose full-scope text does not come from kit writes. Default None: the kit writes its own.
     """
@@ -111,7 +112,7 @@ class RAGStoreContractTests:
         fields.update(extra)
         return RAGFilterSpec(**fields)
 
-    def make_scoped_store(self, owner: OwnerScope) -> RAGStore[Any] | None:
+    def make_scoped_store(self, store: RAGStore[Any], owner: OwnerScope) -> RAGStore[Any] | None:
         return None
 
     def full_scope_filters(self) -> RAGFilterSpec | None:
@@ -335,20 +336,32 @@ class RAGStoreContractTests:
 
     # ── Check 16: Scoped store refuses another scope ───────────────────────────
     def test_check_16_scoped_store_refuses_other_scope(self):
-        base = self.make_owner()
-        owner_a = base.model_copy(update={"tenant_or_user_id": "kit-user-a"})
-        owner_b = base.model_copy(update={"tenant_or_user_id": "kit-user-b"})
-        store_a = self.make_scoped_store(owner_a)
-        if store_a is None:
+        base_owner = self.make_owner()
+        owner_a = base_owner.model_copy(update={"tenant_or_user_id": "kit-user-a"})
+        owner_b = base_owner.model_copy(update={"tenant_or_user_id": "kit-user-b"})
+        shared = self.make_store()
+        store_a = self.make_scoped_store(shared, owner_a)
+        store_b = self.make_scoped_store(shared, owner_b)
+        if store_a is None or store_b is None:
             return
         vec = [0.1] * DIM
+        filters_a = self.make_filters("scoped_doc", tenant_or_user_id="kit-user-a")
+        filters_b = self.make_filters("scoped_doc", tenant_or_user_id="kit-user-b")
         self.write(store_a, "scoped_doc", [_node("sc_n", "Scoped text", "scoped_doc")], [vec], owner=owner_a)
 
+        # A read or write that names another owner is refused
         with pytest.raises(ScopeViolationError):
-            store_a.vector_search(vec, self.make_filters("scoped_doc", tenant_or_user_id="kit-user-b"), top_k=5)
+            store_a.vector_search(vec, filters_b, top_k=5)
         with pytest.raises(ScopeViolationError):
             self.write(store_a, "scoped_doc_b", [_node("sc_b", "Other text", "scoped_doc_b")], [vec], owner=owner_b)
-        own = store_a.vector_search(vec, self.make_filters("scoped_doc", tenant_or_user_id="kit-user-a"), top_k=5)
+        # B cannot see A's rows, nor write into A's document even under its own owner
+        assert store_b.vector_search(vec, filters_b, top_k=5) == []
+        with pytest.raises(ScopeViolationError):
+            self.write(store_b, "scoped_doc", [_node("sc_x", "Overwrite", "scoped_doc")], [vec], owner=owner_b)
+        with pytest.raises(ScopeViolationError):
+            store_b.delete_document("scoped_doc")
+        # A still sees exactly its own row
+        own = store_a.vector_search(vec, filters_a, top_k=5)
         assert [hit.node_id for hit in own] == ["sc_n"]
 
     # ── full-scope helpers for checks 17 and 18 ────────────────────────────────

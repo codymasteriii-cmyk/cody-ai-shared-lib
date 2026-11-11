@@ -9,6 +9,7 @@ import copy
 from datetime import datetime
 from typing import Any, Sequence
 
+from .errors import MissingRequiredScopeError
 from .granularity import TRAIT_OFFSET_ADDRESSABLE, has_trait
 from .models import (
     FilterPatch,
@@ -135,9 +136,14 @@ class TemporalGuard:
         self,
         date_range_utc: tuple[datetime | None, datetime | None] | None = None,
         date_field: str | None = None,
+        renderer: Any = None,
+        store_applies_filter: bool = False,
     ):
         self.date_range_utc = date_range_utc
         self.date_field = date_field or "created_at"
+        self.renderer = renderer
+        # A node without a timestamp is kept only when the store already applied the date filter (§5.1)
+        self.store_applies_filter = store_applies_filter
 
     def to_filter(self) -> FilterPatch:
         fields: dict[str, Any] = {}
@@ -151,19 +157,27 @@ class TemporalGuard:
         if self.date_range_utc is None:
             return node
         dt_start, dt_end = self.date_range_utc
+        node_dt = self._timestamp(node)
+        if node_dt is None:
+            return node if self.store_applies_filter else None
+        if dt_start is not None and as_utc(node_dt) < as_utc(dt_start):
+            return None
+        if dt_end is not None and as_utc(node_dt) > as_utc(dt_end):
+            return None
+        return node
+
+    def _timestamp(self, node: RAGNode[Any]) -> datetime | None:
+        """The caller's date field when the node has it, else the renderer's timestamp (§5.1)."""
         extra = getattr(node.metadata, "extra", {}) if hasattr(node.metadata, "extra") else {}
         if isinstance(node.metadata, dict):
-            node_dt = node.metadata.get(self.date_field)
+            value = node.metadata.get(self.date_field)
         else:
-            node_dt = getattr(node.metadata, self.date_field, None) or (
+            value = getattr(node.metadata, self.date_field, None) or (
                 extra.get(self.date_field) if isinstance(extra, dict) else None
             )
-        if node_dt is not None and isinstance(node_dt, datetime):
-            if dt_start is not None and as_utc(node_dt) < as_utc(dt_start):
-                return None
-            if dt_end is not None and as_utc(node_dt) > as_utc(dt_end):
-                return None
-        return node
+        if value is None and self.renderer is not None:
+            value = self.renderer.timestamp(node.metadata)
+        return value if isinstance(value, datetime) else None
 
     def verify_citation(self, citation: RAGCitation) -> bool:
         return True
@@ -283,12 +297,16 @@ def build_turn_guards(
     analyzer: TextAnalyzer | None = None,
     profile_guards: Sequence[str] = (),
     extra_guards: Sequence[Any] = (),
+    renderer: Any = None,
+    store_date_fields: frozenset[str] = frozenset(),
 ) -> list[Any]:
     """Build the turn's guards from the effective filters, plus app guards, which only ever add (§5.3)."""
     eff_analyzer = analyzer or CjkAwareAnalyzer()
     active: list[Any] = []
 
-    # 1. Sequential boundary guard from filters or profile
+    # 1. Sequential boundary guard. A profile that requires it fails closed without a boundary (§5.2).
+    if "sequential_boundary" in profile_guards:
+        _require_boundary(filters)
     if (
         filters.max_char_offset is not None
         or filters.max_char_offset_by_doc
@@ -308,6 +326,8 @@ def build_turn_guards(
             TemporalGuard(
                 date_range_utc=filters.date_range_utc,
                 date_field=filters.date_field,
+                renderer=renderer,
+                store_applies_filter=(filters.date_field or "created_at") in store_date_fields,
             )
         )
 
@@ -344,3 +364,29 @@ BUILTIN_GUARDS: dict[str, Any] = {
     TenantGuard.name: TenantGuard,
     ScopeGuard.name: ScopeGuard,
 }
+
+
+def _require_boundary(filters: RAGFilterSpec) -> None:
+    """Fail closed when a profile requires the sequential guard but the request states no boundary (§5.2).
+
+    The app owns the boundary: the furthest point the user has reached, or the document length when
+    the user turned spoiler protection off. With only a per-document map, every document in scope
+    must be in it.
+    """
+    if filters.max_char_offset is not None:
+        return
+    by_doc = filters.max_char_offset_by_doc or {}
+    if not by_doc:
+        raise MissingRequiredScopeError(
+            "Profile requires the sequential boundary guard, but the request has no max_char_offset",
+            missing_keys=["max_char_offset"],
+            stage="guards",
+        )
+    missing = [d for d in (filters.doc_ids or []) if d not in by_doc]
+    if filters.doc_ids is None or missing:
+        raise MissingRequiredScopeError(
+            "Profile requires the sequential boundary guard; max_char_offset_by_doc must cover every "
+            f"document in scope (missing: {missing or 'scope is not limited to listed documents'})",
+            missing_keys=["max_char_offset_by_doc"],
+            stage="guards",
+        )

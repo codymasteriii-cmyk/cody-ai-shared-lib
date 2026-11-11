@@ -53,8 +53,8 @@ class TestTenantEnforcingStoreConformance(RAGStoreContractTests):
     def make_owner(self) -> OwnerScope:
         return OwnerScope(tenant_or_user_id="kit-user")
 
-    def make_scoped_store(self, owner: OwnerScope):
-        return InMemoryRAGStore(capabilities=_tenant_caps()).scoped(owner)
+    def make_scoped_store(self, store, owner: OwnerScope):
+        return store.scoped(owner)
 
 
 class ZeroStatsStore(InMemoryRAGStore):

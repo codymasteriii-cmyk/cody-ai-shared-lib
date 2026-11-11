@@ -78,6 +78,17 @@ ZERO = [0.0] * DIM
 SIMPLE_MODELS = ModelBindings(generation=["m"], embedding="gemini-embedding-2")
 RERANK_MODELS = ModelBindings(generation=["m"], embedding="gemini-embedding-2", reranker="jina-reranker")
 
+_long_form_reader_preset = long_form_reader
+
+
+def long_form_reader(*args, **kwargs):
+    """The AudioReading preset without a required spoiler boundary.
+
+    These tests are not about spoilers. Since 1.2.0 the preset rejects a request without a boundary
+    (review item M23); a test that sends a boundary still gets the guard, built from its filters.
+    """
+    return _long_form_reader_preset(*args, **{"guards": [], **kwargs})
+
 
 class ArticleMeta(BaseModel):
     url: str = ""

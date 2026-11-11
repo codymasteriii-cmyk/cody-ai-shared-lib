@@ -28,6 +28,17 @@ from cody_ai_shared_lib.rag.testing.canary import (
     assert_no_text_past_boundary,
 )
 
+_long_form_reader_preset = long_form_reader
+
+
+def long_form_reader(*args, **kwargs):
+    """The AudioReading preset without a required spoiler boundary.
+
+    These tests are not about spoilers. Since 1.2.0 the preset rejects a request without a boundary
+    (review item M23); a test that sends a boundary still gets the guard, built from its filters.
+    """
+    return _long_form_reader_preset(*args, **{"guards": [], **kwargs})
+
 
 def _setup_streaming_engine():
     bindings = ModelBindings(
