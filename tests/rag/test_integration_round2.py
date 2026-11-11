@@ -158,7 +158,10 @@ def test_store_persists_engine_fingerprints_and_reindex_is_clean():
     expected = "gemini-embedding-2|768|RETRIEVAL_DOCUMENT|1.0.0"
     fingerprints = store.get_fingerprints("b")
     assert fingerprints and {fp.embedding_signature for fp in fingerprints.values()} == {expected}
-    assert {fp.fts_signature for fp in fingerprints.values()} == {f"{eng.analyzer.name}|{eng.analyzer.version}"}
+    passages = {nid: fp for nid, fp in fingerprints.items() if not nid.endswith("_sum")}
+    summaries = {nid: fp for nid, fp in fingerprints.items() if nid.endswith("_sum")}
+    assert {fp.fts_signature for fp in passages.values()} == {f"{eng.analyzer.name}|{eng.analyzer.version}"}
+    assert summaries and {fp.fts_signature for fp in summaries.values()} == {None}   # never keyword-searched
     status = eng.needs_reindex("b")
     assert not status.embeddings_stale and not status.fts_stale
 

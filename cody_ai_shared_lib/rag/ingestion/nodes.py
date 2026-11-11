@@ -104,12 +104,13 @@ class WriteSignatures:
     embedding: str
     fts: str | None
 
-    def fingerprint(self, node: RAGNode[MetaT], has_vector: bool = True) -> Fingerprint:
+    def fingerprint(self, node: RAGNode[MetaT], has_vector: bool = True, keyword_indexed: bool = True) -> Fingerprint:
         """A row stored without a vector carries no embedding signature (§6.6)."""
         return Fingerprint(
             content_hash=node.content_hash or "",
             embedding_signature=self.embedding if has_vector else None,
-            fts_signature=self.fts,
+            # Summaries are never keyword-searched (§4.2), so their search tokens carry no signature
+            fts_signature=self.fts if keyword_indexed else None,
         )
 
 
@@ -164,7 +165,9 @@ def prepare_summaries(
         node = result.section_summary
         summary_vector = vectors.get(node.node_id)
         prepared.section_summary = SummaryWrite[MetaT](
-            node=node, vector=summary_vector, fingerprint=signatures.fingerprint(node, has_vector=summary_vector is not None)
+            node=node, vector=summary_vector, fingerprint=signatures.fingerprint(
+                node, has_vector=summary_vector is not None, keyword_indexed=False
+            )
         )
     for position, unit in enumerate(result.unit_summaries):
         unit_vector = vectors.get(unit.node_id)
@@ -172,7 +175,7 @@ def prepare_summaries(
             SummaryWrite[MetaT](
                 node=unit,
                 vector=unit_vector,
-                fingerprint=signatures.fingerprint(unit, has_vector=unit_vector is not None),
+                fingerprint=signatures.fingerprint(unit, has_vector=unit_vector is not None, keyword_indexed=False),
                 unit_seq=_unit_seq(unit.span.doc_id, unit, position),
             )
         )

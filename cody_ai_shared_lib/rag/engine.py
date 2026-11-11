@@ -39,6 +39,7 @@ from .ingestion.nodes import (
     finalize_node,
     embedding_is_stale,
     fts_signature,
+    parse_node_id,
     prepare_passages,
     prepare_summaries,
     write_signatures,
@@ -1049,5 +1050,10 @@ class RAGEngine(Generic[MetaT]):
                 embedding_is_stale(doc_id, node_id, fp, expected_embedding, embed_summaries)
                 for node_id, fp in stored.items()
             ),
-            fts_stale=uses_tokens and any(fp.fts_signature != expected_fts for fp in stored.values()),
+            # Only keyword-searched rows count: summaries never are (§4.2), so they carry no FTS signature
+            fts_stale=uses_tokens and any(
+                fp.fts_signature != expected_fts
+                for node_id, fp in stored.items()
+                if not ((parsed := parse_node_id(doc_id, node_id)) is not None and parsed.is_summary)
+            ),
         )

@@ -647,7 +647,7 @@ def test_every_template_function_pins_search_path_and_checks_the_owner():
     for name in ("upsert_section.sql", "vector_search.sql", "hybrid_search.sql", "sequential_boundary.sql",
                  "fingerprints.sql"):
         for body in _functions(_sql(name)):
-            assert "SET search_path = public, pg_temp" in body, (name, body[:40])
+            assert "SET search_path = public, extensions, pg_temp" in body, (name, body[:40])
             assert "tenant_or_user_id" in body, (name, body[:40])
 
 
@@ -739,3 +739,25 @@ def test_optional_extras_are_declared():
     extras = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["optional-dependencies"]
     assert "rag-cjk" in extras and any(dep.startswith("jieba") for dep in extras["rag-cjk"])
     assert "rag-eval" in extras
+
+
+def test_summaries_carry_no_search_token_signature_and_never_make_the_index_stale():
+    store = RecordingStore()                                   # uses analyzer tokens, like AudioReading
+    eng = engine(unit_profile(embed_summaries=False), store, llm=FakeLLM("A short summary."))
+    doc = document(UNIT_TEXT)
+    eng.ingest_document(doc)
+
+    write = store.writes[0]
+    assert all(s.fingerprint.fts_signature is None for s in [write.section_summary, *write.unit_summaries])
+    assert all(p.fingerprint.fts_signature for p in write.passages)
+    status = eng.needs_reindex("b")
+    assert not status.fts_stale and not status.embeddings_stale
+
+    store.writes.clear()
+    eng.sync_document(doc)
+    assert store.writes == []                                  # nothing to refresh
+
+
+def test_every_template_starts_with_the_migration_checklist():
+    for path in SQL_DIR.glob("*.sql"):
+        assert path.read_text(encoding="utf-8").startswith("-- MIGRATION CHECKLIST"), path.name

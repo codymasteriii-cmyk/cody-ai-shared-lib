@@ -220,8 +220,7 @@ class DocumentSynchronizer(Generic[MetaT]):
                 continue
             vector_stale = embedding_is_stale(doc_id, node_id, fp, signatures.embedding, self.embed_summaries)
             unwanted_vector = not self.embed_summaries and fp.embedding_signature is not None
-            tokens_stale = caps.uses_analyzer_tokens and fp.fts_signature != signatures.fts
-            if vector_stale or unwanted_vector or tokens_stale:
+            if vector_stale or unwanted_vector:      # summaries have no search tokens to refresh (§4.2)
                 stale.append(node_id)
         return stale
 
@@ -259,7 +258,7 @@ class DocumentSynchronizer(Generic[MetaT]):
                 SummaryWrite[MetaT](
                     node=node,
                     vector=vector,
-                    fingerprint=signatures.fingerprint(node, has_vector=vector is not None),
+                    fingerprint=signatures.fingerprint(node, has_vector=vector is not None, keyword_indexed=False),
                     unit_seq=parsed.number if parsed is not None and parsed.kind == "unit_summary" else None,
                 )
             )
