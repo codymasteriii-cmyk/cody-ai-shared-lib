@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
@@ -28,7 +29,7 @@ class RouterConfig(BaseModel):
     name: str = "auto"
     enable_jev: bool = False
     enable_temporal_extraction: bool = False
-    jev_timeout: float = 2.0
+    jev_timeout: float = 2.5
 
 
 DEFAULT_FUSION_WEIGHTS: dict[str, tuple[float, float]] = {
@@ -122,6 +123,7 @@ class SummariesConfig(BaseModel):
 class IngestionConfig(BaseModel):
     model_config = {"frozen": True, "extra": "forbid"}
     splitter: str = "sentence"
+    granularity: str = "passage"         # what ingested chunks are: "article"/"entry" are atomic (§3.3)
     target_size: int = 1200
     overlap: int = 150
     summaries: SummariesConfig = Field(default_factory=SummariesConfig)
@@ -155,6 +157,17 @@ class ValidationReport(BaseModel):
 
 
 VALID_FALLBACK_KEYS = {"rerank", "jev", "summarizer", "query_embedding", "cache", "deadline"}
+# §13.3: opt-in rows take their enabling value; any row can be set to "raise"
+VALID_FALLBACK_VALUES: dict[str, set[str]] = {
+    "rerank": {"raise", "keep_order"},
+    "jev": {"raise"},
+    "summarizer": {"raise", "skip"},
+    "query_embedding": {"raise", "keyword"},
+    "cache": {"raise"},
+    "deadline": {"raise"},
+}
+# Citation policies this version implements; repair/raise and coverage minimums come with §11.4-11.5 (P4)
+IMPLEMENTED_CITATION_POLICIES = {"filter"}
 
 
 class EngineProfile(BaseModel):
@@ -185,8 +198,8 @@ class EngineProfile(BaseModel):
     variants: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     def fingerprint(self) -> str:
-        """Stable sha256 fingerprint of resolved configuration."""
-        dumped = self.model_dump_json()
+        """Stable sha256 fingerprint of resolved configuration, independent of dict insertion order."""
+        dumped = json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
 
     def with_overrides(self, **changes: Any) -> "EngineProfile":
@@ -270,10 +283,16 @@ class EngineProfile(BaseModel):
 
         problems.extend(self._threshold_problems())
 
-        for k in self.fallbacks:
+        for k, v in self.fallbacks.items():
             if k not in VALID_FALLBACK_KEYS:
                 unknown.append(f"fallback:{k}")
                 problems.append(f"Unknown fallback key '{k}' in profile.fallbacks")
+            elif v not in VALID_FALLBACK_VALUES[k]:
+                problems.append(f"fallbacks['{k}'] = {v!r}: allowed values are {sorted(VALID_FALLBACK_VALUES[k])}")
+        if self.citations.policy not in IMPLEMENTED_CITATION_POLICIES:
+            problems.append(f"citations.policy {self.citations.policy!r} is not implemented in this version (§11.4)")
+        if self.citations.min_citation_coverage:
+            problems.append("citations.min_citation_coverage is not enforced in this version (§11.4); leave it at 0")
 
         if registry is not None:
             for category, name in self._component_names():

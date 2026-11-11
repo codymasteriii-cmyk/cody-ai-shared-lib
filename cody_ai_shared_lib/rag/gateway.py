@@ -18,12 +18,12 @@ from typing import Any
 from ..embedding import EmbeddingResult, EmbeddingUsage, generate_embedding_with_usage
 from ..jev import JevClient
 from ..llm import LLMClient, LLMResult, LLMUsage, ModelCallError
-from ..pricing import PRICE_TABLE_VERSION, compute_cost
+from ..pricing import PRICE_TABLE_VERSION, compute_cost, estimate_cost
 from ..tokens import estimate_tokens
 from ..rerank import RerankClient, RerankResult
 from .cache import Cache, deserialize_vector, make_embedding_cache_key, serialize_vector
 from .degradation import DegradationTracker
-from .errors import EmbeddingProviderError, GenerationError, RAGEngineError, RAGStageError
+from .errors import EmbeddingProviderError, GenerationError, RAGEngineError, RAGStageError, safe_message
 from .models import StageUsage
 from .text.analyzer import CjkAwareAnalyzer, TextAnalyzer
 from .usage import BudgetGuard, UsageTracker, invoke_budget_guard
@@ -79,7 +79,7 @@ class ModelGateway:
         for model_idx, model in enumerate(models):
             # Pre-call budget check (DG-11)
             if budget_guard is not None:
-                est_cost = compute_cost(model, input_tokens=est_in, output_tokens=max_tokens or 500)
+                est_cost = estimate_cost(model, est_input_tokens=est_in, est_output_tokens=max_tokens or 500)
                 ctx = usage_tracker.call_context(stage, model, is_opt, est_in, est_cost)
                 decision = invoke_budget_guard(budget_guard, ctx)
                 if decision == "skip":
@@ -258,7 +258,7 @@ class ModelGateway:
                 )
 
         raise GenerationError(
-            f"All models failed for stage '{stage}': {last_exc}",
+            f"All models failed for stage '{stage}': {safe_message(last_exc)}",
             reason="all_models_failed",
             stage=stage,
             cause=last_exc,
@@ -523,7 +523,7 @@ class ModelGateway:
 
         for model_idx, model in enumerate(models):
             if budget_guard is not None:
-                est_cost = compute_cost(model, input_tokens=est_in, output_tokens=max_tokens or 500)
+                est_cost = estimate_cost(model, est_input_tokens=est_in, est_output_tokens=max_tokens or 500)
                 ctx = usage_tracker.call_context(stage, model, is_opt, est_in, est_cost)
                 decision = invoke_budget_guard(budget_guard, ctx)
                 if decision == "skip":

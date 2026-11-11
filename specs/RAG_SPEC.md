@@ -1048,6 +1048,7 @@ class TextAnalyzer(Protocol):
   - **Terminator rules** (per character, so English, Chinese and mixed text go through one pass with no language detection):
     - `。` `！` `？` `；` `……` end a sentence wherever they appear; Chinese puts no space after them.
     - `.` `!` `?` end a sentence only before whitespace, a closing quote or bracket, or the end of the text, so `3.14` and `example.com` do not split.
+    - A paragraph break (`\n\n` or `\r\n\r\n`) ends a sentence even without terminal punctuation, so a heading followed by a blank line is a complete unit for the §5.2 cut.
     - A run of terminators (`？！`, `...`) counts as one, and closing quotes and brackets right after it (`"` `'` `”` `’` `」` `』` `）` `)` `》`) belong to the sentence.
     - Abbreviations (`Dr.`, `U.S.`) may split early. That is accepted: a short extra sentence does no harm in the splitter, and under the guard it only cuts earlier.
   - A sentence longer than 1.5× the target MAY split at clause punctuation (`,` `;` `，` `、`), or hard-cut at 2× the target.
@@ -1057,6 +1058,7 @@ class TextAnalyzer(Protocol):
   - Each node gets `span.breadcrumb`, and RAG-ING-1 offsets are preserved.
   - Implemented with the stdlib or a light parser; no heavy dependency.
 - **`PassThroughSplitter`:** one input unit becomes one node (KB entries, News articles).
+- **Granularity (1.2.0).** `profile.ingestion.granularity` (default `"passage"`) sets what ingested chunks are. Set it to an atomic kind (`"article"`, `"entry"`) for whole units, so budgets drop them whole instead of cutting them (§3.3, §10.1).
 - Every splitter has a `version` string, which becomes part of the embedding signature (§6.6).
 
 ### 6.3 Parent summaries **[contract: model] [later: recursive]**
@@ -1067,6 +1069,9 @@ class TextAnalyzer(Protocol):
 - Callers may pass existing summaries (KB section descriptions, News `agent_summary`), which skips the LLM call.
 - **`summaries.embed_summaries`** (default `True`, 1.2.0). When `False`, the `summary_embedding` stage is skipped and summaries reach the store without vectors (`SummaryWrite.vector=None`). This needs a store that overrides `upsert_section` (§4.4.1); engine startup raises `ProfileConfigError` otherwise. A store that never searches summaries by vector saves those calls and their budget (INT-02). When `True`, a section's summary and its units are embedded in one batch.
 - **Failure behaviour.** After `LLMClient` retries and the summary model list (DG-01, DG-02), a summarizer failure raises `RAGStageError("summarizer")`. Skipping the summary is an **opt-in** degradation (DG-14, `fallbacks={"summarizer": "skip"}`): the section then proceeds without a summary and reports `IngestionProgress.summary_status="failed"`.
+- **Prompt and input (1.2.0).** The summarizer uses only the text it is given: the prompt forbids content from other parts of the work, outside sources, or prior knowledge of the work (a model that knows a famous novel must not put later events into an early summary). The section text goes inside a data fence and is never followed as instructions (§10.4).
+- **What can be skipped (1.2.0).** Under `fallbacks={"summarizer": "skip"}`, only model and provider failures are skipped. Configuration, scope, budget and deadline errors, and a safety block, always propagate (§13.3). When some unit summaries fail but others succeed, `summary_status="partial"`.
+- **Long sections (1.2.0).** A section longer than four summary units is summarized from its unit summaries (map, then reduce), so no single call receives an oversized input.
 - **Later:** `RecursiveSummarizer` (an ingestion stage) builds levels ≥ 2 (chapters → arcs → book).
 
 > **Rationale:**
@@ -1102,7 +1107,7 @@ engine.prepare_node(node, *, owner: OwnerScope | None = None) -> PreparedNode[Me
 engine.prepare_nodes(nodes, *, owner: OwnerScope | None = None) -> PreparedBatch[MetaT]  # per node: returns the good ones
 ```
 - **RAG-ING-13.** `prepare_nodes` computes, for each node, everything `upsert_section` would persist: the embedding of `renderer.embed_text(node)`, the fingerprint (§6.6), `token_estimate` and, for stores with `uses_analyzer_tokens`, `search_tokens`. It uses the profile's own renderer, analyzer and embedder, so the values are **identical** to the engine's by construction. It writes nothing.
-- **Failure is per node.** `prepare_node` is for one article or entry: it either succeeds completely or raises `EmbeddingProviderError`. `prepare_nodes` judges each node on its own: failed nodes are listed in `failed` (ERROR log, DG-08) and the good ones are returned, so the caller keeps those and retries only the rest. It raises only when no node succeeded (`failed_node_ids` names them), when the whole embedding call fails, or on `BudgetExceeded`, with the usage of calls already made (RAG-OPS-1). A failed node has no vector and no fingerprint, so it can never be stored as current.
+- **Failure is per node.** `prepare_node` is for one article or entry: it either succeeds completely or raises `EmbeddingProviderError`. `prepare_nodes` judges each node on its own: failed nodes are listed in `failed` (ERROR log, DG-08) and the good ones are returned, so the caller keeps those and retries only the rest. It raises only when no node succeeded (`failed_node_ids` names them), when the whole embedding call fails, or on `BudgetExceeded`, with the usage of calls already made (RAG-OPS-1). A failed node has no vector and no fingerprint, so it can never be stored as current. `FailedNode.reason` says why: the provider returned no vector, or a zero vector (1.2.0).
 - **Use it when the app owns the insert.** An app that writes a row in its own transaction, together with its own columns (for example KnowledgeBase's entry row with `proposal_id` and `claim_id`), calls `prepare_nodes`, then inserts vector, fingerprint and tokens with its row. `sync_document` and `reconcile` then see that row as current. Apps that let the engine write use `ingest_document`, which writes through `upsert_section`; both paths produce the same stored values, and `upsert_section` receives the same `PreparedNode` shape.
 - **Owner (1.2.0).** `owner` follows §6.4.2. Nothing is written, but the app inserts the result, so the owner must be stated and the spend counts against it. Each call gets its own request id.
 
@@ -1169,7 +1174,7 @@ class IngestionProgress(BaseModel):
     sections_total: int
     passages_upserted: int
     passages_skipped_unchanged: int = 0
-    summary_status: Literal["generated", "provided", "skipped", "failed"] = "skipped"
+    summary_status: Literal["generated", "provided", "skipped", "partial", "failed"] = "skipped"
     usage: list[StageUsage] = Field(default_factory=list)
     degradations: list[Degradation] = Field(default_factory=list)
 ```
@@ -1786,15 +1791,15 @@ class GenerationStrategy(Protocol):
 | :--- | :--- | :--- |
 | `intent` | after routing | core intent facets, `router_source` |
 | `status` | at stage starts (optional) | `{"stage": "retrieving" \| "reranking" \| "generating" ...}` |
-| `retrieval` | after guard enforcement | node refs, labels, `strategy_used`, `applied_filters` |
+| `retrieval` | after guard enforcement | node refs (`nodes`), their citation `labels`, `node_count`, `strategy_used`, `applied_filters` |
 | `delta` | per model chunk | `{"text": "..."}`, raw text (markers included, flag withheld) |
-| `citations` | after the full text is verified | verified `citations`, `sources`, `citation_coverage` |
+| `citations` | after the full text is verified | verified `citations`, `sources`, `citation_coverage` (the ratio, a number; the full `CitationCoverage` is in `RAGResponse`) |
 | `degradation` | immediately when an agreed degradation fires | the `Degradation` record; pre-generation ones arrive before the first `delta`, so a UI can show a notice |
 | `done` | last | `answer_id`, `answer_final`, the full `citations` and `sources` lists (same as the `citations` event), `usage`, `degradations`, `state`, `grounded`, `answer_found`, `request_id`, `message_id` if supplied |
 | `error` | when the engine raises | `{"type": ..., "stage": ..., "message": ..., "request_id": ..., "usage": [...], "usage_total": {...}}` (no stack traces; usage of the calls already made, RAG-OPS-1); the iterator then raises the same exception. That exception is for the caller's logging and control flow; the route MUST NOT send a second error to the client |
 
 - **Verification happens at end of stream.** Deltas carry raw text. A UI that needs clean text uses `answer_final` from `done`, or `strip_markers(text, formatter)` while streaming.
-- **Cancel-safe.** Closing the iterator (`GeneratorExit`) stops all further model and store calls and releases pool threads.
+- **Cancel-safe.** Closing the iterator (`GeneratorExit`) stops all further model and store calls and releases pool threads. Observers still receive `on_complete(trace, None)` for the cancelled request (RAG-EVAL-8).
 - **Close it with `with` (1.2.0).** `RAGStream` is a context manager. Leaving a plain `for event in stream:` loop early does not close the stream, so its cleanup would wait for garbage collection; leaving a `with` block always closes it, whether by `break`, an exception or a client disconnect. `close()` is idempotent.
   ```python
   with engine.stream_query(request) as stream:
@@ -1842,6 +1847,8 @@ class PostGenerationStage(Protocol):
 - Each stage records its outcome in the trace.
 
 ### 11.1 `CitationFormatter` **[contract]**
+- **What counts as a `ref` marker (1.2.0).** Any bracketed list of 1–3-digit numbers is a candidate, whatever character precedes it, so `主角[1]。`, `city[1].` and `(table)[2]` are recognised. A candidate is a citation when it resolves in this turn's citation map. One glued to an ASCII word or closing bracket (`arr[1]`) that resolves to nothing is ordinary text and stays; any other unresolved marker is unverified and handled per `on_unverified`. Code spans are never parsed. `strip_markers` (no citation map) leaves glued markers alone.
+- **Offset markers name no document.** When the same section range exists in several documents of the scope, the marker cannot be verified and is treated as unverified.
 ```python
 class CitationFormatter(Protocol):
     name: str
@@ -1879,7 +1886,7 @@ KB may register its own `[page§entry, vN]` formatter. The trade-off (model-visi
    - `answer_final`: unverified markers removed (default) or replaced with `[?]` (`profile.citations.on_unverified="flag"`).
 
 ### 11.3 `QuoteValidator` **[v1]**
-- When `verify_quotes` is set, every quoted string next to a citation is matched against the cited node's text.
+- When `verify_quotes` is set, every quoted string next to a citation is matched against the cited node's text. A citation with no quote written next to it is not quote-checked; it keeps its marker verification (1.2.0: comparing the source with its own excerpt proved nothing). `[1, 2]` after a quote checks the quote against both. CJK quotes (`“”`, `「」`, `『』`) count from 2 characters, ASCII quotes from 4.
 - Matching uses `difflib.SequenceMatcher` over a sliding window, with threshold ≥ 0.85. KB's `span_checker.py` is the reference implementation.
 - The ratio is stored in `verification_score`. Below the threshold, `verified=False`.
 
@@ -1898,7 +1905,7 @@ KB may register its own `[page§entry, vN]` formatter. The trade-off (model-visi
 
 ### 11.6 Output sanitizer (RAG-SEC-6) **[v1]**
 Default last stage. It:
-1. Neutralizes Markdown images and links whose URL host is not among the retrieved sources' URLs (taken from the renderer's metadata) or `profile.allowed_link_hosts`. The link text is kept and the URL is dropped.
+1. Neutralizes Markdown images and links whose URL host is not among the retrieved sources' URLs (taken from the renderer's metadata) or `profile.allowed_link_hosts`. The link text is kept and the URL is dropped. Reference-style definitions (`[1]: https://…`, which turn `![x][1]` into a remote image) and autolinks (`<https://…>`) to untrusted hosts are removed too (1.2.0).
 2. Removes the fence id, the `[[answer_found=…]]` flag and any fence-like tag from `answer_final`.
 
 > **Rationale:**
@@ -1945,7 +1952,7 @@ class EngineProfile(BaseModel):
     runtime: "RuntimeConfig"         # deadline_seconds, stage budgets, pool_size
     cache: "CacheConfig"
     trace_level: Literal["light", "verbose"] = "light"
-    allowed_link_hosts: frozenset[str] = frozenset()
+    allowed_link_hosts: list[str] = []            # hosts are compared case-insensitively; order is irrelevant
     injection_scanner: str | None = None
     variants: dict[str, dict] = {}   # named overrides, e.g. {"search": {...}}
 
@@ -1959,7 +1966,8 @@ class EngineProfile(BaseModel):
 - **No model id is hardcoded in the lib.** Presets take `models=` as a required argument: `EngineProfile.long_form_reader(models=ModelBindings(...))`.
 - `validate()` lists **every** problem at once: missing bindings for enabled stages, unknown component names, threshold/score-kind mismatches, a zone ratio sum above 1, and a Tier 0 gate that does not fit: `full_context_max_tokens` plus the reserved instruction, history and question zones must not exceed `max_context_tokens` (the question reserve is counted since 1.2.0).
 - **Model lists.** Each binding is an ordered list. Its models may come from the same provider (for example two Gemini models when an app has only a Gemini key). A one-model list is valid; the backup-model degradation (DG-02) then does not apply, and a failure after retries raises.
-- `fingerprint()` and `version` are recorded in every trace. Named variants (`news_chat`, `news_search`) share one base and differ only in their override block.
+- `fingerprint()` and `version` are recorded in every trace. The fingerprint hashes the profile with sorted keys, so it does not depend on dict insertion order (1.2.0).
+- **Validation (1.2.0)** also rejects: a `fallbacks` value the row does not accept (`rerank`: `raise`/`keep_order`; `summarizer`: `raise`/`skip`; `query_embedding`: `raise`/`keyword`; `jev`, `cache`, `deadline`: `raise`); a `citations.policy` other than `filter`, and a non-zero `min_citation_coverage`, until §11.4 is built; and a store whose embedding dimensions differ from the model's (RAG-ING-7). Router `auto` without `models.intent` is valid but logs a startup WARNING that routing is heuristic-only. Named variants (`news_chat`, `news_search`) share one base and differ only in their override block.
 - **Sibling engines.** `engine.with_profile(profile)` and `engine.with_store(store)` (1.2.0) return engines that share the pool, cache, gateway, registry, observers and guards, and differ only in the profile or the store. They also share the fence secret, so stateless fence ids, and with them the cacheable prompt prefix, stay the same across siblings (D-06). `with_store` is how an app serves each request from a store scoped to the signed-in user (§5.6) without building a pool per request.
 
 > **Rationale:**
@@ -2172,6 +2180,7 @@ class RAGTrace(BaseModel):
 
 - `profile.fallbacks` turns opt-in rows on (`{"query_embedding": "keyword", "summarizer": "skip"}`) and can turn any default-on row off (`{"rerank": "raise"}`). Keys are `rerank`, `jev`, `summarizer`, `query_embedding`, `cache`, and `deadline` (DG-10); unknown keys fail `validate()`. Model lists and `observer_errors` control the generation and observer rows.
 - **Not failures, so not in the table:** empty retrieval (a normal `answer_found="no"` result, RAG-RES-4), citations that fail verification (removed or flagged per §11.2), fence-id rotation on collision (§10.4), and an opt-in relaxation step (§7.6, reported in `relaxations`).
+- **`NEVER_DEGRADABLE`** (`errors.py`, 1.2.0) lists the errors no degradation may absorb: budget, deadline, configuration, store capability, missing scope, scope violation, unsupported filter. A safety block (`GenerationError(reason="blocked")`) is never retried on another model either. An intent-model outage raises `GenerationError(reason="all_models_failed")` (DG-02 per failed model); unparseable intent output raises `IntentParseError`, which never echoes the model output.
 - **Never degradable** (always raise, whatever `fallbacks` says): store errors (`RetrievalError`, wrapping the cause), missing required scope, unsupported filters, guard errors, embedding-space mismatch, configuration errors, blocked output, and a stream that breaks after it started.
 
 **Startup validation.** The `RAGEngine` constructor runs `validate()` and raises `ProfileConfigError` listing every problem, so nothing knowable in advance becomes a per-request fallback:
@@ -2269,7 +2278,7 @@ class Cache(Protocol):
 
 - **INFO summary line**, generated from the light trace:
   `[RAG] id=<request_id> profile=<name>@<version> strategy=<name> rule=<n> router=<source> nodes=<n> reranked=<bool> citations=<verified>/<raw> degr=<ids|none> tokens=<in>/<out> cost=<usd|na> ms=<total> outcome=<ok|degraded|error>`
-- **No content above DEBUG.** Raw questions, document text and answers are never logged at INFO, WARNING or ERROR. Error messages from providers are truncated to 200 characters and must not include prompt text.
+- **No content above DEBUG.** Raw questions, document text and answers are never logged at INFO, WARNING or ERROR. Error messages from providers are truncated to 200 characters and must not include prompt text. One helper, `errors.safe_message`, produces every such message (`Type: text`, one line, at most 200 characters), and `DegradationTracker.record` applies it to every `reason` and `message` (1.2.0).
 
 > **Rationale:**
 > - WARNING means "something went wrong but the configured result was still achieved"; ERROR means "the result is worse than configured, or the request failed". An operator can alert on ERROR rate alone.
@@ -2544,6 +2553,11 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-97** | Date windows | §5.5, §7.6 | Hard range Jan–Jun plus intent window Jun 1–7 applies Jun 1–7; a window outside the hard range leaves the hard range. Relaxation widens or drops back to the hard range, never past it. `date_window_days=3` under a frozen clock gives `[now-3d, now]`; a reversed range is repaired. |
 | **AC-RAG-98** | Layer selection | §4.2, §8.6 | Ranked searches return no summaries. Tier 3 returns the section summary or its units, never both. Full scope has no overlapping text and `scope_stats` measures the same text. |
 | **AC-RAG-99** | Ranking contract | §3.3, §8.2, §9 | Reranking a comparison scores each subject against its own variant and keeps both. Boosters leave an ordered node in place with its score. Tier 0 keeps an `entry` atomic, flags it `full_scope`, and never ranks it. The engine never requests more than `max_top_k` rows and marks the result truncated. `threshold(rerank)` without a rerank stage fails at startup. Summaries over budget drop oldest first. |
+| **AC-RAG-100** | Citation markers | §11.1 | `张三是主角[1]。`, `city[1].` and `(table)[1].` cite node 1; `arr[3]` that resolves to nothing stays as text; an offset marker found in two documents is unverified. |
+| **AC-RAG-101** | Quotes and links | §11.3, §11.6 | A citation without a written quote keeps its verification; a fabricated quote fails. Reference-style image definitions and autolinks to untrusted hosts are removed. |
+| **AC-RAG-102** | Summarizer | §6.3 | The prompt forbids prior knowledge and the source arrives fenced. Under `skip`, one failed unit gives `summary_status="partial"`; a `ProfileConfigError` still propagates. A section longer than four units is never sent whole. |
+| **AC-RAG-103** | Errors and config | §12.1, §13.3, §13.8 | Degradation reasons are one line of at most 200 characters. An intent outage raises `GenerationError`, unparseable output `IntentParseError` without the output text. Unknown fallback values and unimplemented citation policies fail validation. The fingerprint ignores dict order. `prepare_nodes` failures carry a reason. Ingestion uses `profile.ingestion.granularity`. |
+| **AC-RAG-104** | Store and stream hygiene | §4.5, §10.8 | `to_jsonl`/`from_jsonl` keep stored fingerprints and owners. `delete_document` counts summaries and clears owners. A paragraph break ends a sentence. `generate_from_nodes` honours `request.variant`. |
 
 ### 16.2 Delivery phases (Q-04)
 Delivery follows production need: first what both production apps share, then AudioReading (which has no RAG today), then the NewsIntelligence migration, then KnowledgeBase (still in development, so the easiest to adapt) and everything else. Each step ends with every existing `cody-ai-shared-lib` test and every new `tests/rag/` test passing.

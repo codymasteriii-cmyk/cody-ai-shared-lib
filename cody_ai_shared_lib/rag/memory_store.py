@@ -663,6 +663,10 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                 if nid in self._nodes:
                     node = self._nodes.pop(nid)
                     self._fingerprints.get(node.span.doc_id, {}).pop(nid, None)
+                    self._owners.pop(nid, None)
+                    key = (node.span.doc_id, node.span.section_seq)
+                    if key in self._section_nodes:
+                        self._section_nodes[key] = [i for i in self._section_nodes[key] if i != nid]
                     deleted += 1
 
             targets = set(node_ids)
@@ -679,12 +683,17 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             to_delete = [nid for nid, n in self._nodes.items() if n.span.doc_id == doc_id]
             for nid in to_delete:
                 del self._nodes[nid]
+                self._owners.pop(nid, None)
             self._fingerprints.pop(doc_id, None)
+            self._doc_owners.pop(doc_id, None)
+            for key in [k for k in self._section_nodes if k[0] == doc_id]:
+                del self._section_nodes[key]
             sec_keys = [k for k in self._section_summaries if k[0] == doc_id]
             for k in sec_keys:
+                self._owners.pop(self._section_summaries[k].node_id, None)
                 del self._section_summaries[k]
             self._revision_counter += 1
-            return len(to_delete)
+            return len(to_delete) + len(sec_keys)       # same counting as delete_nodes
 
     def delete_sections(self, doc_id: str, from_seq: int) -> int:
         with self._lock:
@@ -720,6 +729,8 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                 "_kind": "header",
                 "embedding_space": self._embedding_space.model_dump(mode="json"),
                 "revision_counter": self._revision_counter,
+                "doc_owners": {d: o.model_dump(mode="json") for d, o in self._doc_owners.items()},
+                "node_owners": {n: o.model_dump(mode="json") for n, o in self._owners.items()},
             }
             lines.append(json.dumps(header, ensure_ascii=False))
             for nid, node in self._nodes.items():
@@ -737,7 +748,12 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                     "doc_id": doc_id,
                     "section_seq": sec_seq,
                     "node": sum_node.model_dump(mode="json"),
-                    "fingerprint": self._fingerprint(sum_node).model_dump(mode="json"),
+                    # the stored fingerprint, as written by the engine; recomputing it would lose it
+                    "fingerprint": (
+                        fp.model_dump(mode="json")
+                        if (fp := self._fingerprints.get(doc_id, {}).get(sum_node.node_id)) is not None
+                        else None
+                    ),
                 }
                 lines.append(json.dumps(row, ensure_ascii=False))
             file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -754,6 +770,8 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         raw_lines = [ln.strip() for ln in file_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
         emb_space: EmbeddingSpace | None = None
         rev_counter = 1
+        doc_owners: dict[str, Any] = {}
+        node_owners: dict[str, Any] = {}
         nodes_to_load: list[tuple[RAGNode[Any], Fingerprint | None]] = []
         summaries_to_load: list[tuple[str, int, RAGNode[Any]]] = []
         summary_fingerprints: list[tuple[str, str, Fingerprint]] = []
@@ -765,6 +783,8 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                 if "embedding_space" in record and record["embedding_space"]:
                     emb_space = EmbeddingSpace.model_validate(record["embedding_space"])
                 rev_counter = int(record.get("revision_counter", 1))
+                doc_owners = record.get("doc_owners") or {}
+                node_owners = record.get("node_owners") or {}
             elif kind == "node":
                 node = RAGNode.model_validate(record["node"])
                 fp = Fingerprint.model_validate(record["fingerprint"]) if record.get("fingerprint") else None
@@ -794,6 +814,8 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             store._section_summaries[(doc_id, sec_seq)] = s_node
         for doc_id, node_id, fp in summary_fingerprints:
             store._fingerprints.setdefault(doc_id, {})[node_id] = fp
+        store._doc_owners = {d: OwnerScope.model_validate(o) for d, o in doc_owners.items()}
+        store._owners = {n: OwnerScope.model_validate(o) for n, o in node_owners.items()}
         return store
 
 

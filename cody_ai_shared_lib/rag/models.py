@@ -460,7 +460,7 @@ class IngestionProgress(BaseModel):
     sections_total: int
     passages_upserted: int
     passages_skipped_unchanged: int = 0
-    summary_status: Literal["generated", "provided", "skipped", "failed"] = "skipped"
+    summary_status: Literal["generated", "provided", "skipped", "partial", "failed"] = "skipped"
     usage: list[StageUsage] = Field(default_factory=list)
     degradations: list[Degradation] = Field(default_factory=list)
 

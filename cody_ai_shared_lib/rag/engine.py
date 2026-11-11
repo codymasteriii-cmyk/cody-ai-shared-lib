@@ -12,6 +12,9 @@ import uuid
 from typing import Any, Callable, Generic, Iterator
 
 from ..embedding import EMBEDDING_MODEL
+
+# Dimensions of the embedding models the lib embeds with; others are not checked
+EMBEDDING_DIMS = {EMBEDDING_MODEL: 768}
 from ..pricing import get_model_pricing
 from .answering import AnswerFinalizer
 from .cache import Cache, InMemoryLRUCache
@@ -238,11 +241,18 @@ class RAGEngine(Generic[MetaT]):
             embedding_model=profile.models.embedding,
             budget_guard=budget_guard,
             embed_summaries=profile.ingestion.summaries.embed_summaries,
+            granularity=profile.ingestion.granularity,
         )
         self.pipeline: RetrievalPipeline[MetaT] = RetrievalPipeline(
             self._deps, store, self._pool, self.cache, budget_guard, self._explicit_guards
         )
         self.router: IntentRouter = router or self.registry.get("router", profile.router.name)(self._deps)
+        if router is None and profile.router.name == "auto" and not profile.models.intent:
+            # Valid, but say so once: "auto" without an intent model is heuristic-only routing (§7)
+            logger.warning(
+                f"[RAG] profile '{profile.name}': router 'auto' has no models.intent; "
+                "intents come from the heuristic router only"
+            )
 
     # ── Validation ────────────────────────────────────────────────────────
 
@@ -254,6 +264,11 @@ class RAGEngine(Generic[MetaT]):
         profile = self.profile
 
         space = self.store.embedding_space()
+        known_dims = EMBEDDING_DIMS.get(profile.models.embedding)
+        if known_dims is not None and space.dims != known_dims:
+            problems.append(
+                f"Store embedding space has {space.dims} dims; '{profile.models.embedding}' produces {known_dims} (RAG-ING-7)"
+            )
         if space.model != profile.models.embedding:
             problems.append(
                 f"Store embedding space model '{space.model}' does not match "
@@ -573,6 +588,10 @@ class RAGEngine(Generic[MetaT]):
         intent: QueryIntent | None = None,
     ) -> RAGResponse[MetaT]:
         """Run guards, assembly, generation and citation checks on caller-supplied nodes (§14.4)."""
+        if request.variant:
+            return self._variant_engine(request.variant).generate_from_nodes(
+                request.model_copy(update={"variant": None}), nodes, intent
+            )
         run = self._begin(request)
         resolved = intent or QueryIntent(search_query=request.question, router_source="passthrough")
         retrieval: RAGRetrievalResult[MetaT] | None = None
@@ -676,6 +695,7 @@ class RAGEngine(Generic[MetaT]):
                     event="retrieval",
                     data={
                         "nodes": [n.node_id for n in retrieval.nodes],
+                        "labels": [self.formatter.label(n) for n in retrieval.nodes],
                         "node_count": len(retrieval.nodes),
                         "strategy_used": retrieval.strategy_used,
                         "applied_filters": retrieval.applied_filters.model_dump(),
@@ -756,6 +776,15 @@ class RAGEngine(Generic[MetaT]):
             # Closing the model stream makes the gateway record the cancelled call (RAG-OPS-2)
             if chunks is not None:
                 chunks.close()
+            try:
+                # Observers see every request, cancelled ones too (RAG-EVAL-8); outcome None = no answer
+                trace = run.trace.build(
+                    retrieval.applied_filters if retrieval is not None else None,
+                    run.degradations.degradations, run.usage.stage_usages, run.usage.total(),
+                )
+                run.trace.dispatcher.notify_complete(trace, None)
+            except Exception:
+                logger.error(f"[RAG] id={run.request_id} on_complete failed for a cancelled stream", exc_info=True)
             raise
         except Exception as exc:
             self._fail(exc, run, retrieval)
@@ -869,7 +898,9 @@ class RAGEngine(Generic[MetaT]):
             budget_guard=self.budget_guard,
         )
 
-        nodes = build_section_nodes(doc_input.doc_id, section, self.splitter, doc_input.revision)
+        nodes = build_section_nodes(
+            doc_input.doc_id, section, self.splitter, doc_input.revision, self.profile.ingestion.granularity
+        )
         for summary_node in ([result.section_summary] if result.section_summary else []) + result.unit_summaries:
             summary_node.revision = doc_input.revision
         for node in nodes:
@@ -940,9 +971,10 @@ class RAGEngine(Generic[MetaT]):
         doc_ids = list(dict.fromkeys(node.span.doc_id for node in nodes))
         tracker, degradations = self._ingestion_trackers(f"prepare-{uuid.uuid4().hex[:12]}", doc_ids, owner)
         try:
-            embedded, failed = self.embedder.embed_each(
+            embedded, failures = self.embedder.embed_each_with_reasons(
                 nodes, tracker, degradations, "prepare_embedding", self.budget_guard
             )
+            failed = [node for node, _ in failures]
             if not embedded:
                 raise EmbeddingProviderError(
                     f"All {len(nodes)} nodes failed to embed with model '{self.profile.models.embedding}'",
@@ -982,7 +1014,7 @@ class RAGEngine(Generic[MetaT]):
             )
         return PreparedBatch[MetaT](
             prepared=prepared,
-            failed=[FailedNode(node_id=node.node_id, reason="empty or zero embedding") for node in failed],
+            failed=[FailedNode(node_id=node.node_id, reason=reason) for node, reason in failures],
             usage=tracker.stage_usages,
             degradations=degradations.degradations,
         )

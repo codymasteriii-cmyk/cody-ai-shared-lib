@@ -38,6 +38,18 @@ class BatchEmbedder(Generic[MetaT]):
         budget_guard: BudgetGuard | None = None,
     ) -> tuple[list[tuple[RAGNode[MetaT], list[float]]], list[RAGNode[MetaT]]]:
         """Return (embedded pairs, failed nodes), judging every node on its own (§6.4.1)."""
+        embedded, failures = self.embed_each_with_reasons(nodes, usage_tracker, degradation_tracker, stage, budget_guard)
+        return embedded, [node for node, _ in failures]
+
+    def embed_each_with_reasons(
+        self,
+        nodes: list[RAGNode[MetaT]],
+        usage_tracker: UsageTracker,
+        degradation_tracker: DegradationTracker | None = None,
+        stage: str = "ingest_embedding",
+        budget_guard: BudgetGuard | None = None,
+    ) -> tuple[list[tuple[RAGNode[MetaT], list[float]]], list[tuple[RAGNode[MetaT], str]]]:
+        """Like embed_each, with the reason each failed node failed (§6.4.1)."""
         vectors: list[list[float]] = []
         texts = [self.renderer.embed_text(node) for node in nodes]
         for start in range(0, len(texts), self.batch_size):
@@ -53,14 +65,16 @@ class BatchEmbedder(Generic[MetaT]):
             vectors.extend(result.vectors)
 
         embedded: list[tuple[RAGNode[MetaT], list[float]]] = []
-        failed: list[RAGNode[MetaT]] = []
+        failures: list[tuple[RAGNode[MetaT], str]] = []
         for index, node in enumerate(nodes):
             vector = vectors[index] if index < len(vectors) else []
-            if is_zero_vector(vector):
-                failed.append(node)
+            if not vector:
+                failures.append((node, "the provider returned no vector"))
+            elif is_zero_vector(vector):
+                failures.append((node, "the provider returned a zero vector"))
             else:
                 embedded.append((node, vector))
-        return embedded, failed
+        return embedded, failures
 
     def embed_nodes(
         self,

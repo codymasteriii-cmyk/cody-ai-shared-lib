@@ -56,9 +56,14 @@ class _BaseFormatter:
 
 
 class RefCitationFormatter(_BaseFormatter):
-    """Short per-turn markers: `[1]`, `[2]`. Four or more digits are not markers, so `[2024]` stays text."""
+    """Short per-turn markers: `[1]`, `[2]`. Four or more digits are not markers, so `[2024]` stays text.
+
+    Any bracketed number list is a candidate, wherever it appears, so `主角[1]。` and `city[1].` are
+    recognised. Whether a candidate is a citation is decided by the extractor against the turn's
+    citation map (§11.2): one glued to an ASCII word (`arr[1]`) that resolves to nothing stays text.
+    """
     name = "ref"
-    pattern = re.compile(r"(?<![\w)])\[\s*\d{1,3}(?:\s*,\s*\d{1,3})*\s*\]")
+    pattern = re.compile(r"\[\s*\d{1,3}(?:\s*,\s*\d{1,3})*\s*\]")
 
     def marker(self, node: RAGNode[Any], index: int) -> str:
         return f"[{index}]"
@@ -80,13 +85,17 @@ class OffsetCitationFormatter(_BaseFormatter):
         if match is None:
             return None
         seq, start, end = (int(g) for g in match.groups())
-        for node in nodes:
-            if node.span.section_seq == seq and node.span.char_end > start and node.span.char_start < end:
-                span = node.span.model_copy(
-                    update={"char_start": max(node.span.char_start, start), "char_end": min(node.span.char_end, end)}
-                )
-                return node, span
-        return None
+        hits = [
+            node for node in nodes
+            if node.span.section_seq == seq and node.span.char_end > start and node.span.char_start < end
+        ]
+        if len({node.span.doc_id for node in hits}) != 1:
+            return None   # no match, or the same range exists in several documents: cannot be verified
+        node = hits[0]
+        span = node.span.model_copy(
+            update={"char_start": max(node.span.char_start, start), "char_end": min(node.span.char_end, end)}
+        )
+        return node, span
 
 
 class DocumentCitationFormatter(_BaseFormatter):
@@ -106,6 +115,14 @@ BUILTIN_FORMATTERS = {
 
 
 _CODE_RE = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)
+
+
+_GLUED_BEFORE = re.compile(r"[A-Za-z0-9_\])]")
+
+
+def _glued_to_ascii_word(text: str, start: int) -> bool:
+    """True when the marker directly follows an ASCII word character or a closing bracket (`arr[1]`, `f(x)[2]`)."""
+    return start > 0 and bool(_GLUED_BEFORE.fullmatch(text[start - 1]))
 
 
 def _markers_outside_code(text: str, formatter: CitationFormatter) -> list[tuple[str, int, int]]:
@@ -138,8 +155,15 @@ def _rebuild(text: str, replacements: list[tuple[int, int, str]]) -> str:
 
 
 def strip_markers(text: str, formatter: CitationFormatter) -> str:
-    """Remove citation markers, for a UI that needs clean text while streaming (§10.8)."""
-    return _rebuild(text, [(start, end, "") for _, start, end in _markers_outside_code(text, formatter)])
+    """Remove citation markers, for a UI that needs clean text while streaming (§10.8).
+
+    Without the turn's citation map it cannot tell `arr[1]` from a citation, so it leaves markers glued
+    to an ASCII word alone; `done.answer_final` is the canonical clean text.
+    """
+    return _rebuild(text, [
+        (start, end, "") for _, start, end in _markers_outside_code(text, formatter)
+        if not _glued_to_ascii_word(text, start)
+    ])
 
 
 class CitationExtractor(Generic[MetaT]):
@@ -180,8 +204,11 @@ class CitationExtractor(Generic[MetaT]):
         replacements: list[tuple[int, int, str]] = []
         for raw, start, end in _markers_outside_code(text, self.formatter):
             markers = self._expand(raw)
-            if len(markers) > 1 and not all(self.formatter.resolve(m, markers_to_nodes) for m in markers):
+            resolves = all(self.formatter.resolve(m, markers_to_nodes) for m in markers)
+            if len(markers) > 1 and not resolves:
                 continue  # a list of numbers such as [7, 8, 9] that are not all sources is ordinary text
+            if not resolves and _glued_to_ascii_word(text, start):
+                continue  # `arr[1]`, `x[2]`: an index, not a citation, unless it names a source
             outputs = []
             for marker in markers:
                 citation = citation_for(marker)

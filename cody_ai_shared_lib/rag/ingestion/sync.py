@@ -25,7 +25,7 @@ from .nodes import (
 from .splitter import TextSplitter
 from .summarizer import SectionSummarizer
 
-_STATUS_PRIORITY = {"skipped": 0, "provided": 1, "generated": 2, "failed": 3}
+_STATUS_PRIORITY = {"skipped": 0, "provided": 1, "generated": 2, "partial": 3, "failed": 4}
 
 
 class DocumentSynchronizer(Generic[MetaT]):
@@ -42,6 +42,7 @@ class DocumentSynchronizer(Generic[MetaT]):
         embedding_model: str,
         budget_guard: BudgetGuard | None = None,
         embed_summaries: bool = True,
+        granularity: str = "passage",
     ):
         self.store = store
         self.splitter = splitter
@@ -52,6 +53,7 @@ class DocumentSynchronizer(Generic[MetaT]):
         self.embedding_model = embedding_model
         self.budget_guard = budget_guard
         self.embed_summaries = embed_summaries
+        self.granularity = granularity
 
     def sync(
         self,
@@ -86,7 +88,7 @@ class DocumentSynchronizer(Generic[MetaT]):
         current_ids: set[str] = set()
         section_nodes: dict[int, list[RAGNode[MetaT]]] = {}
         for section in sections:
-            nodes = build_section_nodes(doc.doc_id, section, self.splitter, doc.revision)
+            nodes = build_section_nodes(doc.doc_id, section, self.splitter, doc.revision, self.granularity)
             for node in nodes:
                 finalize_node(node, self.renderer, self.analyzer, caps.uses_analyzer_tokens)
                 current_ids.add(node.node_id)

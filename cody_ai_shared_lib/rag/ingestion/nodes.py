@@ -22,6 +22,7 @@ def build_section_nodes(
     section: RAGSectionInput[MetaT],
     splitter: TextSplitter,
     revision: str | None = None,
+    granularity: str = "passage",
 ) -> list[RAGNode[MetaT]]:
     """Split a section into passage nodes carrying global character offsets and the document revision."""
     nodes: list[RAGNode[MetaT]] = []
@@ -29,7 +30,7 @@ def build_section_nodes(
         nodes.append(
             node_class_for(section.metadata)(
                 node_id=format_node_id(doc_id, section.section_seq, "passage", idx),
-                granularity="passage",
+                granularity=granularity,
                 text=chunk.text,
                 span=SourceSpan(
                     doc_id=doc_id,
