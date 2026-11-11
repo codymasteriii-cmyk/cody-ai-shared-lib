@@ -5,7 +5,7 @@
 | **Document Version** | 1.2.0-draft |
 | **Status** | Draft, design agreed. Sibling feedback (AUD-01..26, NF-01..40, KB-01..23) was consolidated into C-01..C-39 and folded in; owner decisions Q-01..Q-08, the failure model and the pushbacks (Appendix C) are settled, and all three app agents (AudioReading, NewsIntelligence, KnowledgeBase) agreed through 1.1.8. Version 1.1.14 changes parts of that agreed contract after the Phase 1–3 review (Appendix B). Version 1.2.0 adds the changes agreed with AudioReading after its first integration (INT-01..INT-09); they are additive. This file records the outcome and its reasoning; the exchange itself was removed after agreement and remains in git history (commit `37d76fd`). This file is the only record of the design and its reasoning; the round's working files were removed on 2026-11-08. |
 | **Package Namespace** | `cody_ai_shared_lib.rag` (`cody-ai-shared-lib >= 0.8.0`) |
-| **Target Runtime** | Python 3.11+, synchronous core (matching the rest of `cody_ai_shared_lib`) with a bounded thread pool for independent calls |
+| **Target Runtime** | Python 3.13+ (1.2.0: the owner's floor for all projects; the models use PEP 696 `TypeVar` defaults), synchronous core (matching the rest of `cody_ai_shared_lib`) with a bounded thread pool for independent calls |
 | **Primary Consumers** | **AudioReading** (`audiolib.codymasterai.com`), **NewsIntelligence / Pulse Nexus** (`ai.codymasterai.com`), **KnowledgeBase** |
 | **Owner** | Cody (`codymasteriii@gmail.com`) / Cody AI Engineering Team |
 | **Last Updated** | 2026-11-08 |
@@ -726,7 +726,7 @@ class RAGStore(ABC, Generic[MetaT]):
 ```python
 class Fingerprint(BaseModel):
     content_hash: str
-    embedding_signature: str      # f"{model}|{dims}|{task_type}|{splitter_version}"
+    embedding_signature: str | None   # f"{model}|{dims}|{task_type}|{splitter_version}"; None: stored without a vector
     fts_signature: str | None = None   # f"{analyzer_name}|{analyzer_version}" when uses_analyzer_tokens
 
     def upsert_section_nodes(self, doc_id: str, section_seq: int, nodes: list[RAGNode[MetaT]],
@@ -1065,7 +1065,7 @@ class TextAnalyzer(Protocol):
 > - Summary units close the gap AudioReading found after the spoiler fix (Audio response N-4): with whole-section summaries only, the current section of a long PDF chunk had no summary at all. Units are ingestion-only and need no new store method.
 
 ### 6.4 `BatchEmbedder` (public, usable standalone) **[v1]**
-- Embeds `renderer.embed_text(node)` through `ModelGateway` with `task_type="RETRIEVAL_DOCUMENT"`.
+- Embeds `renderer.embed_text(node)` through `ModelGateway` with the task type the store declares (`embedding_space().task_type_documents`, default `"RETRIEVAL_DOCUMENT"`), so the fingerprint never names a task type the vector was not made with.
 - **RAG-ING-4 (zero-vector guard).** `generate_embedding` returns `[0.0]*768` for failed items.
   - Zero vectors MUST NOT be upserted.
   - On the engine-write path (`ingest_document`, `sync_document`) one section is one unit. If any of its nodes fails, the engine raises `EmbeddingProviderError` naming them in `failed_node_ids`, before anything of that section is written, so a document never has holes. The job retries from its checkpoint.
@@ -1175,11 +1175,15 @@ class IngestionProgress(BaseModel):
   - `embedding_signature = model|dims|task_type|splitter_version`, where `splitter_version` is the store's `embedding_space().splitter_version`, or the splitter's own version when the store declares none;
   - `fts_signature = analyzer_name|analyzer_version` for stores with `uses_analyzer_tokens`, else `None`.
   All three reach the store with every node through `upsert_section` (§4.4.1), or reach the app from `prepare_nodes` (§6.4.1). There is no other formula: neither apps nor stores compute fingerprints themselves.
-- **`engine.sync_document(doc, *, owner=None)`:**
-  - Diffs against `store.get_fingerprints(doc_id)`.
-  - Embeds only new or changed nodes, deletes nodes that vanished, and skips unchanged ones.
-  - Node ids of unchanged content are preserved.
+- **Rows without a vector (1.2.0).** A row stored without a vector by design (a summary when `embed_summaries=False`) carries `embedding_signature=None`. It is never stale for embeddings, so a model upgrade does not flag it. If the profile later embeds summaries, a summary with `None` is stale and sync embeds it.
+- **Revision.** Every node the engine builds carries `RAGDocumentInput.revision`, so a citation saved before an edit is reported `stale` (§11.2) instead of silently pointing at different text. An app whose documents can be edited passes a revision.
+- **`engine.sync_document(doc, *, owner=None)`** brings every stored row of the document to the current text and signatures:
+  - Diffs against `store.get_fingerprints(doc_id)`. `doc` is the **whole** document: a node that is stored but not in `doc` is deleted. (To add later sections without touching earlier ones, use `ingest_document`.)
+  - Passages: new ones and ones whose text, embedding signature or FTS signature differ are re-embedded; unchanged ones are skipped; vanished ones are deleted.
+  - A section whose text changed gets fresh summaries.
+  - A section whose text is unchanged keeps its summaries. When they no longer match the current signatures (model or analyzer upgrade, `embed_summaries` switched), sync re-reads them with `fetch_nodes` and re-embeds or re-signs them without summarizing again. A store without `supports_fetch_nodes` regenerates them instead (summary model cost).
   - Requires `supports_fingerprints` and `supports_delete`.
+- **Node ids are positional (1.2.0, owner decision on review item M5).** `{doc}#s{seq}p{i}` numbers passages in order, so ids are stable for appends and for unchanged sections. Inserting text into a section renumbers the passages after it: sync re-embeds them, and citations saved before the edit are flagged stale through `revision`. The engine does not try to keep ids stable across in-place edits; that cost is accepted for edited documents.
 - **`engine.reconcile(limit, dry_run=False)`:**
   - Re-embeds rows that are missing, zero, or carry the wrong signature.
   - Batch-sized and cost-guarded.
@@ -1195,7 +1199,8 @@ class IngestionProgress(BaseModel):
 >   - KB edits and supersedes entries (KB-03).
 >   - News has two vector columns that must never be mixed (NF-28).
 > - One fingerprint contract covers all three and makes a model upgrade a `reconcile` run instead of a one-off script.
-> - Preserving node ids for unchanged content keeps citations, conversation state and eval golden sets valid across re-ingestion (RAG-EVAL-5).
+> - Preserving node ids for unchanged content keeps citations, conversation state and eval golden sets valid across re-ingestion of append-only and unchanged documents (RAG-EVAL-5). For edited documents the owner chose simplicity over finer cost savings: renumber, re-embed, flag stale citations (2026-11-11).
+> - Sync refreshes kept summaries from their stored text because a model upgrade must never leave vectors from two models in one store (RAG-ING-7, NF-28), and re-summarizing would pay the summary model again for unchanged text.
 > - Index coverage reporting stays in Audio, which already knows its checkpoint (R-01).
 
 ---
@@ -2271,7 +2276,7 @@ Evaluating a RAG system is a large topic that deserves its own design session: g
 | **RAG-EVAL-2** | **Component-level invocation.** Each layer can be run and judged on its own (§14.4): retrieval only, generation over given nodes, and verification of a given answer. | §8.10, §14.4 |
 | **RAG-EVAL-3** | **Complete, serializable trace.** The verbose trace records each stage's inputs and outputs as node ids with every raw score and rank, the drop reasons, the router decision, the tier rule, the guard effects, the component versions, the model ids, `prompt_version` and the profile fingerprint. The trace is JSON-serializable and carries `trace_schema_version`. | §13.2 |
 | **RAG-EVAL-4** | **Determinism controls.** The clock is injected (`Clock`). The random source used for fence ids and ids is injectable (`rng`). Temperature comes from the profile. Parallel results are merged in submission order. No component reads wall-clock time or global randomness directly. | §7.6, §10.4, §13.4 |
-| **RAG-EVAL-5** | **Stable identities.** Node ids survive re-ingestion of unchanged content. Spans are stable coordinates for append-only documents. `revision` and `scope_stats().revision` identify content versions, and the trace records the scope revision. A golden case can therefore point at a node id or at `(doc_id, char range)` and stay valid. | §3.2, §6.6 |
+| **RAG-EVAL-5** | **Stable identities.** Node ids survive re-ingestion of unchanged content (append-only documents and unchanged sections; in-place edits renumber, §6.6). Spans are stable coordinates for append-only documents. `revision` and `scope_stats().revision` identify content versions, and the trace records the scope revision. A golden case can therefore point at a node id or at `(doc_id, char range)` and stay valid. | §3.2, §6.6 |
 | **RAG-EVAL-6** | **Comparable configurations.** Frozen profiles have a `fingerprint()`. Named variants run against the same store. `engine.with_profile(profile_or_variant)` returns a sibling engine that shares the store, registry and pool. | §12.1 |
 | **RAG-EVAL-7** | **Record and replay.** `RecordingGateway` stores every model call (stage, model, canonical input hash, output, usage) to a sink. `ReplayGateway` serves recorded outputs by the same key and fails loudly on a miss. Replaying a recorded run with the same profile, store snapshot, clock and rng reproduces the same retrieval and response. Records never contain credentials. | §2.3 |
 | **RAG-EVAL-8** | **Online tap.** `RAGObserver.on_complete` receives the trace and the outcome for every request. Sampling, storage and asynchronous judging are app-side and run outside the request path. | §13.2 |
@@ -2512,6 +2517,10 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-85** | Full-scope granularity | §4.2 | Kit check 18 fails a store that returns one node for a two-section scope. (A39.) |
 | **AC-RAG-86** | Stream lifecycle | §10.8 | Leaving a `with engine.stream_query(...)` block after the first delta reads no further model output, `usage_total` includes the cancelled call, and a second `close()` is harmless. (A40.) |
 | **AC-RAG-87** | Caller contract | §10.8 | With a model that emits no flag, `done.data["answer_found"]` is `None`; `done` echoes `request_id` and `metadata["message_id"]`; `answer_final` holds no flag text. (A41.) |
+| **AC-RAG-88** | Platform | header | `pyproject.toml` requires Python >= 3.13. |
+| **AC-RAG-89** | Sync after upgrade | §6.6 | After an embedding-signature change, `sync_document` clears `embeddings_stale` for passages and summaries, re-embedding kept summaries from their stored text with no summary model call; a store without `fetch_nodes` regenerates them. After an analyzer change, sync clears `fts_stale`. A splitter version change is detected on a store that declares no `splitter_version`. |
+| **AC-RAG-90** | Rows without vectors | §6.6 | With `embed_summaries=False` every summary is written with `embedding_signature=None` and never makes the document stale, also after an upgrade. Switching the profile to embed summaries makes them stale, and sync embeds them. |
+| **AC-RAG-91** | Revision and task type | §6.4, §6.6 | Every node from `ingest_document` carries the document's `revision`, returned by `current_revisions`. The embedder uses the store's `task_type_documents`. |
 
 ### 16.2 Delivery phases (Q-04)
 Delivery follows production need: first what both production apps share, then AudioReading (which has no RAG today), then the NewsIntelligence migration, then KnowledgeBase (still in development, so the easiest to adapt) and everything else. Each step ends with every existing `cody-ai-shared-lib` test and every new `tests/rag/` test passing.

@@ -21,8 +21,9 @@ def build_section_nodes(
     doc_id: str,
     section: RAGSectionInput[MetaT],
     splitter: TextSplitter,
+    revision: str | None = None,
 ) -> list[RAGNode[MetaT]]:
-    """Split a section into passage nodes carrying global character offsets."""
+    """Split a section into passage nodes carrying global character offsets and the document revision."""
     nodes: list[RAGNode[MetaT]] = []
     for idx, chunk in enumerate(splitter.split(section.text, base_offset=section.char_start)):
         nodes.append(
@@ -40,6 +41,7 @@ def build_section_nodes(
                     breadcrumb=list(section.breadcrumb) + chunk.breadcrumb,
                 ),
                 metadata=section.metadata,
+                revision=revision,
             )
         )
     return nodes
@@ -71,6 +73,20 @@ def fts_signature(analyzer: TextAnalyzer, uses_analyzer_tokens: bool) -> str | N
     return f"{analyzer.name}|{analyzer.version}" if uses_analyzer_tokens else None
 
 
+def embedding_is_stale(
+    doc_id: str, node_id: str, fingerprint: Fingerprint, expected: str, embed_summaries: bool
+) -> bool:
+    """True when this row's vector must be (re)made under the current signature (§6.6).
+
+    A row with a signature is stale when the signature differs. A row stored without a vector is
+    stale only when it is a summary and the profile now embeds summaries.
+    """
+    if fingerprint.embedding_signature is not None:
+        return fingerprint.embedding_signature != expected
+    parsed = parse_node_id(doc_id, node_id)
+    return embed_summaries and parsed is not None and parsed.is_summary
+
+
 def write_signatures(
     model: str, space: EmbeddingSpace, splitter: TextSplitter, analyzer: TextAnalyzer, uses_analyzer_tokens: bool
 ) -> "WriteSignatures":
@@ -87,8 +103,13 @@ class WriteSignatures:
     embedding: str
     fts: str | None
 
-    def fingerprint(self, node: RAGNode[MetaT]) -> Fingerprint:
-        return Fingerprint(content_hash=node.content_hash or "", embedding_signature=self.embedding, fts_signature=self.fts)
+    def fingerprint(self, node: RAGNode[MetaT], has_vector: bool = True) -> Fingerprint:
+        """A row stored without a vector carries no embedding signature (§6.6)."""
+        return Fingerprint(
+            content_hash=node.content_hash or "",
+            embedding_signature=self.embedding if has_vector else None,
+            fts_signature=self.fts,
+        )
 
 
 @dataclass
@@ -140,15 +161,17 @@ def prepare_summaries(
     prepared: PreparedSummaries[MetaT] = PreparedSummaries()
     if result.section_summary is not None:
         node = result.section_summary
+        vector = vectors.get(node.node_id)
         prepared.section_summary = SummaryWrite[MetaT](
-            node=node, vector=vectors.get(node.node_id), fingerprint=signatures.fingerprint(node)
+            node=node, vector=vector, fingerprint=signatures.fingerprint(node, has_vector=vector is not None)
         )
     for position, unit in enumerate(result.unit_summaries):
+        vector = vectors.get(unit.node_id)
         prepared.unit_summaries.append(
             SummaryWrite[MetaT](
                 node=unit,
-                vector=vectors.get(unit.node_id),
-                fingerprint=signatures.fingerprint(unit),
+                vector=vector,
+                fingerprint=signatures.fingerprint(unit, has_vector=vector is not None),
                 unit_seq=_unit_seq(unit.span.doc_id, unit, position),
             )
         )

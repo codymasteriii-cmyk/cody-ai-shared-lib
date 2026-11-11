@@ -6,13 +6,16 @@ from typing import Any, Generic
 from ..degradation import DegradationTracker
 from ..errors import StoreCapabilityError
 from ..models import IngestionProgress, MetaT, RAGDocumentInput, RAGNode
-from ..ports import Fingerprint, OwnerScope, RAGStore, SectionWrite, call_store
+from ..models import RAGFilterSpec
+from ..ports import Fingerprint, OwnerScope, RAGStore, SectionWrite, StoreCapabilities, SummaryWrite, call_store
 from ..render import NodeRenderer
 from ..text.analyzer import TextAnalyzer
 from ..usage import BudgetGuard, UsageTracker
 from .embedder import BatchEmbedder
 from .nodes import (
+    WriteSignatures,
     build_section_nodes,
+    embedding_is_stale,
     finalize_node,
     parse_node_id,
     prepare_passages,
@@ -57,11 +60,15 @@ class DocumentSynchronizer(Generic[MetaT]):
         degradation_tracker: DegradationTracker,
         owner: OwnerScope | None = None,
     ) -> IngestionProgress:
-        """Embed new or changed nodes, delete vanished ones, and skip unchanged ones.
+        """Bring every stored row of the document to the current text and signatures (§6.6).
 
-        A section whose text changed gets fresh summaries, because its old ones describe text
-        that no longer exists. A section whose text is unchanged keeps them, so a model upgrade
-        (signature change only) re-embeds passages without paying to summarize again.
+        - Passages: new, changed or stale ones (text, embedding signature, or FTS signature) are
+          re-embedded; unchanged ones are skipped; vanished ones are deleted.
+        - A section whose text changed gets fresh summaries, because its old ones describe text
+          that no longer exists.
+        - A section whose text is unchanged keeps its summaries. If they are stale (model or
+          analyzer upgrade, or embed_summaries switched), they are refreshed from their stored text
+          via fetch_nodes, without summarizing again; a store without fetch_nodes regenerates them.
         """
         caps = self.store.capabilities()
         if not (caps.supports_fingerprints and caps.supports_delete):
@@ -74,13 +81,12 @@ class DocumentSynchronizer(Generic[MetaT]):
         signatures = write_signatures(
             self.embedding_model, self.store.embedding_space(), self.splitter, self.analyzer, caps.uses_analyzer_tokens
         )
-        signature = signatures.embedding
         sections = sorted(doc.sections, key=lambda s: s.section_seq)
 
         current_ids: set[str] = set()
         section_nodes: dict[int, list[RAGNode[MetaT]]] = {}
         for section in sections:
-            nodes = build_section_nodes(doc.doc_id, section, self.splitter)
+            nodes = build_section_nodes(doc.doc_id, section, self.splitter, doc.revision)
             for node in nodes:
                 finalize_node(node, self.renderer, self.analyzer, caps.uses_analyzer_tokens)
                 current_ids.add(node.node_id)
@@ -91,12 +97,22 @@ class DocumentSynchronizer(Generic[MetaT]):
         upserted = skipped = 0
         summary_status = "skipped"
         regenerated_ids: set[str] = set()
+        resummarized: set[int] = set()
 
         for section in sections:
             seq = section.section_seq
-            to_embed = [n for n in section_nodes[seq] if self._is_stale(n, stored.get(n.node_id), signature)]
+            to_embed = [n for n in section_nodes[seq] if self._is_stale(n, stored.get(n.node_id), signatures)]
             skipped += len(section_nodes[seq]) - len(to_embed)
-            if not to_embed and seq not in changed_sections:
+            stale_summaries = (
+                [] if seq in changed_sections else self._stale_summary_ids(doc.doc_id, seq, stored, signatures, caps)
+            )
+            refreshed: list[SummaryWrite[MetaT]] | None = None
+            if stale_summaries:
+                refreshed = self._refresh_summaries(
+                    doc.doc_id, stale_summaries, signatures, caps, owner, usage_tracker, degradation_tracker
+                )
+            resummarize = seq in changed_sections or (bool(stale_summaries) and refreshed is None)
+            if not to_embed and not resummarize and not refreshed:
                 continue
 
             pairs = (
@@ -110,7 +126,12 @@ class DocumentSynchronizer(Generic[MetaT]):
                 owner=owner or OwnerScope(),
                 passages=prepare_passages(pairs, signatures),
             )
-            if seq in changed_sections:
+            if refreshed:
+                write.unit_summaries = [w for w in refreshed if w.unit_seq is not None]
+                write.section_summary = next((w for w in refreshed if w.unit_seq is None), None)
+                regenerated_ids.update(w.node.node_id for w in refreshed)
+            if resummarize:
+                resummarized.add(seq)
                 result = self.summarizer.summarize_section(
                     doc_id=doc.doc_id,
                     section_seq=seq,
@@ -125,6 +146,8 @@ class DocumentSynchronizer(Generic[MetaT]):
                 )
                 if _STATUS_PRIORITY[result.summary_status] > _STATUS_PRIORITY[summary_status]:
                     summary_status = result.summary_status
+                for summary_node in ([result.section_summary] if result.section_summary else []) + result.unit_summaries:
+                    summary_node.revision = doc.revision
                 summaries = prepare_summaries(
                     result,
                     self.embedder,
@@ -152,7 +175,7 @@ class DocumentSynchronizer(Generic[MetaT]):
             for node_id in stored
             if node_id not in current_ids
             and node_id not in regenerated_ids
-            and not self._is_kept_summary(doc.doc_id, node_id, section_seqs, changed_sections)
+            and not self._is_kept_summary(doc.doc_id, node_id, section_seqs, changed_sections | resummarized)
         ]
         if to_delete:
             call_store("delete_nodes", lambda: self.store.delete_nodes(to_delete))
@@ -170,12 +193,75 @@ class DocumentSynchronizer(Generic[MetaT]):
         )
 
     @staticmethod
-    def _is_stale(node: RAGNode[Any], fingerprint: Fingerprint | None, signature: str) -> bool:
+    def _is_stale(node: RAGNode[Any], fingerprint: Fingerprint | None, signatures: WriteSignatures) -> bool:
+        """A passage is stale when its text, its vector signature or its search-token signature differ."""
         return (
             fingerprint is None
             or fingerprint.content_hash != node.content_hash
-            or fingerprint.embedding_signature != signature
+            or fingerprint.embedding_signature != signatures.embedding
+            or (signatures.fts is not None and fingerprint.fts_signature != signatures.fts)
         )
+
+    def _stale_summary_ids(
+        self,
+        doc_id: str,
+        seq: int,
+        stored: dict[str, Fingerprint],
+        signatures: WriteSignatures,
+        caps: StoreCapabilities,
+    ) -> list[str]:
+        """Stored summaries of an unchanged section that no longer match the current signatures."""
+        stale = []
+        for node_id, fp in stored.items():
+            parsed = parse_node_id(doc_id, node_id)
+            if parsed is None or not parsed.is_summary or parsed.section_seq != seq:
+                continue
+            vector_stale = embedding_is_stale(doc_id, node_id, fp, signatures.embedding, self.embed_summaries)
+            unwanted_vector = not self.embed_summaries and fp.embedding_signature is not None
+            tokens_stale = caps.uses_analyzer_tokens and fp.fts_signature != signatures.fts
+            if vector_stale or unwanted_vector or tokens_stale:
+                stale.append(node_id)
+        return stale
+
+    def _refresh_summaries(
+        self,
+        doc_id: str,
+        node_ids: list[str],
+        signatures: WriteSignatures,
+        caps: StoreCapabilities,
+        owner: OwnerScope | None,
+        usage_tracker: UsageTracker,
+        degradation_tracker: DegradationTracker,
+    ) -> list[SummaryWrite[MetaT]] | None:
+        """Re-sign stored summaries from their stored text, or None when they must be regenerated."""
+        if not caps.supports_fetch_nodes:
+            return None
+        filters = _owner_filters(doc_id, owner, caps)
+        fetched = call_store("fetch_nodes", lambda: self.store.fetch_nodes(node_ids, filters))
+        if {n.node_id for n in fetched} != set(node_ids):
+            return None
+        for node in fetched:
+            finalize_node(node, self.renderer, self.analyzer, caps.uses_analyzer_tokens)
+        vectors: dict[str, list[float]] = {}
+        if self.embed_summaries:
+            pairs = self.embedder.embed_nodes(
+                fetched, usage_tracker, degradation_tracker, "summary_embedding", self.budget_guard
+            )
+            vectors = {node.node_id: vector for node, vector in pairs}
+        writes: list[SummaryWrite[MetaT]] = []
+        for node in fetched:
+            parsed = parse_node_id(doc_id, node.node_id)
+            vector = vectors.get(node.node_id)
+            node.embedding = vector
+            writes.append(
+                SummaryWrite[MetaT](
+                    node=node,
+                    vector=vector,
+                    fingerprint=signatures.fingerprint(node, has_vector=vector is not None),
+                    unit_seq=parsed.number if parsed is not None and parsed.kind == "unit_summary" else None,
+                )
+            )
+        return writes
 
     @staticmethod
     def _sections_with_changed_text(
@@ -206,3 +292,17 @@ class DocumentSynchronizer(Generic[MetaT]):
         if parsed is None or not parsed.is_summary:
             return False
         return parsed.section_seq in section_seqs and parsed.section_seq not in changed_sections
+
+
+def _owner_filters(doc_id: str, owner: OwnerScope | None, caps: StoreCapabilities) -> RAGFilterSpec:
+    """Read filters that state the owner's scope, so a sync read passes the store's required keys."""
+    fields: dict[str, Any] = {"doc_ids": [doc_id]}
+    if owner is not None:
+        if owner.tenant_or_user_id is not None:
+            fields["tenant_or_user_id"] = owner.tenant_or_user_id
+        if owner.domain_id is not None:
+            fields["domain_id"] = owner.domain_id
+        custom = {k: v for k, v in owner.custom.items() if k in caps.supported_custom_filters}
+        if custom:
+            fields["custom"] = custom
+    return RAGFilterSpec(**fields)

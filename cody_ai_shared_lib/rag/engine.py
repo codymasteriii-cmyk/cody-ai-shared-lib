@@ -34,6 +34,7 @@ from .ingestion.nodes import (
     build_section_nodes,
     embedding_signature,
     finalize_node,
+    embedding_is_stale,
     fts_signature,
     prepare_passages,
     prepare_summaries,
@@ -210,7 +211,12 @@ class RAGEngine(Generic[MetaT]):
             self.sanitizer,
             self.conversation_manager,
         )
-        self.embedder = BatchEmbedder(gateway=self.gateway, model=profile.models.embedding, renderer=self.renderer)
+        self.embedder = BatchEmbedder(
+            gateway=self.gateway,
+            model=profile.models.embedding,
+            renderer=self.renderer,
+            task_type=store.embedding_space().task_type_documents,   # the task type the fingerprint names
+        )
         self.summarizer = SectionSummarizer(
             gateway=self.gateway,
             summary_models=profile.models.summary,
@@ -848,7 +854,9 @@ class RAGEngine(Generic[MetaT]):
             budget_guard=self.budget_guard,
         )
 
-        nodes = build_section_nodes(doc_input.doc_id, section, self.splitter)
+        nodes = build_section_nodes(doc_input.doc_id, section, self.splitter, doc_input.revision)
+        for summary_node in ([result.section_summary] if result.section_summary else []) + result.unit_summaries:
+            summary_node.revision = doc_input.revision
         for node in nodes:
             finalize_node(node, self.renderer, self.analyzer, uses_tokens)
         pairs = self.embedder.embed_nodes(nodes, tracker, deg_tracker, budget_guard=self.budget_guard)
@@ -965,15 +973,23 @@ class RAGEngine(Generic[MetaT]):
         )
 
     def needs_reindex(self, doc_id: str) -> ReindexStatus:
-        """Check whether stored embeddings or FTS tokens are stale (§6.6, AC-RAG-64)."""
+        """Check whether stored embeddings or FTS tokens are stale (§6.6, AC-RAG-64).
+
+        A row stored without a vector by design is never stale for embeddings; a summary without
+        a vector is stale when the profile now embeds summaries.
+        """
         stored = self.store.get_fingerprints(doc_id)
         uses_tokens = self.store.capabilities().uses_analyzer_tokens
         expected_embedding = embedding_signature(
             self.profile.models.embedding, self.store.embedding_space(), self.splitter
         )
         expected_fts = fts_signature(self.analyzer, uses_tokens)
+        embed_summaries = self.profile.ingestion.summaries.embed_summaries
         return ReindexStatus(
             doc_id=doc_id,
-            embeddings_stale=any(fp.embedding_signature != expected_embedding for fp in stored.values()),
+            embeddings_stale=any(
+                embedding_is_stale(doc_id, node_id, fp, expected_embedding, embed_summaries)
+                for node_id, fp in stored.items()
+            ),
             fts_stale=uses_tokens and any(fp.fts_signature != expected_fts for fp in stored.values()),
         )

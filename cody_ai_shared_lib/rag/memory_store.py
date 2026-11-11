@@ -82,7 +82,6 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             model="gemini-embedding-2",
             dims=768,
             task_type_documents="RETRIEVAL_DOCUMENT",
-            splitter_version="1.0.0",
         )
         self.analyzer = analyzer or CjkAwareAnalyzer()
         self._lock = threading.RLock()
@@ -615,7 +614,8 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         uses_tokens = self._capabilities.uses_analyzer_tokens
         return Fingerprint(
             content_hash=node.content_hash or self._hash_text(node.text),
-            embedding_signature=f"{space.model}|{space.dims}|{space.task_type_documents}|{space.splitter_version}",
+            # Legacy writes carry no fingerprint; a store cannot know the splitter, so it says so
+            embedding_signature=f"{space.model}|{space.dims}|{space.task_type_documents}|{space.splitter_version or 'unspecified'}",
             fts_signature=f"{self.analyzer.name}|{self.analyzer.version}" if uses_tokens else None,
         )
 

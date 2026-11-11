@@ -30,7 +30,7 @@ class EmbeddingSpace(BaseModel):
     model: str
     dims: int
     task_type_documents: str = "RETRIEVAL_DOCUMENT"
-    splitter_version: str | None = "1.0.0"
+    splitter_version: str | None = None      # None: the engine uses its splitter's own version
 
 
 class ScopeStats(BaseModel):
@@ -77,9 +77,13 @@ class StoreCapabilities(BaseModel):
 
 
 class Fingerprint(BaseModel):
-    """Ingestion fingerprint for node change detection and cache reconciliation."""
+    """How a stored row was made, so the engine can tell whether it is still current (§6.6).
+
+    `embedding_signature` is None for a row stored without a vector by design (a summary when
+    embed_summaries is False); such a row is never stale for embeddings.
+    """
     content_hash: str
-    embedding_signature: str
+    embedding_signature: str | None
     fts_signature: str | None = None
 
 
