@@ -19,6 +19,17 @@ from cody_ai_shared_lib.rag import (
 from cody_ai_shared_lib.rag.guards import SequentialBoundaryGuard
 from cody_ai_shared_lib.rag.ports import EmbeddingSpace, ScopeStats
 
+_long_form_reader_preset = long_form_reader
+
+
+def long_form_reader(*args, **kwargs):
+    """The AudioReading preset without a required spoiler boundary.
+
+    These tests are not about spoilers. Since 1.2.0 the preset rejects a request without a boundary
+    (review item M23); a test that sends a boundary still gets the guard, built from its filters.
+    """
+    return _long_form_reader_preset(*args, **{"guards": [], **kwargs})
+
 
 def _setup_engine(mock_store=None):
     bindings = ModelBindings(

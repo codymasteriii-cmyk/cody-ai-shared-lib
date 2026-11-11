@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
@@ -28,7 +29,7 @@ class RouterConfig(BaseModel):
     name: str = "auto"
     enable_jev: bool = False
     enable_temporal_extraction: bool = False
-    jev_timeout: float = 2.0
+    jev_timeout: float = 2.5
 
 
 DEFAULT_FUSION_WEIGHTS: dict[str, tuple[float, float]] = {
@@ -45,6 +46,7 @@ class RetrievalConfig(BaseModel):
     top_k: int = 8
     retrieve_max_results: int = 100
     full_context_max_tokens: int = 120_000
+    keyword_first_min_hits: int = 3      # keyword_first falls back to hybrid below this many hits (§8.3)
     local_window_radius_chars: int = 6000
     always_include_summaries: bool = False
     rrf_k: int = 60
@@ -68,8 +70,8 @@ class ContextConfig(BaseModel):
     answer_reserve_tokens: int = 4000
     history_ratio: float = 0.15
     summary_ratio: float = 0.25
-    local_window_ratio: float = 0.20
-    retrieved_ratio: float = 0.40
+    local_window_ratio: float = 0.25
+    retrieved_ratio: float | None = None   # deprecated, ignored: ranked nodes take the remainder (§10.1)
     min_recent_turns_kept: int = 2
     history_decay_lambda: float = 0.35
     history_overlap_alpha: float = 0.40
@@ -87,6 +89,9 @@ class GenerationConfig(BaseModel):
     grounding_mode: Literal["strict", "labelled_fallback"] = "strict"
     fallback_label: str = "Not from your sources:"
     stream_mode: Literal["native", "buffered"] = "buffered"
+    # §10.10: "silent" reports degradations only in the response; "note" also tells the model, so the
+    # answer can mention them briefly. Overridable per request.
+    degradation_disclosure: Literal["silent", "note"] = "silent"
 
 
 class CitationConfig(BaseModel):
@@ -113,11 +118,15 @@ class SummariesConfig(BaseModel):
     enabled: bool = False
     min_chars_for_summary: int = 1500
     summary_unit_chars: int = 8000
+    # False skips the summary_embedding stage; the store then gets summaries without vectors and must
+    # override upsert_section (§6.3, INT-02). Keep True for a store that searches summaries by vector.
+    embed_summaries: bool = True
 
 
 class IngestionConfig(BaseModel):
     model_config = {"frozen": True, "extra": "forbid"}
     splitter: str = "sentence"
+    granularity: str = "passage"         # what ingested chunks are: "article"/"entry" are atomic (§3.3)
     target_size: int = 1200
     overlap: int = 150
     summaries: SummariesConfig = Field(default_factory=SummariesConfig)
@@ -151,6 +160,17 @@ class ValidationReport(BaseModel):
 
 
 VALID_FALLBACK_KEYS = {"rerank", "jev", "summarizer", "query_embedding", "cache", "deadline"}
+# §13.3: opt-in rows take their enabling value; any row can be set to "raise"
+VALID_FALLBACK_VALUES: dict[str, set[str]] = {
+    "rerank": {"raise", "keep_order"},
+    "jev": {"raise"},
+    "summarizer": {"raise", "skip"},
+    "query_embedding": {"raise", "keyword"},
+    "cache": {"raise"},
+    "deadline": {"raise"},
+}
+# Citation policies this version implements; repair/raise and coverage minimums come with §11.4-11.5 (P4)
+IMPLEMENTED_CITATION_POLICIES = {"filter"}
 
 
 class EngineProfile(BaseModel):
@@ -181,8 +201,8 @@ class EngineProfile(BaseModel):
     variants: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     def fingerprint(self) -> str:
-        """Stable sha256 fingerprint of resolved configuration."""
-        dumped = self.model_dump_json()
+        """Stable sha256 fingerprint of resolved configuration, independent of dict insertion order."""
+        dumped = json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
 
     def with_overrides(self, **changes: Any) -> "EngineProfile":
@@ -211,6 +231,23 @@ class EngineProfile(BaseModel):
         """Construct EngineProfile from mapping dictionary (§12.1)."""
         return cls(**data)
 
+    def _threshold_problems(self) -> list[str]:
+        """A threshold on a score kind this pipeline can never produce would silently keep everything (§9.1)."""
+        problems: list[str] = []
+        stages = [split_stage_name(name) for name in self.post_stages]
+        strategy = self.retrieval.default_strategy
+        for index, (name, kind) in enumerate(stages):
+            if name != "threshold":
+                continue
+            kind = kind or "cosine"
+            if kind == "rerank" and "rerank" not in [n for n, _ in stages[:index]]:
+                problems.append("threshold(rerank) needs a rerank stage before it in post_stages")
+            elif kind == "bm25" and strategy == "dense_vector":
+                problems.append("threshold(bm25) cannot apply: strategy dense_vector produces no keyword scores")
+            elif kind == "cosine" and strategy == "keyword_only":
+                problems.append("threshold(cosine) cannot apply: strategy keyword_only produces no vector scores")
+        return problems
+
     def check(self, registry: ComponentRegistry | None = None) -> ValidationReport:
         """Return every configuration problem without raising."""
         problems: list[str] = []
@@ -223,7 +260,8 @@ class EngineProfile(BaseModel):
                 problems.append(f"{reason} requires {binding} to be configured")
 
         require_binding(self.models.generation, "models.generation", "Generation")
-        require_binding(self.models.reranker or "rerank" not in self.post_stages, "models.reranker", "Stage 'rerank'")
+        stage_names = [split_stage_name(name)[0] for name in self.post_stages]
+        require_binding(self.models.reranker or "rerank" not in stage_names, "models.reranker", "Stage 'rerank'")
         require_binding(self.models.intent or self.router.name != "llm", "models.intent", "Router 'llm'")
         require_binding(
             self.models.summary or not self.ingestion.summaries.enabled, "models.summary", "Enabled summaries"
@@ -234,6 +272,7 @@ class EngineProfile(BaseModel):
             self.retrieval.full_context_max_tokens
             + self.context.reserved_instruction_tokens
             + self.context.reserved_history_tokens
+            + self.context.question_reserve_tokens
         )
         if reserved_sum > self.context.max_context_tokens:
             problems.append(
@@ -241,19 +280,22 @@ class EngineProfile(BaseModel):
                 f"reserved zones exceeds max_context_tokens ({self.context.max_context_tokens})"
             )
 
-        ratio_sum = (
-            self.context.history_ratio
-            + self.context.summary_ratio
-            + self.context.local_window_ratio
-            + self.context.retrieved_ratio
-        )
+        ratio_sum = self.context.history_ratio + self.context.summary_ratio + self.context.local_window_ratio
         if ratio_sum > 1.0 + 1e-9:
-            problems.append(f"Context zone ratios sum to {ratio_sum:.2f}, above 1")
+            problems.append(f"Context zone ratios (history, summary, local window) sum to {ratio_sum:.2f}, above 1")
 
-        for k in self.fallbacks:
+        problems.extend(self._threshold_problems())
+
+        for k, v in self.fallbacks.items():
             if k not in VALID_FALLBACK_KEYS:
                 unknown.append(f"fallback:{k}")
                 problems.append(f"Unknown fallback key '{k}' in profile.fallbacks")
+            elif v not in VALID_FALLBACK_VALUES[k]:
+                problems.append(f"fallbacks['{k}'] = {v!r}: allowed values are {sorted(VALID_FALLBACK_VALUES[k])}")
+        if self.citations.policy not in IMPLEMENTED_CITATION_POLICIES:
+            problems.append(f"citations.policy {self.citations.policy!r} is not implemented in this version (§11.4)")
+        if self.citations.min_citation_coverage:
+            problems.append("citations.min_citation_coverage is not enforced in this version (§11.4); leave it at 0")
 
         if registry is not None:
             for category, name in self._component_names():
@@ -429,3 +471,11 @@ def knowledge_base(models: ModelBindings, **overrides: Any) -> EngineProfile:
     }
     cfg.update(overrides)
     return EngineProfile(**cfg)
+
+
+def split_stage_name(name: str) -> tuple[str, str | None]:
+    """'threshold(rerank)' -> ('threshold', 'rerank'); 'top_k' -> ('top_k', None)."""
+    if name.endswith(")") and "(" in name:
+        base, argument = name[:-1].split("(", 1)
+        return base.strip(), argument.strip() or None
+    return name.strip(), None

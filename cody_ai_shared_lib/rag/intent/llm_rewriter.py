@@ -15,7 +15,7 @@ from typing import Any
 
 from ..context.fence import ContextFencer
 from ..degradation import DegradationTracker
-from ..errors import BudgetExceeded, IntentParseError
+from ..errors import NEVER_DEGRADABLE, GenerationError, IntentParseError, safe_message
 from ..gateway import ModelGateway
 from ..models import QueryIntent
 from ..usage import BudgetGuard, UsageTracker
@@ -248,6 +248,7 @@ class LLMIntentRouter:
         user_msg = self._user_message(query, history, fence_id)
 
         last_raw_text = ""
+        model_failures = 0
         for model in self.models:
             for attempt in range(2):
                 try:
@@ -283,20 +284,23 @@ class LLMIntentRouter:
                         fallback_used="retry" if attempt == 0 else "next_model",
                         impact="Retrying intent parsing",
                     )
-                except BudgetExceeded:
+                except NEVER_DEGRADABLE:
                     raise
                 except Exception as exc:
+                    if isinstance(exc, GenerationError) and exc.reason == "blocked":
+                        raise                      # a safety block is never retried on another model
+                    model_failures += 1
                     degradation_tracker.record(
-                        dg_id="DG-04",
+                        dg_id="DG-02",
                         stage="intent",
-                        reason=f"Model call failed during intent parsing: {exc}",
+                        reason=f"Intent model {model} failed: {safe_message(exc)}",
                         fallback_used="next_model",
-                        impact="Skipping to next intent model",
+                        impact="Trying the next intent model",
                         error_type=type(exc).__name__,
                     )
                     break  # Move to next model
 
-        raise IntentParseError(
-            f"All intent models failed to produce valid JSON. Last output: {last_raw_text[:200]}",
-            stage="intent",
-        )
+        if model_failures and not last_raw_text:
+            # No model answered at all: a provider outage, not a parse problem
+            raise GenerationError("All intent models failed", reason="all_models_failed", stage="intent")
+        raise IntentParseError("All intent models failed to produce valid JSON", stage="intent")

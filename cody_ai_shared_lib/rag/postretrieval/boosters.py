@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, ClassVar, Generic, Sequence
+from ..granularity import apply_to_ranked
 from ..models import MetaT, RAGNode
 from ..ports import NodeRenderer
 from ..render import DefaultRenderer
@@ -21,7 +22,8 @@ class RecencyBooster(Generic[MetaT]):
     accepts_score_kinds: ClassVar[frozenset[str] | None] = None
 
     def process(self, nodes: list[RAGNode[MetaT]], ctx: Any) -> list[RAGNode[MetaT]]:
-        return self.boost(nodes, renderer=ctx.renderer)
+        # Ordered layers and Tier 0 text are never rescored or reordered (§3.3)
+        return apply_to_ranked(nodes, lambda ranked: self.boost(ranked, renderer=ctx.renderer))
 
     def __init__(
         self,
@@ -65,7 +67,8 @@ class ScoreFusionStage(Generic[MetaT]):
     accepts_score_kinds: ClassVar[frozenset[str] | None] = None
 
     def process(self, nodes: list[RAGNode[MetaT]], ctx: Any) -> list[RAGNode[MetaT]]:
-        return self.fuse(nodes, renderer=ctx.renderer, clock=ctx.deadline.clock)
+        # Normalization and fusion see only ranked nodes; ordered layers keep score and place (§3.3)
+        return apply_to_ranked(nodes, lambda ranked: self.fuse(ranked, renderer=ctx.renderer, clock=ctx.deadline.clock))
 
     def __init__(self, weights: dict[str, float] | None = None, feature: str | None = None):
         self.feature = feature  # one named app feature, e.g. score_fusion(confidence); None uses them all

@@ -18,12 +18,12 @@ from typing import Any
 from ..embedding import EmbeddingResult, EmbeddingUsage, generate_embedding_with_usage
 from ..jev import JevClient
 from ..llm import LLMClient, LLMResult, LLMUsage, ModelCallError
-from ..pricing import PRICE_TABLE_VERSION, compute_cost
+from ..pricing import PRICE_TABLE_VERSION, compute_cost, estimate_cost
 from ..tokens import estimate_tokens
 from ..rerank import RerankClient, RerankResult
 from .cache import Cache, deserialize_vector, make_embedding_cache_key, serialize_vector
 from .degradation import DegradationTracker
-from .errors import EmbeddingProviderError, GenerationError, RAGEngineError, RAGStageError
+from .errors import EmbeddingProviderError, GenerationError, RAGEngineError, RAGStageError, safe_message
 from .models import StageUsage
 from .text.analyzer import CjkAwareAnalyzer, TextAnalyzer
 from .usage import BudgetGuard, UsageTracker, invoke_budget_guard
@@ -70,6 +70,7 @@ class ModelGateway:
         response_mime_type: str | None = None,
         optional: bool | None = None,
         cache_breakpoints: bool | list[int] | None = None,
+        user_blocks: list[tuple[str, bool]] | None = None,
     ) -> LLMResult:
         """Execute text generation through ordered model fallback list (DG-02, AC-RAG-44)."""
         last_exc: Exception | None = None
@@ -79,7 +80,7 @@ class ModelGateway:
         for model_idx, model in enumerate(models):
             # Pre-call budget check (DG-11)
             if budget_guard is not None:
-                est_cost = compute_cost(model, input_tokens=est_in, output_tokens=max_tokens or 500)
+                est_cost = estimate_cost(model, est_input_tokens=est_in, est_output_tokens=max_tokens or 500)
                 ctx = usage_tracker.call_context(stage, model, is_opt, est_in, est_cost)
                 decision = invoke_budget_guard(budget_guard, ctx)
                 if decision == "skip":
@@ -106,6 +107,7 @@ class ModelGateway:
                     response_schema=response_schema,
                     response_mime_type=response_mime_type,
                     cache_breakpoints=cache_breakpoints,
+                    **_blocks(user_blocks),
                 )
                 lat_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -159,6 +161,7 @@ class ModelGateway:
                             response_schema=response_schema,
                             response_mime_type=response_mime_type,
                             cache_breakpoints=cache_breakpoints,
+                            **_blocks(user_blocks),
                         )
                     except Exception as retry_exc:
                         usage_tracker.record(
@@ -258,7 +261,7 @@ class ModelGateway:
                 )
 
         raise GenerationError(
-            f"All models failed for stage '{stage}': {last_exc}",
+            f"All models failed for stage '{stage}': {safe_message(last_exc)}",
             reason="all_models_failed",
             stage=stage,
             cause=last_exc,
@@ -515,6 +518,7 @@ class ModelGateway:
         temperature: float | None = None,
         cache_breakpoints: list[int] | None = None,
         optional: bool | None = None,
+        user_blocks: list[tuple[str, bool]] | None = None,
     ) -> Any:
         """Stream generation through ordered model fallback list (§10.8, AC-RAG-44, AC-RAG-70)."""
         last_exc: Exception | None = None
@@ -523,7 +527,7 @@ class ModelGateway:
 
         for model_idx, model in enumerate(models):
             if budget_guard is not None:
-                est_cost = compute_cost(model, input_tokens=est_in, output_tokens=max_tokens or 500)
+                est_cost = estimate_cost(model, est_input_tokens=est_in, est_output_tokens=max_tokens or 500)
                 ctx = usage_tracker.call_context(stage, model, is_opt, est_in, est_cost)
                 decision = invoke_budget_guard(budget_guard, ctx)
                 if decision == "skip":
@@ -566,6 +570,7 @@ class ModelGateway:
                     max_tokens=max_tokens,
                     temperature=temperature,
                     cache_breakpoints=cache_breakpoints,
+                    **_blocks(user_blocks),
                 )
                 for chunk in chunk_iter:
                     if chunk.delta:
@@ -636,3 +641,8 @@ class ModelGateway:
             stage=stage,
             cause=last_exc,
         )
+
+
+def _blocks(user_blocks: list[tuple[str, bool]] | None) -> dict[str, Any]:
+    """Pass user_blocks to the LLM client only when there are some, so older clients keep working."""
+    return {"user_blocks": user_blocks} if user_blocks else {}

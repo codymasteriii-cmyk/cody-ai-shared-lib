@@ -224,8 +224,13 @@ class LLMClient:
         stop_sequences: list[str] | None = None,
         stream: bool = False,
         cache_breakpoints: bool | list[int] | None = None,
+        user_blocks: list[tuple[str, bool]] | None = None,
     ) -> LLMResult:
-        """Same call as generate(), but returns real token usage, cost, and finish reason."""
+        """Same call as generate(), but returns real token usage, cost, and finish reason.
+
+        user_blocks: the user message as ordered (text, cacheable) blocks. Claude sends them as content
+        blocks and marks the cacheable ones with cache_control; other providers use user_message.
+        """
         if model.startswith("gemini"):
             return self._gemini_generate(
                 system_prompt, user_message, model, max_tokens,
@@ -241,6 +246,7 @@ class LLMClient:
                 response_schema=response_schema,
                 stream=stream,
                 cache_breakpoints=cache_breakpoints,
+                user_blocks=user_blocks,
             )
         if model.startswith("gpt"):
             return self._openai_generate(
@@ -266,6 +272,7 @@ class LLMClient:
         temperature: float | None = None,
         stop_sequences: list[str] | None = None,
         cache_breakpoints: bool | list[int] | None = None,
+        user_blocks: list[tuple[str, bool]] | None = None,
     ) -> Iterator[LLMStreamChunk]:
         """Stream chunks from the LLM.
 
@@ -292,6 +299,7 @@ class LLMClient:
                 temperature=temperature,
                 stop_sequences=stop_sequences,
                 cache_breakpoints=cache_breakpoints,
+                user_blocks=user_blocks,
             )
             return
         if model.startswith("gpt"):
@@ -452,13 +460,14 @@ class LLMClient:
         response_schema: type | None = None,
         stream: bool = False,
         cache_breakpoints: bool | list[int] | None = None,
+        user_blocks: list[tuple[str, bool]] | None = None,
     ) -> LLMResult:
         client = self._get_anthropic_client()
 
         create_kwargs: dict = {
             "model": model,
             "max_tokens": max_tokens if max_tokens is not None else 8192,
-            "messages": [{"role": "user", "content": user_message}],
+            "messages": [{"role": "user", "content": _claude_user_content(user_message, user_blocks)}],
         }
         if cache_breakpoints:
             create_kwargs["system"] = [
@@ -758,13 +767,14 @@ class LLMClient:
         temperature: float | None = None,
         stop_sequences: list[str] | None = None,
         cache_breakpoints: bool | list[int] | None = None,
+        user_blocks: list[tuple[str, bool]] | None = None,
     ) -> Iterator[LLMStreamChunk]:
         client = self._get_anthropic_client()
 
         create_kwargs: dict = {
             "model": model,
             "max_tokens": max_tokens if max_tokens is not None else 8192,
-            "messages": [{"role": "user", "content": user_message}],
+            "messages": [{"role": "user", "content": _claude_user_content(user_message, user_blocks)}],
         }
         if cache_breakpoints:
             create_kwargs["system"] = [
@@ -911,3 +921,23 @@ class LLMClient:
                 else:
                     raise
         raise RuntimeError(f"[LLM] OpenAI stream {model} failed: {last_exc}")
+
+
+def _claude_user_content(user_message: str, user_blocks: list[tuple[str, bool]] | None) -> Any:
+    """The user turn for Claude: plain text, or content blocks with the cacheable ones marked.
+
+    The RAG engine puts the stable data (Tier 0 sections, admitted summaries) first, so marking that
+    block lets Claude reuse it across turns instead of re-reading the whole document (§10.3, §15).
+    Falls back to the plain message when the blocks do not add up to it.
+    """
+    if not user_blocks or "".join(text for text, _ in user_blocks) != user_message:
+        return user_message
+    content = []
+    for text, cacheable in user_blocks:
+        if not text:
+            continue
+        block: dict[str, Any] = {"type": "text", "text": text}
+        if cacheable:
+            block["cache_control"] = {"type": "ephemeral"}
+        content.append(block)
+    return content or user_message

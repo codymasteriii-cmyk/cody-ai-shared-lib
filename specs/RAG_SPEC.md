@@ -2,13 +2,13 @@
 
 | | |
 | :--- | :--- |
-| **Document Version** | 1.1.14-draft |
-| **Status** | Draft, design agreed. Sibling feedback (AUD-01..26, NF-01..40, KB-01..23) was consolidated into C-01..C-39 and folded in; owner decisions Q-01..Q-08, the failure model and the pushbacks (Appendix C) are settled, and all three app agents (AudioReading, NewsIntelligence, KnowledgeBase) agreed through 1.1.8. Version 1.1.14 changes parts of that agreed contract after the Phase 1–3 review (Appendix B). This file is the only record of the design and its reasoning; the round's working files were removed on 2026-11-08. |
+| **Document Version** | 1.2.0-draft |
+| **Status** | Draft, design agreed. Sibling feedback (AUD-01..26, NF-01..40, KB-01..23) was consolidated into C-01..C-39 and folded in; owner decisions Q-01..Q-08, the failure model and the pushbacks (Appendix C) are settled, and all three app agents (AudioReading, NewsIntelligence, KnowledgeBase) agreed through 1.1.8. Version 1.1.14 changes parts of that agreed contract after the Phase 1–3 review (Appendix B). Version 1.2.0 adds the changes agreed with AudioReading after its first integration (INT-01..INT-09); they are additive. This file records the outcome and its reasoning; the exchange itself was removed after agreement and remains in git history (commit `37d76fd`). This file is the only record of the design and its reasoning; the round's working files were removed on 2026-11-08. |
 | **Package Namespace** | `cody_ai_shared_lib.rag` (`cody-ai-shared-lib >= 0.8.0`) |
-| **Target Runtime** | Python 3.11+, synchronous core (matching the rest of `cody_ai_shared_lib`) with a bounded thread pool for independent calls |
+| **Target Runtime** | Python 3.13+ (1.2.0: the owner's floor for all projects; the models use PEP 696 `TypeVar` defaults), synchronous core (matching the rest of `cody_ai_shared_lib`) with a bounded thread pool for independent calls |
 | **Primary Consumers** | **AudioReading** (`audiolib.codymasterai.com`), **NewsIntelligence / Pulse Nexus** (`ai.codymasterai.com`), **KnowledgeBase** |
 | **Owner** | Cody (`codymasteriii@gmail.com`) / Cody AI Engineering Team |
-| **Last Updated** | 2026-11-08 |
+| **Last Updated** | 2026-11-11 |
 | **Previous version** | `specs/archive/RAG_SPEC_1.0.0-draft.md` |
 
 ---
@@ -258,8 +258,8 @@ cody_ai_shared_lib/
     ├── models.py                       # canonical models (§3)
     ├── granularity.py                  # granularity traits + built-ins (§3.3)
     ├── render.py                       # NodeRenderer protocol + DefaultRenderer (§3.4)
-    ├── ports.py                        # RAGStore, StoreCapabilities, ScopeStats, EmbeddingSpace (§4)
-    ├── memory_store.py                 # InMemoryRAGStore (§4.5)
+    ├── ports.py                        # RAGStore, StoreCapabilities, ScopeStats, EmbeddingSpace, SectionWrite, OwnerScope (§4)
+    ├── memory_store.py                 # InMemoryRAGStore, ScopedInMemoryRAGStore (§4.5)
     ├── guards.py                       # Guard protocol + built-in guards (§5)
     ├── registry.py                     # ComponentRegistry + default_registry (§8.8)
     ├── profile.py                      # EngineProfile, ModelBindings, presets (§12)
@@ -270,17 +270,20 @@ cody_ai_shared_lib/
     ├── trace.py                        # RAGTrace, StageRecord, RAGObserver (§13.2)
     ├── degradation.py                  # Degradation records, agreed-degradation table, fallbacks (§13.3)
     ├── cache.py                        # Cache port, LRU default, ResultCache seam (§13.5)
+    ├── retrieval_pipeline.py           # filters, guards, strategies, fan-out, stages, relaxation (§5, §7.8, §8, §9)
+    ├── answering.py                    # AnswerFinalizer: citations, quotes, sanitizer, state (§11)
+    ├── vectors.py                      # zero-vector helpers (§6.4)
     ├── text/analyzer.py                # TextAnalyzer, CjkAwareAnalyzer, estimate_tokens (§6.1)
-    ├── ingestion/                      # splitter.py, summarizer.py, embedder.py, stages.py, pipeline.py, sync.py (§6)
+    ├── ingestion/                      # splitter.py, summarizer.py, embedder.py, nodes.py, ids.py (node ids), sync.py (§6)
     ├── intent/                         # models.py, heuristic.py, jev_gate.py, llm_rewriter.py, router.py, temporal.py (§7)
     ├── transforms/                     # base.py (QueryTransform, QueryVariant), fanout.py, fusion.py; LexiconExpander, HyDE seam later (§7.8)
     ├── strategies/                     # context.py, full_context.py, keyword.py, dense_vector.py, hybrid_rrf.py,
     │                                   # hierarchical.py, adaptive.py, relaxation.py, graph and loop seams later (§8)
     ├── postretrieval/                  # base.py, threshold.py, dedup.py, rerank.py, boosters.py, stages.py;
     │                                   # expansion and MMR seams later (§9)
-    ├── context/                        # budgeter.py, conversation.py, compressor.py, fence.py, assembler.py (§10)
+    ├── context/                        # budgeter.py, conversation.py, fence.py, assembler.py; compressor.py later (§10)
     ├── generation/                     # GenerationStrategy, StuffStrategy, structured seam, streaming (§10)
-    ├── postgen/                        # citations.py, quotes.py, policy.py, repair.py, sanitizer.py (§11)
+    ├── postgen/                        # citations.py, quotes.py, sanitizer.py; policy.py, repair.py in P4 (§11)
     ├── integrations/sse.py             # framework-free SSE formatter (§10.9)
     ├── testing/                        # RAGStoreContractTests, BrokenStore, fixtures, canary helpers (§4.6)
     └── eval/                           # RESERVED: protocols only in v1, never imported by runtime modules (§14)
@@ -288,7 +291,7 @@ cody_ai_shared_lib/
 
 > **Dependency note:**
 > - Declare `pydantic>=2.0.0` explicitly in `pyproject.toml`. The only other new runtime dependency allowed is `httpx` or `requests` for Jina, whichever the lib already uses.
-> - Optional extras, never imported by the core:
+> - Optional extras, never imported by the core (declared in `pyproject.toml` since 1.2.0):
 >   - `[rag-cjk]` for `jieba`;
 >   - `[rag-eval]` reserved for the future evaluation system (postponed, Q-06).
 > - The 512 MB hosts (News, Audio) MUST be able to import `cody_ai_shared_lib.rag` without any extra.
@@ -344,7 +347,7 @@ class SourceSpan(BaseModel):
 | Trait | Meaning | Who reads it |
 | :--- | :--- | :--- |
 | `atomic` | Never split, compressed mid-unit, or truncated by budget; included whole or not at all. Sequential guards still apply (§5.2). | Splitter, compressor, budgeter |
-| `ordered` | Kept in document order; never reranked or reordered by score. | Rerankers, fusion, assembler |
+| `ordered` | Kept in document order; never reranked or reordered by score. Boosters and fusion rescore and reorder only ranked nodes; every other node keeps its position (1.2.0). | Rerankers, fusion, boosters, assembler |
 | `offset_addressable` | `text == document[char_start:char_end]`; offset snapping and boundary truncation are valid. | Guards, citation verifier, dedup |
 | `rerankable` | May be sent to a cross-encoder. | Reranker |
 | `summary` | Derived text describing a span (not a verbatim slice). | Sequential guard, assembler |
@@ -362,6 +365,8 @@ Built-ins:
 | `graph_entity` | `summary`, `atomic` |
 
 Apps register more with `registry.register_granularity(name, traits)` (e.g. Audio's `entity_fact`: `atomic`, `ordered`, R-03). Engine stages **MUST** key on traits, never on granularity names.
+
+> **Known limitation (1.2.0, owner decision 2026-11-11, not prioritized).** Unlike strategies, routers and stages, which live in each engine's `ComponentRegistry` (D-18), granularities and their traits live in **one process-wide table**: `register_granularity` on any registry writes to it, and every trait check reads it. So a registration on one engine changes the kind for every engine in the process; two engines cannot give the same name different traits (the last registration wins, silently); and the duplicate-name rule is bypassed. This matters only when one process runs several engines that need different traits for the same name: one user's session using engines of different types, or a multi-user host with an engine per user. Neither is critical today, since each app registers one fixed set of kinds. Making the table per-engine means passing the engine's table to every trait check (about a dozen modules), so it is recorded here (Open Item OI-1) and left for when a real multi-engine case appears.
 
 > **Rationale:**
 > - The 1.0.0 rule "rerank only `passage`" would have disabled reranking for News's whole-article nodes (NF-01).
@@ -456,6 +461,7 @@ class RAGFilterSpec(BaseModel):
     date_field: str | None = None                        # which timestamp the range applies to
     min_similarity: float | None = None                  # raw cosine floor (§3.5)
     custom: dict[str, Any] = Field(default_factory=dict)
+    empty_scope: bool = False                            # 1.2.0: set by the engine on a hard conflict (§5.5)
 ```
 - **`custom` contract.** A store declares `StoreCapabilities.supported_custom_filters: dict[str, type]` (e.g. `{"favorites_only": bool, "categories_any": list[str]}`). The engine **MUST** reject unknown keys or values of the wrong type with `UnsupportedFilterError` before calling the store.
 - **`date_field`.** Names the timestamp a range applies to. A store declares `supported_date_fields` and a `time_basis` note (e.g. `"created_at = ingestion time; publication date not stored"`). A store may have only an ingestion timestamp; `time_basis` says so, and the assembler MAY state the note in the prompt.
@@ -615,7 +621,7 @@ class ScopeStats(BaseModel):
     doc_count: int
     node_count: int
     char_count: int
-    est_tokens: int | None = None     # sum of node.token_estimate when stored
+    est_tokens: int | None = None     # tokens of the content fetch_full_scope would return (§4.2)
     revision: str                     # changes whenever content in scope changes (cache key, §13.5)
 
 class StoreCapabilities(BaseModel):
@@ -664,7 +670,8 @@ class RAGStore(ABC, Generic[MetaT]):
                       top_k: int) -> list[RAGNode[MetaT]]:
         """Descending raw cosine; vector_score and vector_rank (1-based) filled;
         score_kind='cosine'. MUST return up to top_k rows that satisfy filters
-        (no post-filter shortfall, see §4.6 filtered recall)."""
+        (no post-filter shortfall, see §4.6 filtered recall). Ranked searches
+        (vector, keyword, hybrid) return only non-summary rows (1.2.0)."""
 
     def keyword_search(self, query_text: str, filters: RAGFilterSpec, top_k: int,
                        analyzer_tokens: list["TokenGroup"] | None = None) -> list[RAGNode[MetaT]]:
@@ -691,14 +698,19 @@ class RAGStore(ABC, Generic[MetaT]):
         raise NotImplementedError
 
     def scope_stats(self, filters: RAGFilterSpec) -> ScopeStats:
-        """Size and revision of everything the filters allow (Tier 0 decision, cache key)."""
+        """Size and revision of everything the filters allow (Tier 0 decision, cache key).
+        MUST describe exactly the content fetch_full_scope(filters) would return: the source
+        text, not indexed rows."""
         raise NotImplementedError
 
     def fetch_full_scope(self, filters: RAGFilterSpec) -> list[RAGNode[MetaT]]:
-        """All content in scope, in document order, for Tier 0. Renamed from fetch_full_document;
-        the single-document case is a scope with one doc_id."""
+        """All content in scope, for Tier 0. Renamed from fetch_full_document; the
+        single-document case is a scope with one doc_id. Document order, real spans, no
+        overlap, and no node crosses a section boundary (one node per section or finer)."""
         raise NotImplementedError
 ```
+- **`scope_stats` and `fetch_full_scope` describe the same content (1.2.0).** A store that serves Tier 0 from source text that is not embedded yet (AudioReading: the early part of a book, before indexing) counts that text in `scope_stats`. A store that counted only indexed rows would report zero for an unindexed document, and the engine would never choose Tier 0 for it (INT-06). Kit check 17.
+- **Full-scope granularity (1.2.0).** Each node returned by `fetch_full_scope` becomes its own citation and its own place in the cacheable prefix. Nodes carry their real `doc_id`, `section_seq`, `char_start`, `char_end` and title, do not overlap, and never cross a section boundary. One node per section and one node per passage are both valid; one node for a whole multi-section scope is not, because every answer would then have a single citation that seeks to offset 0 (INT-07). Kit check 18.
 
 ### 4.3 Complete rows and node fetch
 ```python
@@ -721,9 +733,10 @@ class RAGStore(ABC, Generic[MetaT]):
 ```python
 class Fingerprint(BaseModel):
     content_hash: str
-    embedding_signature: str      # f"{model}|{dims}|{task_type}|{splitter_version}"
+    embedding_signature: str | None   # f"{model}|{dims}|{task_type}|{splitter_version}"; None: stored without a vector
     fts_signature: str | None = None   # f"{analyzer_name}|{analyzer_version}" when uses_analyzer_tokens
 
+class RAGStore(ABC, Generic[MetaT]):       # continued: lifecycle methods
     def upsert_section_nodes(self, doc_id: str, section_seq: int, nodes: list[RAGNode[MetaT]],
                              embeddings: list[list[float]],
                              summary: RAGNode[MetaT] | None = None) -> int:
@@ -751,6 +764,45 @@ class Fingerprint(BaseModel):
   - `upsert_section_nodes` takes a summary **node** instead of a string, so summaries carry `parent_id`, `parent_kind` and `level`.
   - `fetch_full_document` became `fetch_full_scope`.
 
+#### 4.4.1 Section writes: `upsert_section` and `SectionWrite` **[contract, 1.2.0]**
+```python
+class OwnerScope(BaseModel):                     # who the write is for (§6.4.2)
+    tenant_or_user_id: str | None = None
+    domain_id: str | None = None
+    custom: dict[str, Any] = {}
+
+class SummaryWrite(BaseModel, Generic[MetaT]):
+    node: RAGNode[MetaT]
+    vector: list[float] | None = None            # None when embed_summaries=False (§6.3)
+    fingerprint: Fingerprint
+    unit_seq: int | None = None                  # 0-based unit index; None for the section summary
+
+class SectionWrite(BaseModel, Generic[MetaT]):
+    doc_id: str
+    section_seq: int
+    owner: OwnerScope
+    passages: list[PreparedNode[MetaT]]          # node + vector + fingerprint, document order (§6.4.1)
+    unit_summaries: list[SummaryWrite[MetaT]]
+    section_summary: SummaryWrite[MetaT] | None = None
+
+    def upsert_section(self, write: SectionWrite[MetaT]) -> int:
+        """Atomic for readers, idempotent on node_id, never deletes. Returns nodes written.
+        Default: delegates to upsert_section_nodes with the legacy argument shapes."""
+```
+- The engine writes every section, from `ingest_document` and from `sync_document`, through `upsert_section`.
+- **Default and compatibility.** `RAGStore.upsert_section` calls `upsert_section_nodes(nodes=passages + unit summaries, embeddings=their vectors, summary=section summary node)`, so stores written before 1.2.0 keep working unchanged. `upsert_section_nodes` keeps its signature: the engine calls it with keyword arguments, so adding one would break such stores on their first ingest.
+- **SQL adapters SHOULD override `upsert_section`.** It gives them passages, unit summaries and the section summary as separate lists, each with its fingerprint, so a store with separate passage and summary tables writes both in one transaction without sorting a list or counting positions.
+- **Write semantics.** Idempotent on `node_id`, never deletes, atomic for readers (RAG-ING-10). During sync a write may hold only the changed nodes of a section, or only its refreshed summaries.
+- **`unit_seq`** equals `n` in the unit's id `{doc}#s{seq}_u{n}_sum`. A unit skipped by DG-14 leaves a gap; the units after it keep their numbers. Stores never derive it by counting.
+- **Fingerprints are persisted as given** (§6.6). A store that declares `supports_fingerprints` or `supports_fetch_nodes` persists `node_id`, `content_hash`, `embedding_signature` and `fts_signature` with each row, and never computes them.
+- **Node ids are opaque keys to stores.** The engine names the nodes it builds `{doc}#s{seq}p{i}`, `{doc}#s{seq}_sum` and `{doc}#s{seq}_u{n}_sum`; `format_node_id` and `parse_node_id(doc_id, node_id)` are public for these ids, and `parse_node_id` returns `None` for any other id (it needs `doc_id` because a doc id may contain `#`). A store stores the id, looks rows up and deletes by it, and never parses it. Apps that build their own nodes for `prepare_nodes` may use any id.
+- **`embed_summaries=False` requires an override** (§6.3): the legacy method takes one vector per node, so engine startup raises `ProfileConfigError` otherwise.
+
+> **Rationale:**
+> - Before 1.2.0 unit summaries rode in `nodes`, the section summary in `summary`, and the store received no fingerprints, although §6.6 said the engine persists them. An adapter had to sort the list by granularity, invent the unit sequence and guess the signature strings; AudioReading's guesses made every document look stale (INT-01, INT-03).
+> - One parameter object lets later versions add write payloads (sparse vectors, multi-vector embeddings, entity edges) as optional fields instead of new method signatures.
+> - `unit_seq` lives on the write item, not on `RAGNode`, because only summary writes need it. Node ids stay opaque so that a new node kind is never a contract change.
+
 ### 4.5 `InMemoryRAGStore`
 - `cody_ai_shared_lib.rag.memory_store` **MUST** ship `InMemoryRAGStore[MetaT]`. It implements every capability in pure Python:
   - exact cosine search;
@@ -760,11 +812,24 @@ class Fingerprint(BaseModel):
   - fingerprints, revisions and deletes;
   - optional embedding return.
 - It is the first subclass of the conformance kit, and the default store for eval runs.
+- **Owners and scoped views (1.2.0).** It records the owner of every `upsert_section` write and applies it to tenant and domain filters, so a row written for one user is invisible to another. `store.scoped(owner)` returns `ScopedInMemoryRAGStore`, a view of the same data bound to one owner: the reference implementation of the §5.6 pattern, which refuses a read, write, fingerprint lookup or delete that names another scope with `ScopeViolationError`, and any write into a document another owner holds. The base store never moves a document to another owner, and on stores with a required tenant or domain a row without an owner never matches (fail closed); rows written before 1.2.0 on stores without a required scope keep matching.
 
 ### 4.6 Conformance kit (`RAGStoreContractTests`) **[v1]**
-`cody_ai_shared_lib.rag.testing.RAGStoreContractTests` is a pytest mixin. An app subclasses it, provides `make_store()` and seed data, and runs it in its own CI. It checks:
+`cody_ai_shared_lib.rag.testing.RAGStoreContractTests` is a pytest mixin. An app subclasses it, provides `make_store()` and seed data, and runs it in its own CI.
 
-1. Every `RAGFilterSpec` field the store accepts is honoured: tenant, domain, docs, categories, sequential boundary (single and per-doc), date bounds (inclusive start and end, `date_field`), and `custom` keys.
+**Hooks (1.2.0).** The kit runs against the store's real `capabilities()`, including its required scope, so the configuration that ships is the one tested (INT-05):
+
+| Hook | Default | Override when |
+| :--- | :--- | :--- |
+| `make_store()` | required | always |
+| `make_owner()` | `OwnerScope()` | the store requires a scope: every kit write is made for this owner |
+| `make_filters(doc_id=None, **extra)` | the owner's keys plus `doc_ids=[doc_id]` | reads need more than the owner's keys |
+| `make_scoped_store(store, owner)` | `None` (check 16 skipped) | the app builds scoped stores (§5.6): return a view of `store` bound to `owner` |
+| `full_scope_filters()` | `None` (the kit writes its own two-section scope) | the store's full-scope text does not come from kit writes, e.g. a chapter table |
+
+The kit writes the way the engine does: through `upsert_section` with a `SectionWrite`, fingerprints and the owner. It checks:
+
+1. Every `RAGFilterSpec` field the store accepts is honoured: tenant, domain, docs, categories, sequential boundary (single and per-doc), date bounds (inclusive start and end, `date_field`), and `custom` keys. With an owner, rows written for it are invisible under another tenant (1c).
 2. `required_filter_keys` are enforced (§5.6).
 3. Ordering is descending by the declared score, ranks start at 1, and ties are stable.
 4. Upsert is idempotent. Deletes, fingerprints and revisions behave as declared.
@@ -775,13 +840,24 @@ class Fingerprint(BaseModel):
 9. `fetch_nodes` honours filters.
 10. CJK keyword search: `keyword_search("张三")` finds a node containing 张三 (§6.1).
 11. A keyword-only hit from a native-hybrid store (no `vector_score`) survives the profile's cosine floor (§9.1).
-12. **Atomic section writes.** While one thread writes a section with `upsert_section_nodes`, a concurrent reader sees either none or all of its passages and summaries (RAG-ING-10).
+12. **Atomic section writes.** While one thread writes a section with `upsert_section`, a concurrent reader sees either none or all of its passages and summaries (RAG-ING-10).
 13. **CJK precision** (stores with `uses_analyzer_tokens`). In addition to check 10: a three-character name (李小明) is found through a `"phrase"` group; a passage containing only part of the name (小明) does not outrank it; a passage without the name never ranks first (negative control).
 14. **Snippets** (stores with `returns_snippets`). The `snippet` the store produced arrives unchanged; a store without snippets returns `None` without error.
-15. **Fingerprint parity.** For the same node, `engine.prepare_nodes` and `upsert_section_nodes` produce identical `content_hash`, `embedding_signature`, `fts_signature`, `token_estimate` and `search_tokens`; a row written from `prepare_nodes` is reported as current by `get_fingerprints` and `needs_reindex`.
+15. **Fingerprints persisted as given.** `get_fingerprints` returns exactly the `Fingerprint` each node was written with; the store never computes its own (1.2.0). Together with RAG-ING-13 this gives parity: `engine.prepare_nodes` and `upsert_section` carry identical `content_hash`, `embedding_signature`, `fts_signature`, `token_estimate` and `search_tokens`, and a row written from `prepare_nodes` is reported as current by `get_fingerprints` and `needs_reindex`.
+16. **Scoped store** (with `make_scoped_store`). Over one shared store, the view for user A raises `ScopeViolationError` on a read naming user B and on a write for user B. The view for user B sees none of A's rows, and cannot write into or delete A's document. A still sees exactly its own rows (§5.6).
+17. **Stats match the full scope** (stores with `supports_full_scope_fetch`). `scope_stats(f).char_count` equals the text `fetch_full_scope(f)` returns, and `total_tokens` is positive exactly when that text is non-empty (§4.2, INT-06).
+18. **Full-scope granularity** (stores with `supports_full_scope_fetch`). A two-section scope returns at least two nodes, in document order, without overlap; when the kit wrote the scope, no node crosses a section boundary (§4.2, INT-07).
+19. **Summary layer** (stores with `supports_parent_summaries`). Ranked searches never return summaries; under a boundary, `fetch_parent_summaries` admits a summary only when `char_end <= B` (1.2.0).
+20. **Per-document boundaries** (stores with `supports_sequential_boundary`). `max_char_offset_by_doc` applies a separate boundary per document.
+21. **Partial writes never delete.** A write holding only one changed passage of a section leaves the section's other passages readable (§4.4.1).
+22. **Ordering.** Distinct cosine scores come back in descending order, ranks start at 1, and a tie keeps the same order across calls.
+23. **Deletes and revisions.** `delete_nodes`, `delete_sections`, `current_revisions` and `fetch_nodes` behave as declared.
+24. **Atomic passages and summary.** While a section with passages and a summary is written, a reader never sees part of the passages.
+
+Checks 17 and 18 seed engine-shaped data: the splitter's overlapping passages (1.2.0).
 
 The kit also ships:
-- `BrokenStore`, a deliberately wrong store that must fail the kit;
+- `BrokenStore`, a deliberately wrong store that must fail the kit; the lib's own tests also show that checks 15, 17 and 18 fail a store that computes its own fingerprints, reports zero stats for served text, or returns one node for a whole scope;
 - a **concurrency test** for the engine itself: 16 parallel queries produce the same results as 16 sequential ones (RAG-RES-8).
 
 **Running the kit.** The kit needs no network access and no live database. It takes the app's `make_store()` factory, so it runs against whatever that factory builds: a store over a live Supabase project, or the same adapter over an in-memory fake client (as NewsIntelligence's `backend/tests/fakedb.py` does). Checks 1–6 and 8–11 are meaningful against a fake. Check 7 (filtered recall) tests index behaviour and is only meaningful against real Postgres with the production index; apps SHOULD run it at least before each adapter or index change.
@@ -797,13 +873,24 @@ The lib ships `cody_ai_shared_lib/rag/sql/` inside the package as data files to 
 
 | File | Pattern it captures |
 | :--- | :--- |
-| `hybrid_search.sql` | Vector and full-text branches, each filtered **before** its limit, with per-branch caps (`top_k × 2`), RRF in SQL, and raw `vector_score`/`keyword_score` returned next to `rrf_score`; the cosine floor applied to the vector branch only |
-| `vector_search.sql` | Filtered top-k by cosine that returns `k` rows for a small target document (exact scan when `doc_id` is fixed, or iterative index scan), the filtered-recall trap of §4.6 #7 |
-| `sequential_boundary.sql` | `char_start < boundary` predicates, per-document boundaries via a `(doc_id, boundary)` array argument, and summary rows admitted only when `char_end <= boundary` |
-| `fingerprints.sql` | Columns `content_hash`, `embedding_model`, `embedding_dim`, `fts_signature`, `token_estimate`, `revision`, plus the fingerprint query used by `sync_document` |
-| `upsert_section.sql` | One RPC that writes a section's passages and summaries in a single transaction, because supabase-py cannot run a multi-statement transaction from Python (RAG-ING-10) |
-| `indexes.sql` | HNSW on the embedding column, GIN on the FTS column, b-tree on `(doc_id, char_start)` and on the tenant or scope column |
+| `hybrid_search.sql` | Vector and full-text branches over one scoped set (owner, domain, documents, per-document boundary, **passages only**), each limited to `match_count × 2` after filtering; RRF in SQL with raw `vector_score`/`keyword_score` and ranks; the cosine floor on the vector branch only; snippets via `ts_headline` |
+| `vector_search.sql` | Filtered top-k by cosine over passages only, with a mandatory owner predicate and per-document boundaries; pgvector ≥ 0.8 iterative index scans so a small target document still returns `k` rows (check 7) |
+| `sequential_boundary.sql` | `fetch_parent_summaries`: summaries admitted only when `char_end <= B` (single or per-document boundary), optional level, document order |
+| `fingerprints.sql` | Table with owner columns (`tenant_or_user_id`, `domain_id`), summary columns (`is_summary`, `parent_kind`, `unit_seq`), and the fingerprint as given (`content_hash`, nullable `embedding_signature`, `fts_signature`), plus `get_document_fingerprints`, which returns the stored values and never rebuilds them |
+| `upsert_section.sql` | `upsert_section(doc, seq, owner, passages, unit_summaries, section_summary)`: one transaction, `INSERT … ON CONFLICT (id) DO UPDATE`, **never deletes**, refuses a document or row another owner holds; a separate owner-scoped `delete_nodes` |
+| `indexes.sql` | HNSW on the embedding column, GIN on the FTS column, b-tree on `(tenant_or_user_id, doc_id, is_active)` and `(doc_id, char_start)`, a partial index for summaries |
 | `cjk_fts.sql` | Two options for Chinese keyword search: a `simple`-config `tsvector` over `TextAnalyzer` tokens, or PGroonga where the Supabase plan offers it |
+
+Every template function (1.2.0) is `SECURITY DEFINER` with `SET search_path = public, extensions, pg_temp` (Supabase installs pgvector in the `extensions` schema; `pg_temp` last prevents temp-schema shadowing), raises when the owner is missing, and slices text by reference with chunk-relative offsets (`p.char_start - c.char_start`). A test in the lib pins these rules.
+
+**Migration checklist.** Each template starts with the same checklist, so an app can check its own functions line by line (requested by AudioReading):
+- the upsert never deletes; deletion is a separate RPC;
+- every function takes the owner, raises when it is missing, filters on it, and refuses a document or row another owner holds;
+- `search_path` pinned to `public, extensions, pg_temp` on every `SECURITY DEFINER` function;
+- summaries admitted only when `char_end <= B`; ranked searches read passages only;
+- scan mode: pgvector ≥ 0.8 iterative index scans, or an exact distance sort when every query is limited to one document (AudioReading's choice: no vector index);
+- text by reference sliced with chunk-relative offsets;
+- fingerprints stored exactly as the engine sends them, never computed or rebuilt in SQL.
 
 Every template MUST also show:
 - **Text by reference.** A variant where the passages table stores only offsets, and the text is sliced from a parent table (AudioReading's `audiolib_passages` over `audiolib_article_chunks`).
@@ -849,7 +936,7 @@ class Guard(Protocol):
 | Guard | Built from | `to_filter` | `verify` |
 | :--- | :--- | :--- | :--- |
 | `SequentialBoundaryGuard` | `max_char_offset`, `max_char_offset_by_doc` | Boundary fields | §5.2 |
-| `TemporalGuard` | `date_range_utc` set by the **caller** in `request.filters` | Date range and field | Drops nodes whose `renderer.timestamp` is outside the range; a node without a timestamp is kept only if the store applied the filter. |
+| `TemporalGuard` | `date_range_utc` set by the **caller** in `request.filters` | Date range and field | Drops nodes whose date is outside the range. The date is the node's `date_field` value when it has one, else `renderer.timestamp`. A node without a date is kept only if the store applied the filter (`date_field` in `supported_date_fields`). |
 | `TenantGuard` | `tenant_or_user_id` | Tenant field | Drops nodes whose metadata tenant differs, when the renderer exposes it. |
 | `ScopeGuard` | `doc_ids`, `domain_id`, `categories`, `custom` | Those fields | Drops nodes outside them when the values are visible on the node. |
 
@@ -857,6 +944,12 @@ Apps add guards by passing objects in `request.guards`, or by registering a guar
 
 ### 5.2 Sequential boundary semantics (spoiler guard)
 For document `d` with boundary `B` (exclusive: the reader has seen `[0, B)`):
+
+**Who sets `B` (1.2.0, owner decision).** `B` belongs to the app, which alone knows where the user has been:
+- `B` is the **furthest point the user has reached**, not the current player position. Re-listening to an earlier chapter does not lower it, because the user has already heard what comes after. Seeking and skipping are app logic; the engine does not track them.
+- **Spoiler protection off** is `B` = the document's length, not a missing boundary.
+- The engine filters retrieved text, not chat history. `B` must therefore cover everything already discussed in the thread; a boundary lower than an earlier turn's would let that turn's answer reach the prompt.
+- **Fail closed.** When the profile lists `sequential_boundary` in `guards`, a request without `max_char_offset` raises `MissingRequiredScopeError` before any store call. With only `max_char_offset_by_doc`, every document in scope must be in the map. A forgotten boundary is an error, never "no protection".
 
 1. A node with `span.char_start >= B` is dropped.
 2. A node with trait `offset_addressable` and `span.char_end >= B` is **cut at a sentence end** (D-24). This applies to every offset-addressable kind, including `passage`, and to text a store has already stopped at `B` (`local_window`, `full_doc`).
@@ -908,7 +1001,9 @@ See §10.3 and D-07.
   - boundaries take the minimum;
   - date ranges intersect;
   - `custom` keys must agree. A conflict yields an **empty scope**, and the engine returns the empty-retrieval answer (RAG-RES-4).
-- **Narrow-only inference.** An app-supplied `FilterInferencer` (KB-13) may propose extra filters from the question. Its patch is intersected, never unioned.
+  - **Empty scope is explicit (1.2.0).** A conflict sets `RAGFilterSpec.empty_scope`; the engine then makes no store call, `retrieve` returns no nodes, and `plan()` returns strategy `none` with reason "empty scope". This is distinct from a caller leaving a required key out, which still raises `MissingRequiredScopeError` (§5.6).
+  - **Date windows (1.2.0).** The intent's soft window is **intersected** with the caller's hard range, never dropped because one is set. When the two do not overlap, the hard range alone applies: a soft constraint never empties a hard scope. The guard enforces only the hard range, and relaxation widens or drops the soft window back to the hard range, never past it.
+- **Narrow-only inference.** An app-supplied `FilterInferencer` (KB-13) may propose extra filters from the question. Its patch is intersected, never unioned. Interface (1.2.0): `infer(request, intent) -> dict | FilterPatch | None`, passed as `RAGEngine(filter_inferencer=...)` and shared by sibling engines; the proposal goes through `RAGFilterSpec.patch`, so a conflict gives an empty scope, never a wider search.
 - `applied_filters` on the result reports the final effective spec.
 
 > **Rationale:**
@@ -917,9 +1012,17 @@ See §10.3 and D-07.
 > - This keeps NF-14 (relaxation) and RAG-SEC-5 (isolation) compatible. See D-04.
 
 ### 5.6 Fail-closed required scope
-If any key in `capabilities().required_filter_keys` is missing (or empty) from the effective filters, the engine **MUST** raise `MissingRequiredScopeError` before any store call. Adapters SHOULD additionally bind scope at construction (`store.scoped(domain_id=...)`).
+If any key in `capabilities().required_filter_keys` is missing (or empty) from the effective filters, the engine **MUST** raise `MissingRequiredScopeError` before any store call. The same keys are required on writes (§6.4.2).
 
-> **Rationale:** News and Audio use service-role clients that bypass RLS, so the adapter is the only isolation. A forgotten filter must crash, not leak across tenants (NF-23). The check is one set lookup.
+- **Scoped stores (1.2.0).** The engine proves a scope was **stated**; it cannot prove it is the **right** one. A scoped store also refuses to **write into a document another owner holds**, even when the write names the store's own owner: checking only the owner argument would let user B overwrite user A's document by reusing its id. Adapters SHOULD therefore be built per request for the authenticated principal, e.g. `store.scoped(tenant_or_user_id=user.id)` with the id taken from the verified session and never from request input, and reject any read or write whose filters or owner name another scope by raising `ScopeViolationError`.
+  - `ScopeViolationError` is a typed engine error: it passes through the engine unchanged (never wrapped in `RetrievalError`, never degraded), so the app can answer 403 rather than 500.
+  - `engine.with_store(scoped_store)` returns a sibling engine over that store that shares the pool, cache, gateway, registry, observers and guards, so a per-request store does not build a new pool and cache per request (§12.1).
+  - The conformance kit checks scoped stores through the `make_scoped_store(store, owner)` hook: two views over one store, as two users' requests share one database (§4.6, check 16).
+  - *Informative:* for user-facing paths, a Supabase client bound to the user's JWT lets RLS enforce ownership even if adapter code has a bug. Jobs that keep the service-role key rely on the scoped store.
+
+> **Rationale:**
+> - News and Audio use service-role clients that bypass RLS, so the adapter is the only isolation. A forgotten filter must crash, not leak across tenants (NF-23). The check is one set lookup.
+> - The engine check catches a *forgotten* scope; a scoped store catches a *wrong* one. Both are needed once the apps serve more than one user (AudioReading closing reply, 1.2.0).
 
 ---
 ## 6. Text Analysis, Ingestion & Index Lifecycle
@@ -944,7 +1047,7 @@ class TextAnalyzer(Protocol):
   - dedup vocabulary overlap;
   - citation coverage sentence splitting.
 - **Analyzer tokens (RAG-ING-11), for stores that declare `uses_analyzer_tokens`.** Stores that use Postgres's own language configuration on raw text (NewsIntelligence, KnowledgeBase with `english`) leave the flag off and are unaffected.
-  - **Ingestion side.** The engine sets `node.search_tokens` with the profile's analyzer before `upsert_section_nodes`, so the adapter stores tokens and never runs a tokenizer of its own. The analyzer's name and version go into `Fingerprint.fts_signature`.
+  - **Ingestion side.** The engine sets `node.search_tokens` with the profile's analyzer before `upsert_section`, so the adapter stores tokens and never runs a tokenizer of its own. The analyzer's name and version go into `Fingerprint.fts_signature`.
   - **Query side.** The engine passes `analyzer_tokens: list[TokenGroup]` to `keyword_search` and `hybrid_search`:
     ```python
     class TokenGroup(BaseModel):
@@ -971,6 +1074,7 @@ class TextAnalyzer(Protocol):
   - **Terminator rules** (per character, so English, Chinese and mixed text go through one pass with no language detection):
     - `。` `！` `？` `；` `……` end a sentence wherever they appear; Chinese puts no space after them.
     - `.` `!` `?` end a sentence only before whitespace, a closing quote or bracket, or the end of the text, so `3.14` and `example.com` do not split.
+    - A paragraph break (`\n\n` or `\r\n\r\n`) ends a sentence even without terminal punctuation, so a heading followed by a blank line is a complete unit for the §5.2 cut.
     - A run of terminators (`？！`, `...`) counts as one, and closing quotes and brackets right after it (`"` `'` `”` `’` `」` `』` `）` `)` `》`) belong to the sentence.
     - Abbreviations (`Dr.`, `U.S.`) may split early. That is accepted: a short extra sentence does no harm in the splitter, and under the guard it only cuts earlier.
   - A sentence longer than 1.5× the target MAY split at clause punctuation (`,` `;` `，` `、`), or hard-cut at 2× the target.
@@ -980,6 +1084,7 @@ class TextAnalyzer(Protocol):
   - Each node gets `span.breadcrumb`, and RAG-ING-1 offsets are preserved.
   - Implemented with the stdlib or a light parser; no heavy dependency.
 - **`PassThroughSplitter`:** one input unit becomes one node (KB entries, News articles).
+- **Granularity (1.2.0).** `profile.ingestion.granularity` (default `"passage"`) sets what ingested chunks are. Set it to an atomic kind (`"article"`, `"entry"`) for whole units, so budgets drop them whole instead of cutting them (§3.3, §10.1).
 - Every splitter has a `version` string, which becomes part of the embedding signature (§6.6).
 
 ### 6.3 Parent summaries **[contract: model] [later: recursive]**
@@ -988,7 +1093,11 @@ class TextAnalyzer(Protocol):
   - Under a sequential guard, units that end before the boundary are admitted (§5.2 rule 3), so a recap at position 55,000 of a 60,000-character section still covers the first 48,000 characters through unit summaries, plus the local window for the rest.
   - Tier 3 (§8.6) uses unit summaries only for the section that contains the boundary, or when the section summary is not admitted; otherwise it uses the section summary.
 - Callers may pass existing summaries (KB section descriptions, News `agent_summary`), which skips the LLM call.
+- **`summaries.embed_summaries`** (default `True`, 1.2.0). When `False`, the `summary_embedding` stage is skipped and summaries reach the store without vectors (`SummaryWrite.vector=None`). This needs a store that overrides `upsert_section` (§4.4.1); engine startup raises `ProfileConfigError` otherwise. A store that never searches summaries by vector saves those calls and their budget (INT-02). When `True`, a section's summary and its units are embedded in one batch.
 - **Failure behaviour.** After `LLMClient` retries and the summary model list (DG-01, DG-02), a summarizer failure raises `RAGStageError("summarizer")`. Skipping the summary is an **opt-in** degradation (DG-14, `fallbacks={"summarizer": "skip"}`): the section then proceeds without a summary and reports `IngestionProgress.summary_status="failed"`.
+- **Prompt and input (1.2.0).** The summarizer uses only the text it is given: the prompt forbids content from other parts of the work, outside sources, or prior knowledge of the work (a model that knows a famous novel must not put later events into an early summary). The section text goes inside a data fence and is never followed as instructions (§10.4).
+- **What can be skipped (1.2.0).** Under `fallbacks={"summarizer": "skip"}`, only model and provider failures are skipped. Configuration, scope, budget and deadline errors, and a safety block, always propagate (§13.3). When some unit summaries fail but others succeed, `summary_status="partial"`.
+- **Long sections (1.2.0).** A section longer than four summary units is summarized from its unit summaries (map, then reduce), so no single call receives an oversized input.
 - **Later:** `RecursiveSummarizer` (an ingestion stage) builds levels ≥ 2 (chapters → arcs → book).
 
 > **Rationale:**
@@ -996,7 +1105,7 @@ class TextAnalyzer(Protocol):
 > - Summary units close the gap AudioReading found after the spoiler fix (Audio response N-4): with whole-section summaries only, the current section of a long PDF chunk had no summary at all. Units are ingestion-only and need no new store method.
 
 ### 6.4 `BatchEmbedder` (public, usable standalone) **[v1]**
-- Embeds `renderer.embed_text(node)` through `ModelGateway` with `task_type="RETRIEVAL_DOCUMENT"`.
+- Embeds `renderer.embed_text(node)` through `ModelGateway` with the task type the store declares (`embedding_space().task_type_documents`, default `"RETRIEVAL_DOCUMENT"`), so the fingerprint never names a task type the vector was not made with.
 - **RAG-ING-4 (zero-vector guard).** `generate_embedding` returns `[0.0]*768` for failed items.
   - Zero vectors MUST NOT be upserted.
   - On the engine-write path (`ingest_document`, `sync_document`) one section is one unit. If any of its nodes fails, the engine raises `EmbeddingProviderError` naming them in `failed_node_ids`, before anything of that section is written, so a document never has holes. The job retries from its checkpoint.
@@ -1020,14 +1129,36 @@ class PreparedBatch(BaseModel, Generic[MetaT]):
     usage: list[StageUsage]
     degradations: list[Degradation]
 
-engine.prepare_node(node: RAGNode[MetaT]) -> PreparedNode[MetaT]               # one unit: succeeds or raises
-engine.prepare_nodes(nodes: list[RAGNode[MetaT]]) -> PreparedBatch[MetaT]      # per node: returns the good ones
+engine.prepare_node(node, *, owner: OwnerScope | None = None) -> PreparedNode[MetaT]    # one unit: succeeds or raises
+engine.prepare_nodes(nodes, *, owner: OwnerScope | None = None) -> PreparedBatch[MetaT]  # per node: returns the good ones
 ```
-- **RAG-ING-13.** `prepare_nodes` computes, for each node, everything `upsert_section_nodes` would persist: the embedding of `renderer.embed_text(node)`, the fingerprint (§6.6), `token_estimate` and, for stores with `uses_analyzer_tokens`, `search_tokens`. It uses the profile's own renderer, analyzer and embedder, so the values are **identical** to the engine's by construction. It writes nothing.
-- **Failure is per node.** `prepare_node` is for one article or entry: it either succeeds completely or raises `EmbeddingProviderError`. `prepare_nodes` judges each node on its own: failed nodes are listed in `failed` (ERROR log, DG-08) and the good ones are returned, so the caller keeps those and retries only the rest. It raises only when no node succeeded (`failed_node_ids` names them), when the whole embedding call fails, or on `BudgetExceeded`, with the usage of calls already made (RAG-OPS-1). A failed node has no vector and no fingerprint, so it can never be stored as current.
-- **Use it when the app owns the insert.** An app that writes a row in its own transaction, together with its own columns (for example KnowledgeBase's entry row with `proposal_id` and `claim_id`), calls `prepare_nodes`, then inserts vector, fingerprint and tokens with its row. `sync_document` and `reconcile` then see that row as current. Apps that let the engine write keep using `upsert_section_nodes`; both paths produce the same stored values.
+- **RAG-ING-13.** `prepare_nodes` computes, for each node, everything `upsert_section` would persist: the embedding of `renderer.embed_text(node)`, the fingerprint (§6.6), `token_estimate` and, for stores with `uses_analyzer_tokens`, `search_tokens`. It uses the profile's own renderer, analyzer and embedder, so the values are **identical** to the engine's by construction. It writes nothing.
+- **Failure is per node.** `prepare_node` is for one article or entry: it either succeeds completely or raises `EmbeddingProviderError`. `prepare_nodes` judges each node on its own: failed nodes are listed in `failed` (ERROR log, DG-08) and the good ones are returned, so the caller keeps those and retries only the rest. It raises only when no node succeeded (`failed_node_ids` names them), when the whole embedding call fails, or on `BudgetExceeded`, with the usage of calls already made (RAG-OPS-1). A failed node has no vector and no fingerprint, so it can never be stored as current. `FailedNode.reason` says why: the provider returned no vector, or a zero vector (1.2.0).
+- **Use it when the app owns the insert.** An app that writes a row in its own transaction, together with its own columns (for example KnowledgeBase's entry row with `proposal_id` and `claim_id`), calls `prepare_nodes`, then inserts vector, fingerprint and tokens with its row. `sync_document` and `reconcile` then see that row as current. Apps that let the engine write use `ingest_document`, which writes through `upsert_section`; both paths produce the same stored values, and `upsert_section` receives the same `PreparedNode` shape.
+- **Owner (1.2.0).** `owner` follows §6.4.2. Nothing is written, but the app inserts the result, so the owner must be stated and the spend counts against it. Each call gets its own request id.
 
 > **Rationale:** `sync_document` and `reconcile` decide what to re-embed by comparing stored fingerprints with freshly computed ones. An app that inserts its own rows had no way to compute a matching fingerprint, and a formula that differed even slightly (hashing the raw column instead of the rendered embed text) would make every row look stale, so `reconcile` would re-embed everything (KnowledgeBase closing reply). Passing app columns through `upsert_section_nodes` instead was rejected: the lib would perform an app's domain insert, against D-01.
+
+### 6.4.2 Owner scope on ingestion **[contract, 1.2.0]**
+- `ingest_document`, `sync_document`, `prepare_node` and `prepare_nodes` take a keyword argument `owner: OwnerScope | None` (§4.4.1).
+- **Rule: what a read must state, a write must state.** Every key in `capabilities().required_filter_keys` must have a value in `owner`. `doc_ids` is satisfied by the document being written, and a key that is not an `OwnerScope` field is read from `owner.custom`. Otherwise the engine raises `MissingRequiredScopeError` before any model or store call. A store with no required keys accepts `owner=None`.
+- **Where it goes:**
+  - into every `CallContext` of the call (`tenant_or_user_id`, `scope`), so a per-user `BudgetGuard` sees who pays and `BudgetExceeded` can stop an ingestion midway (§13.1);
+  - into `SectionWrite.owner`, so a scoped store can check it (§5.6);
+  - observers receive the ingestion's `on_usage` and `on_degrade` events like a query's (§13.2).
+- **One principal.** In every app the user who pays for an ingestion is the user who owns the rows it writes. Background jobs (feed ingestion, background book ingestion) run on behalf of the user who set them up, never as a system actor.
+
+| App | Isolation key |
+| :--- | :--- |
+| AudioReading | `tenant_or_user_id` (+ document) |
+| NewsIntelligence | `tenant_or_user_id` + `domain_id` |
+| KnowledgeBase | `tenant_or_user_id` |
+
+> **Rationale:**
+> - Before 1.2.0 ingestion ran with no identity: every `CallContext` had `tenant_or_user_id=None`, so a per-user guard could not decide, and the store could not check ownership (INT-04).
+> - Deriving the write keys from the read keys keeps one source of truth; a second list would be one more thing to forget.
+> - The ownership model (content belongs to a user; News partitions further by domain) was settled with the owner on 2026-11-11, with multi-user support in view: each user signs in through Supabase auth and reads only their own content.
+> - The engine cannot check ownership itself; that is the scoped store's job (§5.6).
 
 ### 6.5 Ingestion stages **[seam]**
 ```python
@@ -1069,25 +1200,30 @@ class IngestionProgress(BaseModel):
     sections_total: int
     passages_upserted: int
     passages_skipped_unchanged: int = 0
-    summary_status: Literal["generated", "provided", "skipped", "failed"] = "skipped"
+    summary_status: Literal["generated", "provided", "skipped", "partial", "failed"] = "skipped"
     usage: list[StageUsage] = Field(default_factory=list)
     degradations: list[Degradation] = Field(default_factory=list)
 ```
-- **`engine.ingest_document(doc, start_section_seq=0, on_section_complete=None)`** (RAG-ING-5):
+- **`engine.ingest_document(doc, start_section_seq=0, on_section_complete=None, *, owner=None)`** (RAG-ING-5):
   - Processes sections in ascending `section_seq`, skipping those below `start_section_seq`.
   - Calls `on_section_complete(progress)` after each successful upsert. The callback is where the app saves its checkpoint and checks for cancellation; raising from it stops ingestion.
-- **RAG-ING-10 (atomic sections).** `upsert_section_nodes` is atomic for readers, so a listener can chat while later sections are still being written (§4.4, kit check 12).
+- **RAG-ING-10 (atomic sections).** `upsert_section` (and the legacy `upsert_section_nodes`) is atomic for readers, so a listener can chat while later sections are still being written (§4.4, kit check 12).
 - **Budget during ingestion (RAG-ING-12).** Ingestion calls go through the `BudgetGuard` like query calls (§13.1). The summary is an optional stage for budget purposes: `"skip"` sets `summary_status="skipped"` and records DG-11. Embedding is required. A `BudgetExceeded` raised during a section leaves every earlier section committed with its `on_section_complete` already called, writes nothing for the current section, and propagates to the caller. Any exception raised during a section (budget or otherwise) carries the usage of that section's calls already made (RAG-OPS-1); earlier sections were already reported through `IngestionProgress.usage`.
 - **RAG-ING-6 (append-only).** `ingest_document` MAY be called repeatedly with later sections of the same document. Offsets of already-ingested text are immutable.
 - **Fingerprints.** For each node, the engine computes:
   - `content_hash = sha256(analyzer.normalize(embed_text))`;
-  - `embedding_signature = model|dims|task_type|splitter_version`.
-  Both are persisted through `upsert_section_nodes`, or by the app from `prepare_nodes` (§6.4.1). There is no other formula: apps never compute fingerprints themselves.
-- **`engine.sync_document(doc)`:**
-  - Diffs against `store.get_fingerprints(doc_id)`.
-  - Embeds only new or changed nodes, deletes nodes that vanished, and skips unchanged ones.
-  - Node ids of unchanged content are preserved.
+  - `embedding_signature = model|dims|task_type|splitter_version`, where `splitter_version` is the store's `embedding_space().splitter_version`, or the splitter's own version when the store declares none;
+  - `fts_signature = analyzer_name|analyzer_version` for stores with `uses_analyzer_tokens`, else `None`. Summaries always carry `fts_signature=None`: ranked searches never return them (§4.2), so they are never keyword-searched, and `needs_reindex`/sync ignore summaries for FTS staleness (1.2.0). A store with no signature columns on its summary table therefore returns `None` for both signatures of summary rows; its `content_hash` may be a hash of the summary text, since the engine decides summary refreshes from passage changes.
+  All three reach the store with every node through `upsert_section` (§4.4.1), or reach the app from `prepare_nodes` (§6.4.1). There is no other formula: neither apps nor stores compute fingerprints themselves.
+- **Rows without a vector (1.2.0).** A row stored without a vector by design (a summary when `embed_summaries=False`) carries `embedding_signature=None`. It is never stale for embeddings, so a model upgrade does not flag it. If the profile later embeds summaries, a summary with `None` is stale and sync embeds it.
+- **Revision.** Every node the engine builds carries `RAGDocumentInput.revision`, so a citation saved before an edit is reported `stale` (§11.2) instead of silently pointing at different text. An app whose documents can be edited passes a revision.
+- **`engine.sync_document(doc, *, owner=None)`** brings every stored row of the document to the current text and signatures:
+  - Diffs against `store.get_fingerprints(doc_id)`. `doc` is the **whole** document: a node that is stored but not in `doc` is deleted. (To add later sections without touching earlier ones, use `ingest_document`.)
+  - Passages: new ones and ones whose text, embedding signature or FTS signature differ are re-embedded; unchanged ones are skipped; vanished ones are deleted.
+  - A section whose text changed gets fresh summaries.
+  - A section whose text is unchanged keeps its summaries. When they no longer match the current signatures (model or analyzer upgrade, `embed_summaries` switched), sync re-reads them with `fetch_nodes` and re-embeds or re-signs them without summarizing again. A store without `supports_fetch_nodes` regenerates them instead (summary model cost).
   - Requires `supports_fingerprints` and `supports_delete`.
+- **Node ids are positional (1.2.0, owner decision on review item M5).** `{doc}#s{seq}p{i}` numbers passages in order, so ids are stable for appends and for unchanged sections. Inserting text into a section renumbers the passages after it: sync re-embeds them, and citations saved before the edit are flagged stale through `revision`. The engine does not try to keep ids stable across in-place edits; that cost is accepted for edited documents.
 - **`engine.reconcile(limit, dry_run=False)`:**
   - Re-embeds rows that are missing, zero, or carry the wrong signature.
   - Batch-sized and cost-guarded.
@@ -1103,7 +1239,8 @@ class IngestionProgress(BaseModel):
 >   - KB edits and supersedes entries (KB-03).
 >   - News has two vector columns that must never be mixed (NF-28).
 > - One fingerprint contract covers all three and makes a model upgrade a `reconcile` run instead of a one-off script.
-> - Preserving node ids for unchanged content keeps citations, conversation state and eval golden sets valid across re-ingestion (RAG-EVAL-5).
+> - Preserving node ids for unchanged content keeps citations, conversation state and eval golden sets valid across re-ingestion of append-only and unchanged documents (RAG-EVAL-5). For edited documents the owner chose simplicity over finer cost savings: renumber, re-embed, flag stale citations (2026-11-11).
+> - Sync refreshes kept summaries from their stored text because a model upgrade must never leave vectors from two models in one store (RAG-ING-7, NF-28), and re-summarizing would pay the summary model again for unchanged text.
 > - Index coverage reporting stays in Audio, which already knows its checkpoint (R-01).
 
 ---
@@ -1189,7 +1326,7 @@ class IntentRouter(Protocol):
 - Uses the profile's `TextAnalyzer`.
 
 ### 7.4 Layer 2: Jev gate **[v1, default off, opt-in per app]**
-- Runs only when `profile.router.enable_jev=True` **and** `TYPESAFE_API_KEY` is present. **All presets ship with it off.**
+- Runs only when `profile.router.enable_jev=True` **and** `TYPESAFE_API_KEY` (or `VERCEL_API_KEY`, which the lib's `JevClient` also reads) is present. **All presets ship with it off.**
 - A single `system_one()` call (through `ModelGateway`) with:
   - `scope`: a `Choice` over the two scopes;
   - `needs_query_rewrite`: a `Noul`;
@@ -1217,7 +1354,8 @@ class IntentRouter(Protocol):
   - Windows are UTC calendar days with an inclusive end of day.
   - Reversed ranges are repaired.
   - "No usable dates" means no window.
-  - `date_window_days` counts back from `clock.now()`.
+  - `date_window_days` counts back from `clock.now()`: an intent with a time expression and no explicit range gets `[now - days, now]`.
+  - It runs on **every** intent, routed or supplied by the caller (`engine.query(req, intent=...)`), before the window is applied (1.2.0).
 - **The clock is injected** (`RAGEngine(clock=...)`). The engine never reads the system time directly (RAG-EVAL-4).
 - **Applied filters.** Every result carries `applied_filters`, so a UI can say "searched Oct 30 – Nov 6".
 - **Relaxation ladder (`profile.relaxation`, opt-in, default empty).**
@@ -1334,10 +1472,12 @@ class RetrievalStrategy(ABC, Generic[MetaT]):
 - **Requires:** `supports_full_scope_fetch`.
 - **Decision.** Tier 0 is selected when `scope_stats(filters).est_tokens` is at most `profile.retrieval.full_context_max_tokens`, after reserving the instruction, history and question zones.
   - When `est_tokens` is `None`, the engine uses `char_count × 1.0` (the CJK worst case).
-  - `request.doc_total_chars` is only a cheap pre-check that can rule Tier 0 out early.
+  - `request.doc_total_chars` is only a cheap pre-check that can rule Tier 0 out early. It never rules Tier 0 in: the store stays the source of truth, because the hint is unvalidated caller input and ignores every filter other than the position.
+  - **Diagnostic (1.2.0).** When the hint says the visible range has text but `scope_stats` reports zero tokens, the engine logs a WARNING and adds a note to `tier_decision_reason` naming `scope_stats`. Behaviour does not change; the note points at a store that counts indexed rows instead of source text (INT-06).
 - **Scope.** Tier 0 applies to any scope: one document (Audio), or a filtered corpus that fits (KB). The `tier_decision_reason` is recorded, e.g. `"full_context: 41k ≤ 120k tokens"`.
 - **Behaviour:**
-  1. Call `fetch_full_scope(filters)`. Nodes come back in document order with `granularity="full_doc"`.
+  1. Call `fetch_full_scope(filters)`. Nodes come back in document order, one per section or finer (§4.2). The engine marks each with the flag `full_scope`; text kinds are relabelled `granularity="full_doc"`, while atomic kinds (`article`, `entry`) keep their granularity, so a budget drops them whole instead of cutting them (1.2.0). Nodes flagged `full_scope` are never ranked: `top_k`, thresholds, rerank and boosters leave them alone.
+  4. Tier 0 does not depend on the query, so with several query variants it runs once, not once per variant. Any strategy can declare `query_independent = True` for the same treatment.
   2. Guards apply as everywhere else (§5.4).
   3. No query embedding is computed.
 
@@ -1352,7 +1492,7 @@ class RetrievalStrategy(ABC, Generic[MetaT]):
 
 ### 8.3 Keyword tiers **[v1]**
 - **`KeywordOnlyStrategy`** (requires `supports_keyword_fts`): makes zero embedding calls.
-- **`KeywordFirstStrategy(min_hits=3, fallback="hybrid_rrf")`:**
+- **`KeywordFirstStrategy(min_hits=3, fallback="hybrid_rrf")`** (`min_hits` from `profile.retrieval.keyword_first_min_hits`; the fallback reason is appended to `tier_decision_reason`):
   - Runs keyword search first and returns its results when there are at least `min_hits` hits above the threshold.
   - Otherwise it runs the fallback strategy and records the reason.
 
@@ -1379,7 +1519,7 @@ class RetrievalStrategy(ABC, Generic[MetaT]):
 - **Requires:** `supports_parent_summaries`.
 - **Selected when** `intent.scope == "document_overview"` or `profile.retrieval.always_include_summaries` is set.
 - Steps:
-  1. `fetch_parent_summaries(filters, level)`. With `supports_summary_levels`, it picks the deepest level whose summaries fit the summary sub-budget.
+  1. `fetch_parent_summaries(filters, level)`. With `supports_summary_levels`, it picks the deepest level whose summaries fit the summary sub-budget. **Per section it keeps the section summary when it was admitted, else that section's unit summaries, never both** (§6.3; 1.2.0).
   2. Retrieve detail passages with Tier 2 (or Tier 1 when FTS is missing).
   3. Fetch the local window when a cursor is set, using the profile radius.
   4. Return all three layers.
@@ -1442,6 +1582,7 @@ default_registry = ComponentRegistry()   # built-ins pre-registered
 - The reranker runs only if it is enabled for the variant.
 - The `suggested_top_k` clamp does not apply. The result size is bounded by `profile.retrieval.retrieve_max_results`, and `truncated` is set when more results existed.
 - Guards, required scope and the trace all apply.
+- **Store limits (1.2.0).** The engine never asks a store for more than `capabilities().max_top_k` rows; when a request needs more, the result is marked `truncated`. A feed-search store therefore declares a `max_top_k` above its `retrieve_max_results`. `top_k_override` in retrieve mode is bounded by `retrieve_max_results`.
 - **Feed search is in scope (Q-08, D-21).** `retrieve()` MUST support NewsIntelligence's feed search: router `none`, explicit UI filters as hard filters, a store-side `min_similarity` floor (§9.1), no rerank, rows carrying the feed's fields (§4.3), and up to `retrieve_max_results` (2,000 for the `news_search` variant) with `truncated`.
 - **Boundary.** The engine returns a *relevance-ranked, filtered* list for a text query. Features of a search product stay in the app: re-sorting by date, pagination, facet counts, saved searches, and filter-only browsing with no query text (that is a plain SQL query, not retrieval).
 
@@ -1502,7 +1643,7 @@ class PostRetrievalStage(Protocol[MetaT]):
 - Drops nodes whose signal of the declared kind is below `min_similarity`. In a profile, `threshold(kind)` selects the kind; the value comes from `retrieval.min_similarity`. A threshold of `kind="cosine"` reads `vector_score`, never the fused `score`.
 - **A node with no value for the declared signal passes** (it was not scored on that signal). In a hybrid result, a keyword-only hit has `vector_score=None` and is kept by a cosine threshold.
 - **Hybrid profiles express the cosine floor store-side**, through `RAGFilterSpec.min_similarity` (default from `profile.retrieval.min_similarity`), which the store applies to the vector branch only. `ThresholdFilter(kind="cosine")` is for dense-only profiles. This keeps today's NewsIntelligence behaviour, where the full-text branch has no similarity gate.
-- A threshold configured for a kind the pipeline cannot produce raises `ProfileConfigError` at construction.
+- A threshold configured for a kind the pipeline cannot produce raises `ProfileConfigError` at construction. Checked in 1.2.0: `threshold(rerank)` needs a rerank stage before it; `threshold(bm25)` cannot follow `dense_vector`; `threshold(cosine)` cannot follow `keyword_only`.
 - Nodes with `ordered` or `atomic` traits from Tier 0 and local windows are exempt.
 
 ### 9.2 Deduplication
@@ -1518,7 +1659,7 @@ class Reranker(Protocol):
 ```
 - Reranks only nodes with the `rerankable` trait. `ordered` nodes keep their positions in their own budget zone.
 - **Candidate pool.** When a rerank stage is active, strategies fetch `retrieval.rerank_candidates` nodes (default `top_k × 3`, limited by the store's `max_top_k`) and the reranker returns `top_k`.
-- Sends `renderer.rerank_text(node)` with the primary query. For comparisons, it reranks per variant and merges with `fair_interleave`, so the second subject is not crowded out.
+- Sends `renderer.rerank_text(node)` with the primary query. For comparisons (implemented in 1.2.0), it reranks per variant and merges with `fair_interleave`, so the second subject is not crowded out.
 - Sets `rerank_score`, and `score_kind="rerank"`.
 - **Jina built-in.** The model id comes from `ModelBindings.reranker` (no default model in the lib). Endpoint `https://api.jina.ai/v1/rerank`, timeout `profile.reranker_timeout_seconds` (4.0 s).
 - **RAG-RES-2.** A non-200 response, a timeout or an exceeded deadline keeps the incoming order truncated to `top_k` (DG-06): ERROR log, degradation recorded with `impact="Results were not reranked; order comes from hybrid/vector search."`. How the answer treats it is the caller's choice (§10.10). A missing `JINA_API_KEY` while reranking is enabled is a startup error.
@@ -1526,6 +1667,7 @@ class Reranker(Protocol):
 ### 9.4 Fusion and boosters **[v1]**
 - **`ScoreFusionStage(weights)`.** Combines min-max-normalized signals: semantic, keyword, rerank, recency, and any app `renderer.features(meta)` such as News priority or KB confidence. The result is written as `score` with `score_kind="fused"`, and the weights are recorded in the trace.
 - **`RecencyBooster(half_life_days, weight)`.** Multiplies by `1 + weight · 2^(-age/half_life)`, using `renderer.timestamp` and `clock.now()`.
+- Both stages touch only ranked nodes; ordered layers and Tier 0 text keep their scores and positions (§3.3).
 - Weights come from the profile and are tuned with evaluation data. The lib never hardcodes app-specific weights.
 
 > **Rationale:**
@@ -1559,7 +1701,8 @@ Runs every guard's `verify` on every node, one final time, before assembly.
    - `summary` nodes: up to 25%;
    - `local_window`: up to 25%;
    - ranked nodes (`passage`, `article`, `entry`, `full_doc`): the remainder.
-   Unused sub-budget flows to ranked nodes.
+   Unused sub-budget flows to ranked nodes. (`context.local_window_ratio` defaults to 0.25 as stated; `context.retrieved_ratio` is deprecated and ignored, because ranked nodes take the remainder.)
+   When summaries do not all fit, the **oldest are dropped first**; the summaries nearest the reader's position are kept (1.2.0).
 
 `atomic` nodes are included whole or not at all. A first non-atomic node larger than its zone is truncated to fit and flagged `truncated_by_budget`. The verbose trace records tokens per zone.
 
@@ -1584,7 +1727,7 @@ The assembler **MUST** order the prompt as follows:
    - history;
    - the question.
 
-The assembler returns `cache_breakpoints` (after blocks 1 and 2). `ModelGateway` maps them to provider cache controls (§15).
+The assembler returns `cache_breakpoints` (after blocks 1 and 2) and, since 1.2.0, `user_blocks`: the user message as ordered `(text, cacheable)` blocks whose texts join to `user_message`, the first holding the stable data. `ModelGateway` passes them to `LLMClient`, which sends Claude content blocks with `cache_control` on the cacheable one (and on the system prompt); providers with implicit prefix caching (Gemini) receive the same joined text, so the stable prefix stays byte-identical (§15).
 
 > **Rationale:**
 > - Tier 0 cost is dominated by re-sending the same document. Provider prompt caching only works on an identical prefix, so the layout must keep that prefix byte-stable (AUD-12, AUD-22, KB-18).
@@ -1674,19 +1817,31 @@ class GenerationStrategy(Protocol):
 | :--- | :--- | :--- |
 | `intent` | after routing | core intent facets, `router_source` |
 | `status` | at stage starts (optional) | `{"stage": "retrieving" \| "reranking" \| "generating" ...}` |
-| `retrieval` | after guard enforcement | node refs, labels, `strategy_used`, `applied_filters` |
+| `retrieval` | after guard enforcement | node refs (`nodes`), their citation `labels`, `node_count`, `strategy_used`, `applied_filters` |
 | `delta` | per model chunk | `{"text": "..."}`, raw text (markers included, flag withheld) |
-| `citations` | after the full text is verified | verified `citations`, `sources`, `citation_coverage` |
+| `citations` | after the full text is verified | verified `citations`, `sources`, `citation_coverage` (the ratio, a number; the full `CitationCoverage` is in `RAGResponse`) |
 | `degradation` | immediately when an agreed degradation fires | the `Degradation` record; pre-generation ones arrive before the first `delta`, so a UI can show a notice |
-| `done` | last | `answer_id`, `answer_final`, the full `citations` and `sources` lists (same as the `citations` event), `usage`, `degradations`, `state`, `grounded`, `answer_found`, `message_id` if supplied |
+| `done` | last | `answer_id`, `answer_final`, the full `citations` and `sources` lists (same as the `citations` event), `usage`, `degradations`, `state`, `grounded`, `answer_found`, `request_id`, `message_id` if supplied |
 | `error` | when the engine raises | `{"type": ..., "stage": ..., "message": ..., "request_id": ..., "usage": [...], "usage_total": {...}}` (no stack traces; usage of the calls already made, RAG-OPS-1); the iterator then raises the same exception. That exception is for the caller's logging and control flow; the route MUST NOT send a second error to the client |
 
 - **Verification happens at end of stream.** Deltas carry raw text. A UI that needs clean text uses `answer_final` from `done`, or `strip_markers(text, formatter)` while streaming.
-- **Cancel-safe.** Closing the iterator (`GeneratorExit`) stops all further model and store calls and releases pool threads.
-- **Usage after cancel (RAG-OPS-2).** `stream_query()` returns a `RAGStream` iterator object with a `usage_total` property, readable at any time and after `close()`. When the stream is closed before the provider's final usage chunk, the last generation record has `outcome="cancelled"`, the input tokens as sent, the output tokens counted from the deltas already received (`estimated=True`), and its estimated cost. An app whose client disconnects reads `stream.usage_total` after closing, so the spend still reaches its totals.
+- **Cancel-safe.** Closing the iterator (`GeneratorExit`) stops all further model and store calls and releases pool threads. Observers still receive `on_complete(trace, None)` for the cancelled request (RAG-EVAL-8).
+- **Close it with `with` (1.2.0).** `RAGStream` is a context manager. Leaving a plain `for event in stream:` loop early does not close the stream, so its cleanup would wait for garbage collection; leaving a `with` block always closes it, whether by `break`, an exception or a client disconnect. `close()` is idempotent.
+  ```python
+  with engine.stream_query(request) as stream:
+      for event in stream:
+          yield format_event(event)
+  record_spend(stream.usage_total)       # final: the stream has ended or been closed
+  ```
+- **Usage after cancel (RAG-OPS-2).** `stream_query()` returns a `RAGStream` iterator object with a `usage_total` property, readable at any time and after `close()`. It is **final only once the stream has ended or been closed**; read earlier, it does not include the call in progress. When the stream is closed before the provider's final usage chunk, the last generation record has `outcome="cancelled"`, the input tokens as sent, the output tokens counted from the deltas already received (`estimated=True`), and its estimated cost. An app whose client disconnects reads `stream.usage_total` after closing, so the spend still reaches its totals.
 - **Buffered mode.** `stream_mode="buffered"` emits one `delta` with the full text; the event contract is the same. Buffered mode is only used when the profile asks for it. If the profile asks for `"native"` and `LLMClient` or the bound model cannot stream, engine construction raises `ProfileConfigError`; the engine never silently switches to buffered.
 - **Async callers** run the iterator in a worker thread (`starlette.concurrency.iterate_in_threadpool` or equivalent). The engine stays synchronous.
 - **AudioReading compatibility.** The `delta` / `citations` / `done` order matches AudioReading's SSE contract (its `SPEC.md` §17.4). The app sends its own `meta {thread_id}` event first and maps `usage` to the token counts in its `done`.
+
+> **Contract for callers (1.2.0, INT-09)**
+> - **Persist and render `done.answer_final`, never the concatenated deltas.** Deltas are raw: they can hold unverified or out-of-range citation markers that `answer_final` has removed (§11.2). Store `done.citations` with it (§11.1).
+> - **`answer_found` is `"yes"`, `"no"`, `"partial"` or `null`.** It is `null` when the model gave no valid flag (§10.5) and for `no_retrieval` answers. Store it as a nullable value; converting it with `str()` stores the text `"None"`.
+> - **Ids.** `done.request_id` is the request's id: the caller's `request.request_id`, or one the engine generated. An app that wants its own message id on the turn passes it as `request_id` (AudioReading passes its assistant message id). `done.message_id` echoes `request.metadata["message_id"]`, or is `null`.
 
 > **Rationale:**
 > - KB would regress from live tokens to a spinner on adoption, and Audio's SSE contract already expects multiple deltas (KB-04, AUD-06).
@@ -1698,7 +1853,7 @@ class GenerationStrategy(Protocol):
 
 ### 10.10 Degradation disclosure **[v1]**
 Generation runs inside the engine, so the caller says in advance how an answer should treat degradations that fired before generation (for example, the reranker failed):
-- `profile.generation.degradation_disclosure` (overridable per request): `"silent"` (default) composes the answer normally; the degradations are reported only in the response and the stream. `"note"` adds each degradation's `impact` to the volatile prompt block with an instruction to mention it briefly to the user.
+- `profile.generation.degradation_disclosure` (overridable per request with `RAGQueryRequest.degradation_disclosure`; implemented in 1.2.0): `"silent"` (default) composes the answer normally; the degradations are reported only in the response and the stream. `"note"` adds each degradation's `impact` to the volatile prompt block with an instruction to mention it briefly to the user.
 - For full control, the caller runs `retrieve()` (whose result carries `degradations`), decides, and then calls `generate_from_nodes()` with its own `system_prompt_variables`.
 
 > **Rationale:** The owner wants the caller to decide whether a user hears about a degraded step. A per-request switch covers the common choices; the two-call path covers everything else. The note goes in the volatile block so the cached prefix does not change (§10.3).
@@ -1718,6 +1873,8 @@ class PostGenerationStage(Protocol):
 - Each stage records its outcome in the trace.
 
 ### 11.1 `CitationFormatter` **[contract]**
+- **What counts as a `ref` marker (1.2.0).** Any bracketed list of 1–3-digit numbers is a candidate, whatever character precedes it, so `主角[1]。`, `city[1].` and `(table)[2]` are recognised. A candidate is a citation when it resolves in this turn's citation map. One glued to an ASCII word or closing bracket (`arr[1]`) that resolves to nothing is ordinary text and stays; any other unresolved marker is unverified and handled per `on_unverified`. Code spans are never parsed. `strip_markers` (no citation map) leaves glued markers alone.
+- **Offset markers name no document.** When the same section range exists in several documents of the scope, the marker cannot be verified and is treated as unverified.
 ```python
 class CitationFormatter(Protocol):
     name: str
@@ -1755,7 +1912,7 @@ KB may register its own `[page§entry, vN]` formatter. The trade-off (model-visi
    - `answer_final`: unverified markers removed (default) or replaced with `[?]` (`profile.citations.on_unverified="flag"`).
 
 ### 11.3 `QuoteValidator` **[v1]**
-- When `verify_quotes` is set, every quoted string next to a citation is matched against the cited node's text.
+- When `verify_quotes` is set, every quoted string next to a citation is matched against the cited node's text. A citation with no quote written next to it is not quote-checked; it keeps its marker verification (1.2.0: comparing the source with its own excerpt proved nothing). `[1, 2]` after a quote checks the quote against both. CJK quotes (`“”`, `「」`, `『』`) count from 2 characters, ASCII quotes from 4.
 - Matching uses `difflib.SequenceMatcher` over a sliding window, with threshold ≥ 0.85. KB's `span_checker.py` is the reference implementation.
 - The ratio is stored in `verification_score`. Below the threshold, `verified=False`.
 
@@ -1774,7 +1931,7 @@ KB may register its own `[page§entry, vN]` formatter. The trade-off (model-visi
 
 ### 11.6 Output sanitizer (RAG-SEC-6) **[v1]**
 Default last stage. It:
-1. Neutralizes Markdown images and links whose URL host is not among the retrieved sources' URLs (taken from the renderer's metadata) or `profile.allowed_link_hosts`. The link text is kept and the URL is dropped.
+1. Neutralizes Markdown images and links whose URL host is not among the retrieved sources' URLs (taken from the renderer's metadata) or `profile.allowed_link_hosts`. The link text is kept and the URL is dropped. Reference-style definitions (`[1]: https://…`, which turn `![x][1]` into a remote image) and autolinks (`<https://…>`) to untrusted hosts are removed too (1.2.0).
 2. Removes the fence id, the `[[answer_found=…]]` flag and any fence-like tag from `answer_final`.
 
 > **Rationale:**
@@ -1821,7 +1978,7 @@ class EngineProfile(BaseModel):
     runtime: "RuntimeConfig"         # deadline_seconds, stage budgets, pool_size
     cache: "CacheConfig"
     trace_level: Literal["light", "verbose"] = "light"
-    allowed_link_hosts: frozenset[str] = frozenset()
+    allowed_link_hosts: list[str] = []            # hosts are compared case-insensitively; order is irrelevant
     injection_scanner: str | None = None
     variants: dict[str, dict] = {}   # named overrides, e.g. {"search": {...}}
 
@@ -1833,9 +1990,11 @@ class EngineProfile(BaseModel):
     def validate(self, registry: ComponentRegistry) -> None: ...  # raises ProfileConfigError(missing, unknown)
 ```
 - **No model id is hardcoded in the lib.** Presets take `models=` as a required argument: `EngineProfile.long_form_reader(models=ModelBindings(...))`.
-- `validate()` lists **every** problem at once: missing bindings for enabled stages, unknown component names, threshold/score-kind mismatches, a zone ratio sum above 1, and a Tier 0 gate that does not fit: `full_context_max_tokens` plus the reserved instruction, history and question zones must not exceed `max_context_tokens`.
+- `validate()` lists **every** problem at once: missing bindings for enabled stages, unknown component names, threshold/score-kind mismatches, a zone ratio sum above 1, and a Tier 0 gate that does not fit: `full_context_max_tokens` plus the reserved instruction, history and question zones must not exceed `max_context_tokens` (the question reserve is counted since 1.2.0).
 - **Model lists.** Each binding is an ordered list. Its models may come from the same provider (for example two Gemini models when an app has only a Gemini key). A one-model list is valid; the backup-model degradation (DG-02) then does not apply, and a failure after retries raises.
-- `fingerprint()` and `version` are recorded in every trace. Named variants (`news_chat`, `news_search`) share one base and differ only in their override block.
+- `fingerprint()` and `version` are recorded in every trace. The fingerprint hashes the profile with sorted keys, so it does not depend on dict insertion order (1.2.0).
+- **Validation (1.2.0)** also rejects: a `fallbacks` value the row does not accept (`rerank`: `raise`/`keep_order`; `summarizer`: `raise`/`skip`; `query_embedding`: `raise`/`keyword`; `jev`, `cache`, `deadline`: `raise`); a `citations.policy` other than `filter`, and a non-zero `min_citation_coverage`, until §11.4 is built; and a store whose embedding dimensions differ from the model's (RAG-ING-7). Router `auto` without `models.intent` is valid but logs a startup WARNING that routing is heuristic-only. Named variants (`news_chat`, `news_search`) share one base and differ only in their override block.
+- **Sibling engines.** `engine.with_profile(profile)` and `engine.with_store(store)` (1.2.0) return engines that share the pool, cache, gateway, registry, observers and guards, and differ only in the profile or the store. They also share the fence secret, so stateless fence ids, and with them the cacheable prompt prefix, stay the same across siblings (D-06). `with_store` is how an app serves each request from a store scoped to the signed-in user (§5.6) without building a pool per request.
 
 > **Rationale:**
 > - The 1.0.0 preset model ids were already out of date compared with what the apps run (KB-07, NF-06).
@@ -1892,7 +2051,8 @@ class EngineProfile(BaseModel):
        question=body.question, request_id=message_id,
        cursor_offset=body.position, doc_total_chars=article["total_length"],
        filters=RAGFilterSpec(doc_ids=[article_id], tenant_or_user_id=user.id,
-                             max_char_offset=body.position if body.spoiler_guard else None),
+                             # furthest point reached; the book's length when spoiler protection is off (§5.2)
+                             max_char_offset=body.furthest_position if body.spoiler_guard else article["total_length"]),
        history=thread_turns, state=thread.rag_state,
    )
    for event in engine.stream_query(req):
@@ -1902,7 +2062,7 @@ class EngineProfile(BaseModel):
 
 ### 12.4 Recipe B: NewsIntelligence
 1. **Adapter.** `PulseArchiveRAGStore(RAGStore[PulseArticleMeta])` wraps `match_intelligence_dynamic` and `fetch_deep_articles_by_ids`.
-   - Capabilities: native hybrid with raw scores, `required_filter_keys={"domain_id"}`, `supported_custom_filters={"favorites_only": bool}`, `supported_date_fields={"created_at"}` with `time_basis="created_at = ingestion time"` (feed publication dates are read at ingestion only to skip old items and are not stored).
+   - Capabilities: native hybrid with raw scores, `required_filter_keys={"tenant_or_user_id", "domain_id"}` (1.2.0: user plus domain, §6.4.2), `supported_custom_filters={"favorites_only": bool}`, `supported_date_fields={"created_at"}` with `time_basis="created_at = ingestion time"` (feed publication dates are read at ingestion only to skip old items and are not stored).
    - The existing RPC is kept. It only has to pass `RAGStoreContractTests` (adding the raw-score columns if `returns_raw_scores` is declared); it does not have to be rewritten to the §4.7 template.
    - The adapter keeps News's RPC followed by a field load and returns complete rows (§4.3): one adapter with the chat fields, one with the feed fields.
 2. **Renderer.** `PulseRenderer` provides the three existing views (embed, rerank, prompt), a URL key for dedup, `created_at` for recency, and priority as a feature.
@@ -1914,7 +2074,7 @@ class EngineProfile(BaseModel):
    resp = engine.query(req, intent=intent)
    ```
    The analytics branch stays in the app (R-06). Persona text comes from `system_prompt_variables`.
-4. **Feed search.** `engine.retrieve(req)` with the `news_search` variant (router `none`, no rerank, `retrieve_max_results` sized for the feed). See §8.10 for what stays in the app.
+4. **Feed search.** `engine.retrieve(req)` with the `news_search` variant (router `none`, no rerank, `retrieve_max_results` sized for the feed). The adapter declares `max_top_k` above `retrieve_max_results` (at least 2,001 for 2,000), or results are capped and marked `truncated` (§8.10). See §8.10 for what stays in the app.
 
 ### 12.5 Recipe C: KnowledgeBase
 1. **Store.** A Postgres adapter, or `InMemoryRAGStore` for evaluation.
@@ -1950,7 +2110,7 @@ class EngineProfile(BaseModel):
       est_input_tokens: int
       est_cost_usd: float | None      # from pricing.estimate_cost(); None when the model has no price
       request_spent: "UsageTotal"     # calls already made in this same request (or ingested section)
-      tenant_or_user_id: str | None   # from the effective filters
+      tenant_or_user_id: str | None   # from the effective filters; from the owner during ingestion (§6.4.2)
       scope: dict[str, Any]           # values of every required_filter_keys entry
       doc_ids: list[str] | None
       profile_name: str
@@ -1959,7 +2119,7 @@ class EngineProfile(BaseModel):
   - `CallContext` is the same object the trace records for the call, so a guard's decision can be matched to its trace entry. A per-user cap reads `ctx.tenant_or_user_id`.
   - It is passed to `RAGEngine(budget_guard=...)`. Caps, running totals and accounting tables stay in the app; the guard reads the app's own running total to decide.
   - With `enforces_cost=True`, engine construction fails if any bound model has no price (§13.3), because a dollar limit could not be checked for it.
-  - Ingestion calls go through the guard too (RAG-ING-12).
+  - Ingestion calls go through the guard too (RAG-ING-12), with the ingestion owner in `tenant_or_user_id` and `scope` (§6.4.2).
   - **The app decides, the engine does not guess.** `"skip"` on an optional stage (Jev, rerank, extra variants, rolling summary, ingestion summary) skips it as degradation DG-11. `"skip"` on a required stage raises `ProfileConfigError`. Raising `BudgetExceeded` aborts the request, and the exception reaches the caller.
 
 > **Rationale:** All three apps meter cost (Audio's per-user daily budget, KB's `kb_cost_log` and batch ceiling, News's per-turn cost). In 1.0.0, router and summarizer spend was invisible (AUD-10, NF-26, KB-06).
@@ -2013,6 +2173,7 @@ class RAGTrace(BaseModel):
   ```
   - **Observer errors (DG-13).** An observer is app code, for example KB writing each `StageUsage` row to `kb_cost_log`; a network error in that write raises inside the engine's request. By default (`observer_errors="log"`) the engine logs it at ERROR with the traceback, records a degradation and continues. With `observer_errors="raise"` the exception propagates to the caller.
   - Observers run synchronously in the request thread, so they MUST be fast (queue to a background worker).
+  - Ingestion (`ingest_document`, `sync_document`, `prepare_nodes`) reports `on_usage` and `on_degrade` like a query (1.2.0), so a cost log sees ingestion spend.
   - The lib depends on no vendor; apps forward to their tables, Langfuse or OpenTelemetry.
 
 > **Rationale:**
@@ -2045,6 +2206,7 @@ class RAGTrace(BaseModel):
 
 - `profile.fallbacks` turns opt-in rows on (`{"query_embedding": "keyword", "summarizer": "skip"}`) and can turn any default-on row off (`{"rerank": "raise"}`). Keys are `rerank`, `jev`, `summarizer`, `query_embedding`, `cache`, and `deadline` (DG-10); unknown keys fail `validate()`. Model lists and `observer_errors` control the generation and observer rows.
 - **Not failures, so not in the table:** empty retrieval (a normal `answer_found="no"` result, RAG-RES-4), citations that fail verification (removed or flagged per §11.2), fence-id rotation on collision (§10.4), and an opt-in relaxation step (§7.6, reported in `relaxations`).
+- **`NEVER_DEGRADABLE`** (`errors.py`, 1.2.0) lists the errors no degradation may absorb: budget, deadline, configuration, store capability, missing scope, scope violation, unsupported filter. A safety block (`GenerationError(reason="blocked")`) is never retried on another model either. An intent-model outage raises `GenerationError(reason="all_models_failed")` (DG-02 per failed model); unparseable intent output raises `IntentParseError`, which never echoes the model output.
 - **Never degradable** (always raise, whatever `fallbacks` says): store errors (`RetrievalError`, wrapping the cause), missing required scope, unsupported filters, guard errors, embedding-space mismatch, configuration errors, blocked output, and a stream that breaks after it started.
 
 **Startup validation.** The `RAGEngine` constructor runs `validate()` and raises `ProfileConfigError` listing every problem, so nothing knowable in advance becomes a per-request fallback:
@@ -2058,6 +2220,7 @@ RAGEngineError
 ├── ProfileConfigError(missing, unknown)
 ├── StoreCapabilityError
 ├── MissingRequiredScopeError
+├── ScopeViolationError(key)                # a scoped store refused another scope (§5.6)
 ├── UnsupportedFilterError
 ├── EmbeddingProviderError
 ├── EmbeddingSignatureMismatch
@@ -2141,7 +2304,7 @@ class Cache(Protocol):
 
 - **INFO summary line**, generated from the light trace:
   `[RAG] id=<request_id> profile=<name>@<version> strategy=<name> rule=<n> router=<source> nodes=<n> reranked=<bool> citations=<verified>/<raw> degr=<ids|none> tokens=<in>/<out> cost=<usd|na> ms=<total> outcome=<ok|degraded|error>`
-- **No content above DEBUG.** Raw questions, document text and answers are never logged at INFO, WARNING or ERROR. Error messages from providers are truncated to 200 characters and must not include prompt text.
+- **No content above DEBUG.** Raw questions, document text and answers are never logged at INFO, WARNING or ERROR. Error messages from providers are truncated to 200 characters and must not include prompt text. One helper, `errors.safe_message`, produces every such message (`Type: text`, one line, at most 200 characters), and `DegradationTracker.record` applies it to every `reason` and `message` (1.2.0).
 
 > **Rationale:**
 > - WARNING means "something went wrong but the configured result was still achieved"; ERROR means "the result is worse than configured, or the request failed". An operator can alert on ERROR rate alone.
@@ -2163,7 +2326,7 @@ Evaluating a RAG system is a large topic that deserves its own design session: g
 | **RAG-EVAL-2** | **Component-level invocation.** Each layer can be run and judged on its own (§14.4): retrieval only, generation over given nodes, and verification of a given answer. | §8.10, §14.4 |
 | **RAG-EVAL-3** | **Complete, serializable trace.** The verbose trace records each stage's inputs and outputs as node ids with every raw score and rank, the drop reasons, the router decision, the tier rule, the guard effects, the component versions, the model ids, `prompt_version` and the profile fingerprint. The trace is JSON-serializable and carries `trace_schema_version`. | §13.2 |
 | **RAG-EVAL-4** | **Determinism controls.** The clock is injected (`Clock`). The random source used for fence ids and ids is injectable (`rng`). Temperature comes from the profile. Parallel results are merged in submission order. No component reads wall-clock time or global randomness directly. | §7.6, §10.4, §13.4 |
-| **RAG-EVAL-5** | **Stable identities.** Node ids survive re-ingestion of unchanged content. Spans are stable coordinates for append-only documents. `revision` and `scope_stats().revision` identify content versions, and the trace records the scope revision. A golden case can therefore point at a node id or at `(doc_id, char range)` and stay valid. | §3.2, §6.6 |
+| **RAG-EVAL-5** | **Stable identities.** Node ids survive re-ingestion of unchanged content (append-only documents and unchanged sections; in-place edits renumber, §6.6). Spans are stable coordinates for append-only documents. `revision` and `scope_stats().revision` identify content versions, and the trace records the scope revision. A golden case can therefore point at a node id or at `(doc_id, char range)` and stay valid. | §3.2, §6.6 |
 | **RAG-EVAL-6** | **Comparable configurations.** Frozen profiles have a `fingerprint()`. Named variants run against the same store. `engine.with_profile(profile_or_variant)` returns a sibling engine that shares the store, registry and pool. | §12.1 |
 | **RAG-EVAL-7** | **Record and replay.** `RecordingGateway` stores every model call (stage, model, canonical input hash, output, usage) to a sink. `ReplayGateway` serves recorded outputs by the same key and fails loudly on a miss. Replaying a recorded run with the same profile, store snapshot, clock and rng reproduces the same retrieval and response. Records never contain credentials. | §2.3 |
 | **RAG-EVAL-8** | **Online tap.** `RAGObserver.on_complete` receives the trace and the outcome for every request. Sampling, storage and asynchronous judging are app-side and run outside the request path. | §13.2 |
@@ -2239,7 +2402,7 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | Provider output-limit policy (e.g. do not send `max_tokens` to Gemini where KB found it harmful; use `max_completion_tokens` for GPT reasoning models) as `LLMClient` behaviour, not a RAG rule | R-11b | P1 |
 | Provider routing for text: direct Google GenAI (`gemini-*`), direct Anthropic (`claude-*`, with `ThinkingBlock` extraction), and direct OpenAI (`gpt-*` using `OPENAI_API_KEY`). Text generation strictly uses these three standard providers; image/video/multimodal models are handled by dedicated modules (§15.2). | Ecosystem-wide LLM access | P1 |
 | `LLMClient.stream(...) -> Iterator[LLMStreamChunk]` (text deltas, then a final chunk with usage, cost and `finish_reason`) | §10.8 native streaming; a profile asking for native streaming without it fails at startup | P2 |
-| Cache breakpoint pass-through (`cache_breakpoints` → Anthropic `cache_control`; Gemini context caching where available) | §10.3; without it the layout still applies, with no explicit cache controls | P2 |
+| Cache breakpoint pass-through (`cache_breakpoints` and `user_blocks` → Anthropic `cache_control` on the system prompt and the stable user block; Gemini context caching where available) | §10.3; without it the layout still applies, with no explicit cache controls | P2 |
 
 ### 15.2 Other model modules
 - **Errors after a billed response (all model modules).** When a module raises after the provider has returned a billed response (for example `LLMClient` failing to parse structured output, or a response blocked after generation), the exception carries the `usage` of that call (`ModelCallError.usage`, with cost). A call that fails without a response (a timeout, a dropped connection) is reported with the estimated input tokens, zero output and `billing="unknown"`, so the caller decides whether to count it. This gives direct callers the same failure-path accounting as RAG (RAG-OPS-1).
@@ -2390,10 +2553,42 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-71** | Prepared nodes | RAG-ING-13, §4.6 #15 | A row inserted by the app from `prepare_nodes` is skipped by `sync_document` and `reconcile` (no re-embedding); changing the node's text makes it stale; the fingerprints equal those `upsert_section_nodes` would write. In a batch, a failed node is listed in `failed` with no vector or fingerprint, and the good nodes are returned; a batch with no success raises. |
 | **AC-RAG-72** | Flag streaming | §10.5 | `Based on…` is released at its first character with `answer_found=None`; `[Source](u)` at its second. `\n[[answer_found=partial]]\nText` emits only `Text` and sets the flag, under any chunking down to one character per chunk. `[[answer_found=maybe]]` is removed, logged at WARNING and gives `None`. A flag-like text that never closes is released at 32 characters; one still held at end of stream is released as a last delta. |
 | **AC-RAG-73** | Sentence cut | §5.2 rule 2, RAG-ING-2 | With `B` mid-sentence in English, Chinese and mixed text, the node ends at the last complete sentence before `B`, including closing quotes (`他说：“走吧。”`); `3.14` is not treated as a sentence end. `span.char_end` matches the shortened text and never exceeds `B`. A passage and a local window at the same `B` get the same cut. With no sentence end before `B`, or one more than `max_snap_back_chars` back, the cut is exactly `B`. A second guard pass changes nothing. The canary test (AC-RAG-23) passes with this cut. |
-| **AC-RAG-74** | Ranked limits | §9, §9.3 | With 30 summaries, a local window and passages, `top_k=8` keeps every summary and the window and cuts only passages. Tier 0 returns the whole scope under any strategy override or secondary query. A rerank stage receives `top_k × 3` candidates. |
+| **AC-RAG-74** | Ranked limits | §9, §9.3 | With 30 summaries, a local window and passages, `top_k=8` keeps every summary and the window and cuts only passages. When Tier 0 runs, whether chosen by the rules or by `strategy_override="full_context"`, the whole scope is returned: `top_k`, secondary queries and variant fusion never cut it. A rerank stage receives `top_k × 3` candidates. |
 | **AC-RAG-75** | Follow-up reuse | §7.7 | A follow-up with no new terms runs no search or embedding. One with new terms shares the ranked slots evenly with prior passages. A request with `cursor_offset` always gets a current local window. Repeated and oversized `prior_nodes` are capped on input. |
 | **AC-RAG-76** | History | §10.1, §10.2 | The history zone is capped by `reserved_history_tokens`. The last two exchanges are always present, shortened if oversized. Older turns are chosen by retention score and stay in chronological order. |
 | **AC-RAG-77** | Per-node preparation | §6.4.1 | `prepare_node` raises on failure. `prepare_nodes` returns the good nodes and names the failed ones, and raises only when none succeeded. |
+| **AC-RAG-78** | Section write | §4.4.1 | A store that overrides only `upsert_section` and a store that implements only `upsert_section_nodes` both ingest a three-unit section correctly. `unit_seq` equals the index in each unit's id; with the middle unit skipped (DG-14) the units are 0 and 2. (Audio's AC-RAG-A33.) |
+| **AC-RAG-79** | Summary vectors | §6.3 | With `embed_summaries=False` no `summary_embedding` call is made and every `SummaryWrite.vector` is `None`; with a store that does not override `upsert_section` the engine refuses to start. With it on, a section's summaries are embedded in one call. (A34.) |
+| **AC-RAG-80** | Engine fingerprints | §4.4.1, §6.6 | A store that persists only the fingerprints it is given (and never computes one) reports not stale after `ingest_document` and after `sync_document`. Changing the splitter version or the analyzer version makes exactly the matching flag true. `parse_node_id(doc, format_node_id(...))` round-trips, also for a doc id containing `#`, and returns `None` for an app-built id. (A35.) |
+| **AC-RAG-81** | Ingestion owner | §6.4.2 | Without a required owner key, `ingest_document`, `sync_document` and `prepare_nodes` raise `MissingRequiredScopeError` before any model call; `doc_ids` is never required of the owner. A guard sees `ctx.tenant_or_user_id` on every ingestion call and stops the third paid call with nothing written. The owner reaches `SectionWrite.owner`. Observers receive ingestion usage. Each `prepare_nodes` call has its own request id. (A36.) |
+| **AC-RAG-82** | Scoped stores | §5.6, §12.1 | A `ScopeViolationError` raised by a store reaches the caller of `retrieve` unchanged. `engine.with_store(s)` uses `s` and shares the pool, cache, gateway and profile. |
+| **AC-RAG-83** | Kit with scope | §4.6 | A store with `required_filter_keys={"tenant_or_user_id", "doc_ids"}` passes the full kit with `make_owner()` overridden, including check 16 through `make_scoped_store`. A scoped in-memory view refuses fingerprint lookups and deletes on another owner's document. (A37.) |
+| **AC-RAG-84** | Stats match scope | §4.2, §8.2 | Kit check 17 fails a store whose `scope_stats` reports zero while `fetch_full_scope` returns text. With `doc_total_chars` set and zero stats, the plan is not Tier 0, a WARNING is logged and `tier_decision_reason` names `scope_stats`. (A38.) |
+| **AC-RAG-85** | Full-scope granularity | §4.2 | Kit check 18 fails a store that returns one node for a two-section scope. (A39.) |
+| **AC-RAG-86** | Stream lifecycle | §10.8 | Leaving a `with engine.stream_query(...)` block after the first delta reads no further model output, `usage_total` includes the cancelled call, and a second `close()` is harmless. (A40.) |
+| **AC-RAG-87** | Caller contract | §10.8 | With a model that emits no flag, `done.data["answer_found"]` is `None`; `done` echoes `request_id` and `metadata["message_id"]`; `answer_final` holds no flag text. (A41.) |
+| **AC-RAG-88** | Platform | header | `pyproject.toml` requires Python >= 3.13. |
+| **AC-RAG-89** | Sync after upgrade | §6.6 | After an embedding-signature change, `sync_document` clears `embeddings_stale` for passages and summaries, re-embedding kept summaries from their stored text with no summary model call; a store without `fetch_nodes` regenerates them. After an analyzer change, sync clears `fts_stale`. A splitter version change is detected on a store that declares no `splitter_version`. |
+| **AC-RAG-90** | Rows without vectors | §6.6 | With `embed_summaries=False` every summary is written with `embedding_signature=None` and never makes the document stale, also after an upgrade. Switching the profile to embed summaries makes them stale, and sync embeds them. |
+| **AC-RAG-91** | Revision and task type | §6.4, §6.6 | Every node from `ingest_document` carries the document's `revision`, returned by `current_revisions`. The embedder uses the store's `task_type_documents`. |
+| **AC-RAG-92** | Cross-owner writes | §5.6, §4.6 | A store scoped to user B cannot ingest into a document user A owns, and the base store never moves a document to another owner; A's text is unchanged. Kit check 16 runs over two views of one store. |
+| **AC-RAG-93** | Fail-closed scope | §4.5 | On a store with a required tenant, a row with no owner never matches a tenant filter; on a store without one, it still does. |
+| **AC-RAG-94** | Required boundary | §5.2 | With `long_form_reader`, a request without `max_char_offset` raises `MissingRequiredScopeError`; the document length as boundary is accepted; a per-document map missing a document in scope raises. |
+| **AC-RAG-95** | Guard inputs | §5.1, §12.1 | The temporal guard dates a node by its `date_field`, else `renderer.timestamp`, and drops an undated node unless the store applied the filter. `with_store` and `with_profile` siblings share the fence secret. |
+| **AC-RAG-96** | Empty scope | §5.5 | A store requiring `doc_ids`, with request `doc_ids=["a"]` and `document_id="b"`: `retrieve` returns no nodes and `plan()` returns `none` with no store call; a request that omits the key still raises `MissingRequiredScopeError`. |
+| **AC-RAG-97** | Date windows | §5.5, §7.6 | Hard range Jan–Jun plus intent window Jun 1–7 applies Jun 1–7; a window outside the hard range leaves the hard range. Relaxation widens or drops back to the hard range, never past it. `date_window_days=3` under a frozen clock gives `[now-3d, now]`; a reversed range is repaired. |
+| **AC-RAG-98** | Layer selection | §4.2, §8.6 | Ranked searches return no summaries. Tier 3 returns the section summary or its units, never both. Full scope has no overlapping text and `scope_stats` measures the same text. |
+| **AC-RAG-99** | Ranking contract | §3.3, §8.2, §9 | Reranking a comparison scores each subject against its own variant and keeps both. Boosters leave an ordered node in place with its score. Tier 0 keeps an `entry` atomic, flags it `full_scope`, and never ranks it. The engine never requests more than `max_top_k` rows and marks the result truncated. `threshold(rerank)` without a rerank stage fails at startup. Summaries over budget drop oldest first. |
+| **AC-RAG-100** | Citation markers | §11.1 | `张三是主角[1]。`, `city[1].` and `(table)[1].` cite node 1; `arr[3]` that resolves to nothing stays as text; an offset marker found in two documents is unverified. |
+| **AC-RAG-101** | Quotes and links | §11.3, §11.6 | A citation without a written quote keeps its verification; a fabricated quote fails. Reference-style image definitions and autolinks to untrusted hosts are removed. |
+| **AC-RAG-102** | Summarizer | §6.3 | The prompt forbids prior knowledge and the source arrives fenced. Under `skip`, one failed unit gives `summary_status="partial"`; a `ProfileConfigError` still propagates. A section longer than four units is never sent whole. |
+| **AC-RAG-103** | Errors and config | §12.1, §13.3, §13.8 | Degradation reasons are one line of at most 200 characters. An intent outage raises `GenerationError`, unparseable output `IntentParseError` without the output text. Unknown fallback values and unimplemented citation policies fail validation. The fingerprint ignores dict order. `prepare_nodes` failures carry a reason. Ingestion uses `profile.ingestion.granularity`. |
+| **AC-RAG-104** | Store and stream hygiene | §4.5, §10.8 | `to_jsonl`/`from_jsonl` keep stored fingerprints and owners. `delete_document` counts summaries and clears owners. A paragraph break ends a sentence. `generate_from_nodes` honours `request.variant`. |
+| **AC-RAG-105** | Kit strength | §4.6 | Checks 19–24 pass for the reference store with and without a required tenant; checks 17–18 run on overlapping passages. |
+| **AC-RAG-106** | SQL templates | §4.7 | The upsert template contains no DELETE in `upsert_section` and refuses another owner; every template function pins `search_path` and filters on the owner; searches return passages only with chunk-relative slicing; summaries are admitted by `char_end`; fingerprints are stored, not rebuilt. |
+| **AC-RAG-107** | Caching blocks | §10.3, §15 | With Tier 0 text, `user_blocks` join to `user_message`, the first is cacheable and holds the stable data, the last holds the question; Claude content marks only that block; the gateway passes the blocks to the client. |
+| **AC-RAG-108** | P1 gaps | §5.5, §10.10, §2.5 | `degradation_disclosure="note"` puts the impacts in the volatile part of the prompt, `"silent"` does not. A `FilterInferencer` narrows the scope and cannot widen it. `rag-cjk` and `rag-eval` extras are declared. |
+| **AC-RAG-109** | Summary search tokens | §6.6 | On a store with analyzer tokens, summaries are written with `fts_signature=None`, passages with the analyzer's signature; `needs_reindex` reports nothing stale and an unchanged sync writes nothing. Every SQL template starts with the migration checklist and pins `search_path = public, extensions, pg_temp`. |
 
 ### 16.2 Delivery phases (Q-04)
 Delivery follows production need: first what both production apps share, then AudioReading (which has no RAG today), then the NewsIntelligence migration, then KnowledgeBase (still in development, so the easiest to adapt) and everything else. Each step ends with every existing `cody-ai-shared-lib` test and every new `tests/rag/` test passing.
@@ -2548,6 +2743,7 @@ Each entry: the decision, the alternative rejected, and why. Sections refer here
 | **Q-07** | Keep the Jev gate in v1 | §7.4, D-14 | **Decided:** kept, default off, opt-in per app |
 | **Q-08** | Feed search through the engine | §8.10, §12.4, D-21 | **Decided:** in scope as ranked retrieval; search-product features stay in the app |
 | **Failure model** | Agreed with the owner, 2026-11-07 | §13.3, §13.8, D-09 | **Decided:** closed list of agreed degradations; everything else raises |
+| **OI-1** | Per-engine granularity registry | §3.3 | **Recorded, not prioritized (owner, 2026-11-11):** granularities live in one process-wide table; per-engine tables when one process needs different traits for the same name |
 | **Pushbacks** | Requests kept in the apps | Appendix C | **Decided by the owner:** all upheld; sent to the app agents for agreement |
 
 ---
@@ -2616,6 +2812,7 @@ Each entry: the decision, the alternative rejected, and why. Sections refer here
 | **1.1.12-draft** | 2026-11-08 | cody-ai-shared-lib agent | Minor contract alignment from Phase 1–3 code review: added `"degradation"` to `RAGStreamEvent.event` in §3.11 (matching §10.8); added `doc_id: str | None = None` to `ReindexStatus` in §6.6; noted single-argument `(ctx: CallContext)` support on `BudgetGuard.before_call` in §13.1. |
 | **1.1.13-draft** | 2026-11-08 | cody-ai-shared-lib agent | `BudgetGuard.before_call` returns to the single five-argument signature; the optional one-argument form added in 1.1.12 is removed. |
 | **1.1.14-draft** | 2026-11-08 | cody-ai-shared-lib agent | Owner decisions after the Phase 1–3 review; **changes the contract the app agents agreed through 1.1.8.** Separate hydration removed: retrieval methods return complete rows, and apps choose fields through their adapter and renderer (§4.3). Embedding failures are all-or-nothing per section or single node, and per node in `prepare_nodes`, which now returns `PreparedBatch` (§6.4, §6.4.1, DG-08); `ingest_embedding` and `passages_failed` removed. `entity_mode="boost"` and `EntityBooster` removed; the default is `"ignore"`. `retrieval.rerank_candidates` added; `top_k`, rerank and variant fusion limit only ranked nodes. Follow-up reuse rule defined (§7.7). History capped by `reserved_history_tokens`, default 8,000. `no_retrieval` returns `answer_found=None`. Fence id is 16 hex; stateless ids derive from the request scope. `fallbacks` keys `intent`, `generation` and `observer` removed. `router` selection and layout corrected to match the code; `transforms/` and `postretrieval/` are the package names; `TransformContext` defined. Acceptance criteria added and revised. |
+| **1.2.0-draft** | 2026-11-11 | cody-ai-shared-lib agent | AudioReading integration feedback round 2 (INT-01..INT-09), agreed with its agent and the owner; the working files were removed after agreement (git history, commit `37d76fd`). All changes are additive. **Writes:** `RAGStore.upsert_section(SectionWrite)` with `OwnerScope`, `SummaryWrite` and `PreparedNode` passages; the default delegates to the unchanged `upsert_section_nodes`; the engine writes through it from `ingest_document` and `sync_document`, and the store persists the engine's fingerprints instead of computing them (§4.4.1). `unit_seq` is 0-based and gaps are allowed. Node ids are opaque keys to stores; `format_node_id` and `parse_node_id(doc_id, …)` are public. **Summaries:** `ingestion.summaries.embed_summaries` (default `True`); summaries are embedded in one batch (§6.3). **Ownership:** an `owner` on `ingest_document`, `sync_document` and `prepare_nodes`, required for every `required_filter_keys` entry (`doc_ids` excepted) and carried to `CallContext`, `SectionWrite` and observers (§6.4.2); isolation keys per app settled with the owner (News: user plus domain). Scoped stores, `ScopeViolationError` and `engine.with_store` (§5.6, §12.1); `InMemoryRAGStore` records owners and offers `scoped()`. **Kit:** `make_owner`, `make_filters`, `make_scoped_store` and `full_scope_filters` hooks; writes go through `upsert_section`; check 15 now checks fingerprints are persisted as given; checks 16–18 added (§4.6). **Contract text:** `scope_stats` describes what `fetch_full_scope` returns, with a WARNING when a caller hint disagrees (§4.2, §8.2); `fetch_full_scope` never crosses a section boundary (§4.2). **Streaming:** `RAGStream` is a context manager; `usage_total` is final after end or close; `done` carries `request_id`; a caller-contract box in §10.8. Audio's proposed AC-RAG-A33..A41 became AC-RAG-78..87. **Independent code review (2026-11-11), agreed with the owner:** Python ≥ 3.13; sync refreshes kept summaries and FTS tokens, and rows stored without a vector carry `embedding_signature=None`; `splitter_version` defaults to `None`; nodes carry the document `revision`; scoped stores refuse writes into another owner's document, rows without an owner fail closed on required keys, and a profile that requires the spoiler guard rejects a request with no boundary (the boundary is the furthest point reached, owner decision); explicit `empty_scope`; date windows intersect the hard range; ranked searches exclude summaries; Tier 3 keeps section or unit summaries, never both; full scope is de-overlapped; rerank per comparison variant; boosters and fusion leave ordered layers alone; Tier 0 flags `full_scope` and keeps atomic kinds whole; citation markers resolve regardless of the preceding character; summarizer forbids prior knowledge and fences its input; bounded error messages; structured cacheable prompt blocks for Claude; SQL templates rewritten; kit checks 19–24; `degradation_disclosure`, `FilterInferencer` and the optional extras built. AC-RAG-88..108. Positional node ids (§6.6) and whole-document sync are documented as intended. **AudioReading's reply to the review update:** summaries carry no search-token signature; template `search_path` includes `extensions`; a migration checklist heads every template (AC-RAG-109). The process-wide granularity table is recorded as Open Item OI-1. |
 
 ## Appendix C. Requests kept in the apps (pushbacks)
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable
 
-from .errors import DeadlineExceeded
+from .errors import DeadlineExceeded, safe_message
 from .models import Degradation
 
 logger = logging.getLogger("shared-rag")
@@ -144,6 +144,8 @@ class DegradationTracker:
         spec = AGREED_DEGRADATIONS.get(dg_id, {})
         log_level = spec.get("log_level", logging.WARNING)
 
+        reason = safe_message(reason)                     # every degradation is bounded (§13.8)
+        message = safe_message(message) if message is not None else None
         deg = Degradation(
             id=dg_id,
             stage=stage,

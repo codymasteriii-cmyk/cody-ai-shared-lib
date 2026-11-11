@@ -116,7 +116,7 @@ class CjkAwareAnalyzer:
         i = sent_start
         while i < n:
             # Check double newline (paragraph break)
-            if text[i : i + 2] == "\n\n":
+            if text[i : i + 2] == "\n\n" or text[i : i + 4] == "\r\n\r\n":
                 # Sentence ends before \n\n
                 sent_end = i
                 if sent_end > sent_start:
@@ -203,6 +203,9 @@ class CjkAwareAnalyzer:
         raw_slice = text[last_start:last_end].rstrip()
         if not raw_slice:
             return None
+        # A paragraph that ends in a blank line is complete, even without terminal punctuation
+        if text.startswith("\n\n", last_end) or text.startswith("\r\n\r\n", last_end):
+            return last_end
 
         # Does raw_slice end with a terminator or closing punct?
         has_terminator = False

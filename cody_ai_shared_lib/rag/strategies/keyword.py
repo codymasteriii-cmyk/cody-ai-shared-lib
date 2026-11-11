@@ -35,15 +35,18 @@ class KeywordFirstStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
     version: ClassVar[str] = "1.0.0"
     requires: ClassVar[frozenset[str]] = frozenset(["supports_keyword_fts"])
 
-    def __init__(self, min_hits: int = 3):
-        self.min_hits = min_hits
+    def __init__(self, min_hits: int | None = None):
+        self.min_hits = min_hits                  # None: profile.retrieval.keyword_first_min_hits
 
     def retrieve(self, ctx: RetrievalContext[MetaT]) -> list[RAGNode[MetaT]]:
         caps = ctx.store.capabilities()
         if not self.is_runnable(caps):
             raise StoreCapabilityError("KeywordFirstStrategy requires store capability 'supports_keyword_fts'")
 
+        min_hits = self.min_hits if self.min_hits is not None else ctx.profile.retrieval.keyword_first_min_hits
         hits = _keyword_hits(ctx)
-        if len(hits) >= self.min_hits or not HybridRRFStrategy.is_runnable(caps):
+        if len(hits) >= min_hits or not HybridRRFStrategy.is_runnable(caps):
             return hits
+        reason = f"keyword_first: {len(hits)} keyword hits < min_hits {min_hits}; fell back to hybrid_rrf"
+        ctx.last_tier_reason = f"{ctx.last_tier_reason}; {reason}" if ctx.last_tier_reason else reason
         return HybridRRFStrategy().retrieve(ctx)

@@ -78,6 +78,17 @@ ZERO = [0.0] * DIM
 SIMPLE_MODELS = ModelBindings(generation=["m"], embedding="gemini-embedding-2")
 RERANK_MODELS = ModelBindings(generation=["m"], embedding="gemini-embedding-2", reranker="jina-reranker")
 
+_long_form_reader_preset = long_form_reader
+
+
+def long_form_reader(*args, **kwargs):
+    """The AudioReading preset without a required spoiler boundary.
+
+    These tests are not about spoilers. Since 1.2.0 the preset rejects a request without a boundary
+    (review item M23); a test that sends a boundary still gets the guard, built from its filters.
+    """
+    return _long_form_reader_preset(*args, **{"guards": [], **kwargs})
+
 
 class ArticleMeta(BaseModel):
     url: str = ""
@@ -194,7 +205,7 @@ def test_custom_metadata_survives_every_summary_kind():
     eng = engine(profile(models=models, ingestion=IngestionConfig(splitter="pass_through", summaries=summaries)), InMemoryRAGStore())
 
     result = eng.summarizer.summarize_section(
-        "z", 0, None, "One sentence here. Another sentence there. " * 4, 0, ArticleMeta(url="u"), None, *eng._ingestion_trackers("r", "z")
+        "z", 0, None, "One sentence here. Another sentence there. " * 4, 0, ArticleMeta(url="u"), None, *eng._ingestion_trackers("r", ["z"], None)
     )
     assert isinstance(result.section_summary.metadata, ArticleMeta)
     assert result.unit_summaries and all(isinstance(u.metadata, ArticleMeta) for u in result.unit_summaries)
@@ -481,7 +492,7 @@ def test_strip_markers_for_streaming():
 
 
 class BrokenWrites(InMemoryRAGStore):
-    def upsert_section_nodes(self, *args, **kwargs):
+    def upsert_section(self, *args, **kwargs):
         raise OSError("disk full")
 
 

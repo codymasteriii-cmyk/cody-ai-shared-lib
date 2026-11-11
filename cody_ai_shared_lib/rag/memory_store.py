@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Generic
 
-from .errors import EmbeddingProviderError
+from .errors import EmbeddingProviderError, ScopeViolationError
 from .granularity import TRAIT_OFFSET_ADDRESSABLE, has_trait
 from .models import (
     DefaultNodeMeta,
@@ -33,13 +33,18 @@ from .models import (
 from .ports import (
     EmbeddingSpace,
     Fingerprint,
+    OwnerScope,
     RAGStore,
     ScopeStats,
+    SectionWrite,
     StoreCapabilities,
     validate_scope,
 )
 from .text.analyzer import CjkAwareAnalyzer, TokenGroup, estimate_tokens
 from .vectors import is_zero_vector
+
+# One node to write: the node, its vector (None for an unembedded summary) and its fingerprint (None: compute)
+_Entry = tuple[RAGNode[MetaT], "list[float] | None", "Fingerprint | None"]
 
 
 class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
@@ -77,7 +82,6 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             model="gemini-embedding-2",
             dims=768,
             task_type_documents="RETRIEVAL_DOCUMENT",
-            splitter_version="1.0.0",
         )
         self.analyzer = analyzer or CjkAwareAnalyzer()
         self._lock = threading.RLock()
@@ -89,6 +93,9 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         self._section_nodes: dict[tuple[str, int], list[str]] = {}
         # (doc_id, section_seq) -> RAGNode[MetaT] (summary)
         self._section_summaries: dict[tuple[str, int], RAGNode[MetaT]] = {}
+        # node_id -> the owner it was written for, and doc_id -> its owner (§6.4.2)
+        self._owners: dict[str, OwnerScope] = {}
+        self._doc_owners: dict[str, OwnerScope] = {}
         # doc_id -> {node_id: Fingerprint}
         self._fingerprints: dict[str, dict[str, Fingerprint]] = {}
         # Store-level revision counter
@@ -106,13 +113,18 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         """Enforce required filter keys and supported custom filter types."""
         validate_scope(filters, self._capabilities)
 
+    def _is_required(self, key: str) -> bool:
+        required = self._capabilities.required_filter_keys
+        return key in required or (key == "tenant_or_user_id" and "tenant_id" in required)
+
     def _passes_filters(self, node: RAGNode[MetaT], filters: RAGFilterSpec) -> bool:
         """Return True if node matches all criteria in filters."""
         # doc_ids filter
         if filters.doc_ids is not None and node.span.doc_id not in filters.doc_ids:
             return False
 
-        # tenant_or_user_id
+        # tenant_or_user_id: from the node's metadata, else from the owner it was written for (§6.4.2)
+        owner = self._owners.get(node.node_id)
         if filters.tenant_or_user_id is not None:
             extra = getattr(node.metadata, "extra", {}) if hasattr(node.metadata, "extra") else {}
             if isinstance(node.metadata, dict):
@@ -121,6 +133,10 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                 node_tenant = getattr(node.metadata, "tenant_id", None) or (
                     extra.get("tenant_id") if isinstance(extra, dict) else None
                 )
+            if node_tenant is None and owner is not None:
+                node_tenant = owner.tenant_or_user_id
+            if node_tenant is None and self._is_required("tenant_or_user_id"):
+                return False                   # fail closed: a row with no owner never matches a required scope
             if node_tenant is not None and node_tenant != filters.tenant_or_user_id:
                 return False
 
@@ -133,6 +149,10 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                 node_domain = getattr(node.metadata, "domain_id", None) or (
                     extra.get("domain_id") if isinstance(extra, dict) else None
                 )
+            if node_domain is None and owner is not None:
+                node_domain = owner.domain_id
+            if node_domain is None and self._is_required("domain_id"):
+                return False
             if node_domain is not None and node_domain != filters.domain_id:
                 return False
 
@@ -266,19 +286,20 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         with self._lock:
             candidates: list[tuple[float, RAGNode[MetaT]]] = []
             for node in self._nodes.values():
-                if not self._passes_filters(node, filters):
-                    continue
+                if node.is_summary or not self._passes_filters(node, filters):
+                    continue                     # ranked searches never return summaries (§4.2)
                 if is_zero_vector(node.embedding):
                     continue
                 sim = self._cosine_similarity(query_vector, node.embedding)
                 if filters.min_similarity is not None and sim < filters.min_similarity:
                     continue
-                candidates.append((sim, copy.deepcopy(node)))
+                candidates.append((sim, node))
 
             # Sort descending by cosine similarity, break ties stably by node_id
             candidates.sort(key=lambda item: (-item[0], item[1].node_id))
             results: list[RAGNode[MetaT]] = []
-            for rank, (score, node) in enumerate(candidates[:top_k], start=1):
+            for rank, (score, stored) in enumerate(candidates[:top_k], start=1):
+                node = copy.deepcopy(stored)     # never mutate the stored row
                 node.score = score
                 node.score_kind = "cosine"
                 node.vector_score = score
@@ -303,8 +324,8 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         with self._lock:
             matched = []
             for node in self._nodes.values():
-                if not self._passes_filters(node, filters):
-                    continue
+                if node.is_summary or not self._passes_filters(node, filters):
+                    continue                     # ranked searches never return summaries (§4.2)
                 tokens = self._node_tokens(node)
                 if all(self._matches_group(tokens, group) for group in groups if group.tokens):
                     matched.append((node, tokens))
@@ -463,12 +484,35 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             )
             return [window_node]
 
+    def _full_scope(self, filters: RAGFilterSpec) -> list[RAGNode[MetaT]]:
+        """The scope's text in document order, without overlap (§4.2).
+
+        Passages overlap by design; each one contributes only the text after the previous one ended,
+        as fetch_local_window does. scope_stats measures this same list, so the two always agree.
+        """
+        matched = sorted(
+            (n for n in self._nodes.values() if self._passes_filters(n, filters) and not n.is_summary),
+            key=lambda n: (n.span.doc_id, n.span.section_seq, n.span.char_start),
+        )
+        stitched: list[RAGNode[MetaT]] = []
+        prev_doc, prev_end = None, 0
+        for node in matched:
+            trim = prev_end - node.span.char_start if node.span.doc_id == prev_doc else 0
+            if trim >= len(node.text):
+                continue
+            copy_node = copy.deepcopy(node)
+            if trim > 0:
+                copy_node.text = copy_node.text[trim:]
+                copy_node.span = copy_node.span.model_copy(update={"char_start": node.span.char_start + trim})
+                copy_node.token_estimate = estimate_tokens(copy_node.text)
+            stitched.append(copy_node)
+            prev_doc, prev_end = node.span.doc_id, max(prev_end if node.span.doc_id == prev_doc else 0, node.span.char_end)
+        return stitched
+
     def scope_stats(self, filters: RAGFilterSpec) -> ScopeStats:
         self._validate_filters(filters)
         with self._lock:
-            matched_nodes = [
-                n for n in self._nodes.values() if self._passes_filters(n, filters) and not n.is_summary
-            ]
+            matched_nodes = self._full_scope(filters)
             docs = {n.span.doc_id for n in matched_nodes}
             char_count = sum(len(n.text) for n in matched_nodes)
             est_tok = sum(
@@ -491,12 +535,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
     def fetch_full_scope(self, filters: RAGFilterSpec) -> list[RAGNode[MetaT]]:
         self._validate_filters(filters)
         with self._lock:
-            matched = [
-                copy.deepcopy(n) for n in self._nodes.values()
-                if self._passes_filters(n, filters) and not n.is_summary
-            ]
-            matched.sort(key=lambda n: (n.span.doc_id, n.span.section_seq, n.span.char_start))
-            return matched
+            return self._full_scope(filters)
 
     def fetch_nodes(self, node_ids: list[str], filters: RAGFilterSpec) -> list[RAGNode[MetaT]]:
         self._validate_filters(filters)
@@ -519,16 +558,56 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         embeddings: list[list[float]] | None = None,
         summary: RAGNode[MetaT] | None = None,
     ) -> int:
-        """Atomic upsert of section passages and summary (RAG-ING-10)."""
+        """Legacy write (RAG-ING-10): the store computes fingerprints itself. The engine uses upsert_section."""
+        if embeddings is None:
+            embeddings = [n.embedding or [0.0] * self._embedding_space.dims for n in nodes]
+        entries: list[_Entry[MetaT]] = [(node, emb, None) for node, emb in zip(nodes, embeddings)]
+        section: _Entry[MetaT] | None = (summary, summary.embedding, None) if summary is not None else None
+        return self._write_section(doc_id, section_seq, entries, section)
+
+    def upsert_section(self, write: SectionWrite[MetaT]) -> int:
+        """Atomic section write that persists the fingerprints the engine computed (§4.4, §6.6)."""
+        entries: list[_Entry[MetaT]] = [(p.node, p.vector, p.fingerprint) for p in write.passages]
+        entries += [(u.node, u.vector, u.fingerprint) for u in write.unit_summaries]
+        summary = write.section_summary
+        section: _Entry[MetaT] | None = (
+            (summary.node, summary.vector, summary.fingerprint) if summary is not None else None
+        )
+        with self._lock:
+            existing = self._doc_owners.get(write.doc_id)
+            if existing is not None and write.owner.as_scope() and existing != write.owner:
+                raise ScopeViolationError(
+                    f"Document {write.doc_id!r} belongs to another owner; a write never moves it (§5.6)",
+                    key="tenant_or_user_id",
+                )
+            if write.owner.as_scope():
+                self._doc_owners[write.doc_id] = write.owner
+                for node_id in [e[0].node_id for e in entries] + ([summary.node.node_id] if summary else []):
+                    self._owners[node_id] = write.owner
+            return self._write_section(write.doc_id, write.section_seq, entries, section)
+
+    def doc_owner(self, doc_id: str) -> OwnerScope | None:
+        """The owner the document was last written for, if any."""
+        with self._lock:
+            return self._doc_owners.get(doc_id)
+
+    def scoped(self, owner: OwnerScope) -> "ScopedInMemoryRAGStore[MetaT]":
+        """A view of this store that serves only `owner`'s scope (§5.6 reference implementation)."""
+        return ScopedInMemoryRAGStore(self, owner)
+
+    def _write_section(
+        self,
+        doc_id: str,
+        section_seq: int,
+        entries: list[_Entry[MetaT]],
+        summary: _Entry[MetaT] | None,
+    ) -> int:
+        """Write one section under the lock, so a reader sees all of it or none (RAG-ING-10)."""
         with self._lock:
             written_ids: list[str] = []
             doc_fprints = self._fingerprints.setdefault(doc_id, {})
 
-            if embeddings is None:
-                embeddings = [n.embedding or [0.0] * self._embedding_space.dims for n in nodes]
-
-            # Prepare all passage nodes with embeddings and signatures
-            for node, emb in zip(nodes, embeddings):
+            for node, emb, fingerprint in entries:
                 node_copy = copy.deepcopy(node)
                 if not node_copy.span.doc_id and doc_id:
                     node_copy.span.doc_id = doc_id
@@ -540,21 +619,22 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
 
                 self._nodes[node_copy.node_id] = node_copy
                 written_ids.append(node_copy.node_id)
-
-                doc_fprints[node_copy.node_id] = self._fingerprint(node_copy)
+                doc_fprints[node_copy.node_id] = fingerprint or self._fingerprint(node_copy)
 
             # A partial upsert (sync) adds to the section; it does not replace it
             existing_ids = self._section_nodes.get((doc_id, section_seq), [])
             self._section_nodes[(doc_id, section_seq)] = list(dict.fromkeys(existing_ids + written_ids))
 
             if summary is not None:
-                sum_copy = copy.deepcopy(summary)
+                summary_node, summary_vector, summary_fingerprint = summary
+                sum_copy = copy.deepcopy(summary_node)
                 if not sum_copy.span.doc_id and doc_id:
                     sum_copy.span.doc_id = doc_id
                 sum_copy.is_summary = True
+                sum_copy.embedding = summary_vector
                 sum_copy.content_hash = sum_copy.content_hash or self._hash_text(sum_copy.text)
                 self._section_summaries[(doc_id, section_seq)] = sum_copy
-                doc_fprints[sum_copy.node_id] = self._fingerprint(sum_copy)
+                doc_fprints[sum_copy.node_id] = summary_fingerprint or self._fingerprint(sum_copy)
 
             self._revision_counter += 1
             return len(written_ids)
@@ -567,7 +647,8 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         uses_tokens = self._capabilities.uses_analyzer_tokens
         return Fingerprint(
             content_hash=node.content_hash or self._hash_text(node.text),
-            embedding_signature=f"{space.model}|{space.dims}|{space.task_type_documents}|{space.splitter_version}",
+            # Legacy writes carry no fingerprint; a store cannot know the splitter, so it says so
+            embedding_signature=f"{space.model}|{space.dims}|{space.task_type_documents}|{space.splitter_version or 'unspecified'}",
             fts_signature=f"{self.analyzer.name}|{self.analyzer.version}" if uses_tokens else None,
         )
 
@@ -582,6 +663,10 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                 if nid in self._nodes:
                     node = self._nodes.pop(nid)
                     self._fingerprints.get(node.span.doc_id, {}).pop(nid, None)
+                    self._owners.pop(nid, None)
+                    key = (node.span.doc_id, node.span.section_seq)
+                    if key in self._section_nodes:
+                        self._section_nodes[key] = [i for i in self._section_nodes[key] if i != nid]
                     deleted += 1
 
             targets = set(node_ids)
@@ -598,12 +683,17 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             to_delete = [nid for nid, n in self._nodes.items() if n.span.doc_id == doc_id]
             for nid in to_delete:
                 del self._nodes[nid]
+                self._owners.pop(nid, None)
             self._fingerprints.pop(doc_id, None)
+            self._doc_owners.pop(doc_id, None)
+            for key in [k for k in self._section_nodes if k[0] == doc_id]:
+                del self._section_nodes[key]
             sec_keys = [k for k in self._section_summaries if k[0] == doc_id]
             for k in sec_keys:
+                self._owners.pop(self._section_summaries[k].node_id, None)
                 del self._section_summaries[k]
             self._revision_counter += 1
-            return len(to_delete)
+            return len(to_delete) + len(sec_keys)       # same counting as delete_nodes
 
     def delete_sections(self, doc_id: str, from_seq: int) -> int:
         with self._lock:
@@ -639,6 +729,8 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                 "_kind": "header",
                 "embedding_space": self._embedding_space.model_dump(mode="json"),
                 "revision_counter": self._revision_counter,
+                "doc_owners": {d: o.model_dump(mode="json") for d, o in self._doc_owners.items()},
+                "node_owners": {n: o.model_dump(mode="json") for n, o in self._owners.items()},
             }
             lines.append(json.dumps(header, ensure_ascii=False))
             for nid, node in self._nodes.items():
@@ -656,7 +748,12 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                     "doc_id": doc_id,
                     "section_seq": sec_seq,
                     "node": sum_node.model_dump(mode="json"),
-                    "fingerprint": self._fingerprint(sum_node).model_dump(mode="json"),
+                    # the stored fingerprint, as written by the engine; recomputing it would lose it
+                    "fingerprint": (
+                        fp.model_dump(mode="json")
+                        if (fp := self._fingerprints.get(doc_id, {}).get(sum_node.node_id)) is not None
+                        else None
+                    ),
                 }
                 lines.append(json.dumps(row, ensure_ascii=False))
             file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -673,6 +770,8 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         raw_lines = [ln.strip() for ln in file_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
         emb_space: EmbeddingSpace | None = None
         rev_counter = 1
+        doc_owners: dict[str, Any] = {}
+        node_owners: dict[str, Any] = {}
         nodes_to_load: list[tuple[RAGNode[Any], Fingerprint | None]] = []
         summaries_to_load: list[tuple[str, int, RAGNode[Any]]] = []
         summary_fingerprints: list[tuple[str, str, Fingerprint]] = []
@@ -684,6 +783,8 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
                 if "embedding_space" in record and record["embedding_space"]:
                     emb_space = EmbeddingSpace.model_validate(record["embedding_space"])
                 rev_counter = int(record.get("revision_counter", 1))
+                doc_owners = record.get("doc_owners") or {}
+                node_owners = record.get("node_owners") or {}
             elif kind == "node":
                 node = RAGNode.model_validate(record["node"])
                 fp = Fingerprint.model_validate(record["fingerprint"]) if record.get("fingerprint") else None
@@ -713,4 +814,115 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             store._section_summaries[(doc_id, sec_seq)] = s_node
         for doc_id, node_id, fp in summary_fingerprints:
             store._fingerprints.setdefault(doc_id, {})[node_id] = fp
+        store._doc_owners = {d: OwnerScope.model_validate(o) for d, o in doc_owners.items()}
+        store._owners = {n: OwnerScope.model_validate(o) for n, o in node_owners.items()}
         return store
+
+
+class ScopedInMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
+    """A view of an InMemoryRAGStore bound to one owner: the §5.6 scoped-store pattern, in reference form.
+
+    Every read must name the bound scope (a filter that names another value raises ScopeViolationError),
+    and the bound values are always applied, so a read never sees another owner's rows. Writes must
+    carry the bound owner. Lifecycle calls on a document written for another owner are refused.
+    A real adapter does the same against its database, with the owner taken from the verified session.
+    """
+
+    def __init__(self, inner: InMemoryRAGStore[MetaT], owner: OwnerScope):
+        self.inner = inner
+        self.owner = owner
+
+    # ── scope checks ──────────────────────────────────────────────────────
+
+    def _bound(self) -> dict[str, Any]:
+        return self.owner.as_scope()
+
+    def _scoped_filters(self, filters: RAGFilterSpec) -> RAGFilterSpec:
+        update: dict[str, Any] = {}
+        custom = dict(filters.custom)
+        for key, bound in self._bound().items():
+            stated = getattr(filters, key, None) if key in ("tenant_or_user_id", "domain_id") else custom.get(key)
+            if stated is not None and stated != bound:
+                raise ScopeViolationError(f"Store is scoped to {key}={bound!r}, not {stated!r}", key=key)
+            if key in ("tenant_or_user_id", "domain_id"):
+                update[key] = bound
+            else:
+                custom[key] = bound
+        if custom != filters.custom:
+            update["custom"] = custom
+        return filters.model_copy(update=update)
+
+    def _check_owner(self, owner: OwnerScope) -> None:
+        for key, bound in self._bound().items():
+            stated = owner.value(key)
+            if stated != bound:
+                raise ScopeViolationError(f"Store is scoped to {key}={bound!r}, not {stated!r}", key=key)
+
+    def _check_doc(self, doc_id: str) -> None:
+        owner = self.inner.doc_owner(doc_id)
+        if owner is not None:
+            self._check_owner(owner)
+
+    # ── delegated port ────────────────────────────────────────────────────
+
+    def capabilities(self) -> StoreCapabilities:
+        return self.inner.capabilities()
+
+    def embedding_space(self) -> EmbeddingSpace:
+        return self.inner.embedding_space()
+
+    def vector_search(self, query_vector, filters, top_k):
+        return self.inner.vector_search(query_vector, self._scoped_filters(filters), top_k)
+
+    def keyword_search(self, query_text, filters, top_k, analyzer_tokens=None):
+        return self.inner.keyword_search(query_text, self._scoped_filters(filters), top_k, analyzer_tokens)
+
+    def hybrid_search(self, query_text, query_vector, filters, top_k, rrf_k=60, w_vec=1.0, w_fts=1.0, analyzer_tokens=None):
+        return self.inner.hybrid_search(
+            query_text, query_vector, self._scoped_filters(filters), top_k, rrf_k, w_vec, w_fts, analyzer_tokens
+        )
+
+    def fetch_parent_summaries(self, filters, level=None):
+        return self.inner.fetch_parent_summaries(self._scoped_filters(filters), level)
+
+    def fetch_local_window(self, doc_id, center_offset, radius_chars, filters):
+        return self.inner.fetch_local_window(doc_id, center_offset, radius_chars, self._scoped_filters(filters))
+
+    def scope_stats(self, filters):
+        return self.inner.scope_stats(self._scoped_filters(filters))
+
+    def fetch_full_scope(self, filters):
+        return self.inner.fetch_full_scope(self._scoped_filters(filters))
+
+    def fetch_nodes(self, node_ids, filters):
+        return self.inner.fetch_nodes(node_ids, self._scoped_filters(filters))
+
+    def upsert_section(self, write: SectionWrite[MetaT]) -> int:
+        self._check_owner(write.owner)
+        self._check_doc(write.doc_id)          # never write into a document another owner holds
+        return self.inner.upsert_section(write)
+
+    def upsert_section_nodes(self, doc_id, section_seq, nodes, embeddings, summary=None):
+        raise ScopeViolationError("A scoped store writes only through upsert_section, which carries the owner")
+
+    def get_fingerprints(self, doc_id):
+        self._check_doc(doc_id)
+        return self.inner.get_fingerprints(doc_id)
+
+    def delete_nodes(self, node_ids):
+        for node_id in node_ids:
+            owner = self.inner._owners.get(node_id)
+            if owner is not None:
+                self._check_owner(owner)
+        return self.inner.delete_nodes(node_ids)
+
+    def delete_document(self, doc_id):
+        self._check_doc(doc_id)
+        return self.inner.delete_document(doc_id)
+
+    def delete_sections(self, doc_id, from_seq):
+        self._check_doc(doc_id)
+        return self.inner.delete_sections(doc_id, from_seq)
+
+    def current_revisions(self, node_ids):
+        return self.inner.current_revisions(node_ids)

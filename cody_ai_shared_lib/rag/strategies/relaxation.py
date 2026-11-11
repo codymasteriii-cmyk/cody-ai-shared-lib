@@ -4,7 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
-from ..models import QueryIntent, RAGFilterSpec
+from datetime import datetime
+
+from ..models import QueryIntent, RAGFilterSpec, as_utc
 from ..registry import split_component_name
 
 
@@ -15,6 +17,7 @@ class RelaxationState:
     intent: QueryIntent
     soft_date_window: bool
     hard_min_similarity: float | None
+    hard_date_range: tuple[datetime | None, datetime | None] | None = None   # the caller's range: never exceeded
 
 
 class RelaxationStep(Protocol):
@@ -43,9 +46,15 @@ class WidenTimeWindow:
         window = state.filters.date_range_utc
         if not state.soft_date_window or window is None or window[0] is None or window[1] is None:
             return None
-        start, end = window
-        widened = (end - (end - start) * self.factor, end)
-        return replace(state, filters=state.filters.model_copy(update={"date_range_utc": widened}))
+        start: datetime = window[0]
+        end: datetime = window[1]
+        new_start: datetime = end - (end - start) * self.factor
+        hard = state.hard_date_range
+        if hard is not None and hard[0] is not None:
+            new_start = max(new_start, as_utc(hard[0]))
+        if new_start >= start:
+            return None                      # already at the caller's limit
+        return replace(state, filters=state.filters.model_copy(update={"date_range_utc": (new_start, end)}))
 
 
 class DropTimeWindow:
@@ -54,7 +63,10 @@ class DropTimeWindow:
     def apply(self, state: RelaxationState) -> RelaxationState | None:
         if not state.soft_date_window or state.filters.date_range_utc is None:
             return None
-        return replace(state, filters=state.filters.model_copy(update={"date_range_utc": None}))
+        if state.filters.date_range_utc == state.hard_date_range:
+            return None
+        # Dropping the soft window leaves the caller's hard range, never no range at all
+        return replace(state, filters=state.filters.model_copy(update={"date_range_utc": state.hard_date_range}))
 
 
 class LowerThreshold:

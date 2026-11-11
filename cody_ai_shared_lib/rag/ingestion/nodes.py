@@ -2,17 +2,17 @@
 from __future__ import annotations
 
 import hashlib
-import re
 from dataclasses import dataclass, field
 from typing import Generic
 
 from ..degradation import DegradationTracker
-from ..models import MetaT, RAGNode, RAGSectionInput, SourceSpan, node_class_for
-from ..ports import EmbeddingSpace
+from ..models import MetaT, PreparedNode, RAGNode, RAGSectionInput, SourceSpan, node_class_for
+from ..ports import EmbeddingSpace, Fingerprint, SummaryWrite
 from ..render import NodeRenderer
 from ..text.analyzer import TextAnalyzer, estimate_tokens
 from ..usage import BudgetGuard, UsageTracker
 from .embedder import BatchEmbedder
+from .ids import format_node_id, parse_node_id  # noqa: F401  (parse_node_id is used by sync)
 from .splitter import TextSplitter
 from .summarizer import SummarizerResult
 
@@ -21,14 +21,16 @@ def build_section_nodes(
     doc_id: str,
     section: RAGSectionInput[MetaT],
     splitter: TextSplitter,
+    revision: str | None = None,
+    granularity: str = "passage",
 ) -> list[RAGNode[MetaT]]:
-    """Split a section into passage nodes carrying global character offsets."""
+    """Split a section into passage nodes carrying global character offsets and the document revision."""
     nodes: list[RAGNode[MetaT]] = []
     for idx, chunk in enumerate(splitter.split(section.text, base_offset=section.char_start)):
         nodes.append(
             node_class_for(section.metadata)(
-                node_id=f"{doc_id}#s{section.section_seq}p{idx}",
-                granularity="passage",
+                node_id=format_node_id(doc_id, section.section_seq, "passage", idx),
+                granularity=granularity,
                 text=chunk.text,
                 span=SourceSpan(
                     doc_id=doc_id,
@@ -40,17 +42,10 @@ def build_section_nodes(
                     breadcrumb=list(section.breadcrumb) + chunk.breadcrumb,
                 ),
                 metadata=section.metadata,
+                revision=revision,
             )
         )
     return nodes
-
-
-def parse_node_id(doc_id: str, node_id: str) -> tuple[int, bool] | None:
-    """Return (section_seq, is_summary) for an engine-built node id, or None for any other id."""
-    match = re.fullmatch(re.escape(doc_id) + r"#s(\d+)(p\d+|_sum|_u\d+_sum)", node_id)
-    if match is None:
-        return None
-    return int(match.group(1)), match.group(2).endswith("_sum")
 
 
 def finalize_node(
@@ -79,12 +74,61 @@ def fts_signature(analyzer: TextAnalyzer, uses_analyzer_tokens: bool) -> str | N
     return f"{analyzer.name}|{analyzer.version}" if uses_analyzer_tokens else None
 
 
+def embedding_is_stale(
+    doc_id: str, node_id: str, fingerprint: Fingerprint, expected: str, embed_summaries: bool
+) -> bool:
+    """True when this row's vector must be (re)made under the current signature (§6.6).
+
+    A row with a signature is stale when the signature differs. A row stored without a vector is
+    stale only when it is a summary and the profile now embeds summaries.
+    """
+    if fingerprint.embedding_signature is not None:
+        return fingerprint.embedding_signature != expected
+    parsed = parse_node_id(doc_id, node_id)
+    return embed_summaries and parsed is not None and parsed.is_summary
+
+
+def write_signatures(
+    model: str, space: EmbeddingSpace, splitter: TextSplitter, analyzer: TextAnalyzer, uses_analyzer_tokens: bool
+) -> "WriteSignatures":
+    """Both signatures for one write, from the one formula each."""
+    return WriteSignatures(
+        embedding=embedding_signature(model, space, splitter),
+        fts=fts_signature(analyzer, uses_analyzer_tokens),
+    )
+
+
+@dataclass(frozen=True)
+class WriteSignatures:
+    """The signatures the engine stamps on every node it writes (§6.6). Computed once per call."""
+    embedding: str
+    fts: str | None
+
+    def fingerprint(self, node: RAGNode[MetaT], has_vector: bool = True, keyword_indexed: bool = True) -> Fingerprint:
+        """A row stored without a vector carries no embedding signature (§6.6)."""
+        return Fingerprint(
+            content_hash=node.content_hash or "",
+            embedding_signature=self.embedding if has_vector else None,
+            # Summaries are never keyword-searched (§4.2), so their search tokens carry no signature
+            fts_signature=self.fts if keyword_indexed else None,
+        )
+
+
 @dataclass
 class PreparedSummaries(Generic[MetaT]):
-    """Summary nodes ready to upsert: the section summary and the embedded unit summaries."""
-    section_summary: RAGNode[MetaT] | None = None
-    unit_nodes: list[RAGNode[MetaT]] = field(default_factory=list)
-    unit_vectors: list[list[float]] = field(default_factory=list)
+    """Summaries ready to write: the section summary and the unit summaries, each with a fingerprint."""
+    section_summary: SummaryWrite[MetaT] | None = None
+    unit_summaries: list[SummaryWrite[MetaT]] = field(default_factory=list)
+
+    @property
+    def node_ids(self) -> list[str]:
+        items = ([self.section_summary] if self.section_summary else []) + self.unit_summaries
+        return [item.node.node_id for item in items]
+
+
+def _unit_seq(doc_id: str, node: RAGNode[MetaT], position: int) -> int:
+    parsed = parse_node_id(doc_id, node.node_id)
+    return parsed.number if parsed is not None and parsed.kind == "unit_summary" and parsed.number is not None else position
 
 
 def prepare_summaries(
@@ -96,22 +140,53 @@ def prepare_summaries(
     usage_tracker: UsageTracker,
     degradation_tracker: DegradationTracker,
     budget_guard: BudgetGuard | None = None,
+    *,
+    signatures: WriteSignatures,
+    embed: bool = True,
 ) -> PreparedSummaries[MetaT]:
-    """Fingerprint and embed the summaries of one section."""
-    prepared: PreparedSummaries[MetaT] = PreparedSummaries(section_summary=result.section_summary)
-    if result.section_summary is not None:
-        finalize_node(result.section_summary, renderer, analyzer, uses_analyzer_tokens)
-        pairs = embedder.embed_nodes(
-            [result.section_summary], usage_tracker, degradation_tracker, "summary_embedding", budget_guard
-        )
-        if pairs:
-            result.section_summary.embedding = pairs[0][1]
+    """Fingerprint the summaries of one section and, when `embed` is set, embed them in one batch.
 
-    for unit in result.unit_summaries:
-        finalize_node(unit, renderer, analyzer, uses_analyzer_tokens)
-        pairs = embedder.embed_nodes([unit], usage_tracker, degradation_tracker, "summary_embedding", budget_guard)
-        if pairs:
-            unit.embedding = pairs[0][1]
-            prepared.unit_nodes.append(unit)
-            prepared.unit_vectors.append(pairs[0][1])
+    The unit's `unit_seq` is the index in its engine-built id, so a skipped unit leaves a gap
+    instead of shifting the units after it (INT-01).
+    """
+    summaries = ([result.section_summary] if result.section_summary is not None else []) + list(result.unit_summaries)
+    for node in summaries:
+        finalize_node(node, renderer, analyzer, uses_analyzer_tokens)
+
+    vectors: dict[str, list[float]] = {}
+    if embed and summaries:
+        pairs = embedder.embed_nodes(summaries, usage_tracker, degradation_tracker, "summary_embedding", budget_guard)
+        for node, vector in pairs:
+            node.embedding = vector
+            vectors[node.node_id] = vector
+
+    prepared: PreparedSummaries[MetaT] = PreparedSummaries()
+    if result.section_summary is not None:
+        node = result.section_summary
+        summary_vector = vectors.get(node.node_id)
+        prepared.section_summary = SummaryWrite[MetaT](
+            node=node, vector=summary_vector, fingerprint=signatures.fingerprint(
+                node, has_vector=summary_vector is not None, keyword_indexed=False
+            )
+        )
+    for position, unit in enumerate(result.unit_summaries):
+        unit_vector = vectors.get(unit.node_id)
+        prepared.unit_summaries.append(
+            SummaryWrite[MetaT](
+                node=unit,
+                vector=unit_vector,
+                fingerprint=signatures.fingerprint(unit, has_vector=unit_vector is not None, keyword_indexed=False),
+                unit_seq=_unit_seq(unit.span.doc_id, unit, position),
+            )
+        )
     return prepared
+
+
+def prepare_passages(
+    pairs: list[tuple[RAGNode[MetaT], list[float]]],
+    signatures: WriteSignatures,
+) -> list[PreparedNode[MetaT]]:
+    """Pair each embedded passage with its fingerprint, in document order."""
+    return [
+        PreparedNode[MetaT](node=node, vector=vector, fingerprint=signatures.fingerprint(node)) for node, vector in pairs
+    ]

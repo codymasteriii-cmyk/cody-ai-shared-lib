@@ -8,6 +8,20 @@ from __future__ import annotations
 from typing import Any, Literal
 
 
+MAX_MESSAGE_CHARS = 200
+
+
+def safe_message(value: object, limit: int = MAX_MESSAGE_CHARS) -> str:
+    """A bounded, single-line message for logs, degradations and errors (§13.8, RAG-SEC-9).
+
+    Exceptions become `Type: message`, cut to 200 characters. Provider errors can echo prompt text,
+    and these messages reach traces, logs and browsers, so they are never copied in full.
+    """
+    text = f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 class RAGEngineError(Exception):
     """Base error for all RAG engine failures."""
 
@@ -58,6 +72,18 @@ class MissingRequiredScopeError(RAGEngineError):
     def __init__(self, message: str, missing_keys: list[str] | None = None, **kwargs: Any):
         super().__init__(message, **kwargs)
         self.missing_keys = list(missing_keys or [])
+
+
+class ScopeViolationError(RAGEngineError):
+    """Raised by a scoped store when a read or write names a scope other than the one it was built for.
+
+    The engine proves a scope was stated (MissingRequiredScopeError); a scoped store proves it is the
+    right one (§5.6). Typed, so it passes through call_store unchanged and the app can answer 403.
+    """
+
+    def __init__(self, message: str, key: str | None = None, **kwargs: Any):
+        super().__init__(message, **kwargs)
+        self.key = key
 
 
 class UnsupportedFilterError(RAGEngineError):
@@ -142,3 +168,15 @@ class BudgetExceeded(RAGEngineError):
 class DeadlineExceeded(RAGEngineError):
     """Raised when a required pipeline stage cannot finish within the remaining deadline."""
     pass
+
+
+# Errors that no agreed degradation may absorb (§13.3): configuration, scope, budget and deadline
+NEVER_DEGRADABLE: tuple[type[RAGEngineError], ...] = (
+    BudgetExceeded,
+    DeadlineExceeded,
+    ProfileConfigError,
+    StoreCapabilityError,
+    MissingRequiredScopeError,
+    ScopeViolationError,
+    UnsupportedFilterError,
+)

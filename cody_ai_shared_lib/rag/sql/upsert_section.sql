@@ -1,108 +1,160 @@
--- Reference SQL: Atomic Upsert Section RPC (§4.7, §4.4, RAG-ING-10, AC-RAG-66, AC-RAG-67)
+-- MIGRATION CHECKLIST (RAG_SPEC 1.2.0 §4.7): check your own functions line by line against these.
+--   [ ] Upsert never deletes: only the rows in the write are inserted or updated; deletion is a separate RPC.
+--   [ ] Owner: every function takes the owner (tenant_or_user_id), raises when it is missing, filters on it,
+--       and refuses a write into a document or row another owner holds.
+--   [ ] search_path pinned on every SECURITY DEFINER function: `public, extensions, pg_temp`
+--       (Supabase installs pgvector in `extensions`; pg_temp last stops temp-schema shadowing).
+--   [ ] Summaries admitted only when char_end <= boundary; ranked searches read passages only.
+--   [ ] Scan mode: pgvector >= 0.8 iterative index scans, or an exact distance sort when every query is
+--       limited to one document (then no vector index is needed).
+--   [ ] Text by reference: slice chunk text with chunk-relative offsets (char_start - chunk.char_start).
+--   [ ] Fingerprints stored exactly as the engine sends them; never computed or rebuilt in SQL.
+
+-- Reference SQL: one section write, in one transaction (§4.4.1, §4.7, RAG-ING-10)
+-- RAG_SPEC 1.2.0. Backs an adapter's `upsert_section(write: SectionWrite)` override.
 -- StoreCapabilities:
 --   supports_parent_summaries=True
 --   supports_fingerprints=True
+--
+-- Contract (§4.4.1):
+--   * Idempotent on id (node_id). NEVER deletes: during sync a write holds only the changed rows of a
+--     section, and every other row must stay. Deletion is a separate delete_nodes RPC.
+--   * A reader sees none or all of the write (one function body = one transaction).
+--   * Fingerprints are stored as given; the store computes nothing.
+--   * A document belongs to one owner. A write into a document another owner holds is refused (§5.6).
+--
+-- The adapter serializes SectionWrite into three jsonb arrays of flat items:
+--   {"id", "section_id", "granularity", "char_start", "char_end", "text", "parent_chunk_id",
+--    "content_hash", "embedding_signature", "fts_signature", "token_estimate", "revision",
+--    "embedding": [..] | null, "search_tokens": [..], "unit_seq": n | null}
+-- and the owner as {"tenant_or_user_id": "...", "domain_id": "..." | null}.
 
-CREATE OR REPLACE FUNCTION upsert_section_nodes(
+CREATE OR REPLACE FUNCTION upsert_section(
     p_doc_id text,
     p_section_seq int,
-    p_nodes jsonb,
-    p_summary jsonb DEFAULT NULL
+    p_owner jsonb,
+    p_passages jsonb DEFAULT '[]'::jsonb,
+    p_unit_summaries jsonb DEFAULT '[]'::jsonb,
+    p_section_summary jsonb DEFAULT NULL
 )
 RETURNS int
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
-    written_count int := 0;
+    v_owner text := p_owner->>'tenant_or_user_id';
+    v_existing_owner text;
+    v_expected int;
+    v_written int := 0;
 BEGIN
-    -- Atomic deletion of existing section rows to guarantee consistency (RAG-ING-10)
-    -- Applies active-row check if soft deletes used: AND {active_predicate}
-    DELETE FROM passages
-    WHERE doc_id = p_doc_id AND section_seq = p_section_seq;
-
-    -- Insert new passage nodes
-    INSERT INTO passages (
-        id,
-        doc_id,
-        section_id,
-        section_seq,
-        granularity,
-        char_start,
-        char_end,
-        text,
-        content_hash,
-        embedding_model,
-        embedding_dim,
-        fts_signature,
-        token_estimate,
-        embedding,
-        search_tokens,
-        fts_search_tokens,
-        is_active
-    )
-    SELECT
-        item->>'id',
-        p_doc_id,
-        item->>'section_id',
-        p_section_seq,
-        COALESCE(item->>'granularity', 'passage'),
-        (item->>'char_start')::int,
-        (item->>'char_end')::int,
-        item->>'text',
-        item->>'content_hash',
-        item->>'embedding_model',
-        (item->>'embedding_dim')::int,
-        item->>'fts_signature',
-        (item->>'token_estimate')::int,
-        (item->>'embedding')::vector(768),
-        ARRAY(SELECT jsonb_array_elements_text(item->'search_tokens')),
-        to_tsvector('simple', COALESCE(item->>'search_tokens_text', '')),
-        TRUE
-    FROM jsonb_array_elements(p_nodes) AS item;
-
-    GET DIAGNOSTICS written_count = ROW_COUNT;
-
-    -- Insert section summary if provided
-    IF p_summary IS NOT NULL THEN
-        INSERT INTO passages (
-            id,
-            doc_id,
-            section_id,
-            section_seq,
-            granularity,
-            char_start,
-            char_end,
-            text,
-            content_hash,
-            embedding_model,
-            embedding_dim,
-            fts_signature,
-            token_estimate,
-            embedding
-        )
-        VALUES (
-            p_summary->>'id',
-            p_doc_id,
-            p_summary->>'section_id',
-            p_section_seq,
-            'parent_summary',
-            (p_summary->>'char_start')::int,
-            (p_summary->>'char_end')::int,
-            p_summary->>'text',
-            p_summary->>'content_hash',
-            p_summary->>'embedding_model',
-            (p_summary->>'embedding_dim')::int,
-            p_summary->>'fts_signature',
-            (p_summary->>'token_estimate')::int,
-            (p_summary->>'embedding')::vector(768)
-        );
-        written_count := written_count + 1;
+    IF v_owner IS NULL OR v_owner = '' THEN
+        RAISE EXCEPTION 'upsert_section: owner is required' USING ERRCODE = '42501';
     END IF;
 
-    RETURN written_count;
+    -- A document never changes owner: refuse a write into another owner's document (§5.6)
+    SELECT p.tenant_or_user_id INTO v_existing_owner
+    FROM passages p WHERE p.doc_id = p_doc_id LIMIT 1;
+    IF v_existing_owner IS NOT NULL AND v_existing_owner <> v_owner THEN
+        RAISE EXCEPTION 'upsert_section: document % belongs to another owner', p_doc_id USING ERRCODE = '42501';
+    END IF;
+
+    v_expected := jsonb_array_length(COALESCE(p_passages, '[]'::jsonb))
+                + jsonb_array_length(COALESCE(p_unit_summaries, '[]'::jsonb))
+                + CASE WHEN p_section_summary IS NULL THEN 0 ELSE 1 END;
+
+    WITH items AS (
+        SELECT item, 'passage'::text AS kind FROM jsonb_array_elements(COALESCE(p_passages, '[]'::jsonb)) AS item
+        UNION ALL
+        SELECT item, 'section_unit' FROM jsonb_array_elements(COALESCE(p_unit_summaries, '[]'::jsonb)) AS item
+        UNION ALL
+        SELECT p_section_summary, 'section' WHERE p_section_summary IS NOT NULL
+    )
+    INSERT INTO passages AS t (
+        id, doc_id, tenant_or_user_id, domain_id, section_id, section_seq, granularity,
+        is_summary, parent_kind, unit_seq, char_start, char_end, text, parent_chunk_id, is_active,
+        content_hash, embedding_signature, fts_signature, token_estimate, revision,
+        embedding, search_tokens, fts_search_tokens, updated_at
+    )
+    SELECT
+        i.item->>'id',
+        p_doc_id,
+        v_owner,
+        p_owner->>'domain_id',
+        i.item->>'section_id',
+        p_section_seq,
+        CASE WHEN i.kind = 'passage' THEN COALESCE(i.item->>'granularity', 'passage') ELSE 'parent_summary' END,
+        i.kind <> 'passage',
+        CASE WHEN i.kind = 'passage' THEN NULL ELSE i.kind END,
+        (i.item->>'unit_seq')::int,
+        (i.item->>'char_start')::int,
+        (i.item->>'char_end')::int,
+        i.item->>'text',
+        i.item->>'parent_chunk_id',
+        TRUE,
+        i.item->>'content_hash',
+        i.item->>'embedding_signature',
+        i.item->>'fts_signature',
+        (i.item->>'token_estimate')::int,
+        i.item->>'revision',
+        CASE WHEN i.item->'embedding' IS NULL OR jsonb_typeof(i.item->'embedding') = 'null'
+             THEN NULL ELSE (i.item->>'embedding')::vector(768) END,
+        ARRAY(SELECT jsonb_array_elements_text(COALESCE(i.item->'search_tokens', '[]'::jsonb))),
+        to_tsvector('simple', array_to_string(
+            ARRAY(SELECT jsonb_array_elements_text(COALESCE(i.item->'search_tokens', '[]'::jsonb))), ' ')),
+        NOW()
+    FROM items i
+    ON CONFLICT (id) DO UPDATE SET
+        section_id = EXCLUDED.section_id,
+        granularity = EXCLUDED.granularity,
+        is_summary = EXCLUDED.is_summary,
+        parent_kind = EXCLUDED.parent_kind,
+        unit_seq = EXCLUDED.unit_seq,
+        char_start = EXCLUDED.char_start,
+        char_end = EXCLUDED.char_end,
+        text = EXCLUDED.text,
+        parent_chunk_id = EXCLUDED.parent_chunk_id,
+        is_active = TRUE,
+        content_hash = EXCLUDED.content_hash,
+        embedding_signature = EXCLUDED.embedding_signature,
+        fts_signature = EXCLUDED.fts_signature,
+        token_estimate = EXCLUDED.token_estimate,
+        revision = EXCLUDED.revision,
+        embedding = EXCLUDED.embedding,
+        search_tokens = EXCLUDED.search_tokens,
+        fts_search_tokens = EXCLUDED.fts_search_tokens,
+        updated_at = NOW()
+    WHERE t.tenant_or_user_id = EXCLUDED.tenant_or_user_id;   -- an id held by another owner is never updated
+
+    GET DIAGNOSTICS v_written = ROW_COUNT;
+    IF v_written <> v_expected THEN
+        -- Some id belongs to another owner: abort the whole write
+        RAISE EXCEPTION 'upsert_section: % of % rows belong to another owner', v_expected - v_written, v_expected
+            USING ERRCODE = '42501';
+    END IF;
+    RETURN v_written;
 END;
 $$;
 
-REVOKE EXECUTE ON FUNCTION upsert_section_nodes FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION upsert_section_nodes TO service_role;
+REVOKE EXECUTE ON FUNCTION upsert_section FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION upsert_section TO service_role;
+
+-- Deletion is its own RPC, scoped to the owner (sync deletes vanished nodes last, §6.6)
+CREATE OR REPLACE FUNCTION delete_nodes(p_tenant_or_user_id text, p_node_ids text[])
+RETURNS int
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+DECLARE
+    v_deleted int;
+BEGIN
+    DELETE FROM passages p
+    WHERE p.tenant_or_user_id = p_tenant_or_user_id AND p.id = ANY(p_node_ids);
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    RETURN v_deleted;
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION delete_nodes FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION delete_nodes TO service_role;

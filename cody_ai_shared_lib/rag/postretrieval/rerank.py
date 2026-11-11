@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, ClassVar, Generic
 from ..degradation import DegradationTracker
 from ..gateway import ModelGateway
-from ..granularity import TRAIT_RERANKABLE, has_trait, limit_ranked
+from ..granularity import TRAIT_RERANKABLE, has_trait, is_ranked, limit_ranked
 from ..models import MetaT, RAGNode
 from ..ports import NodeRenderer
 from ..render import DefaultRenderer
@@ -61,7 +61,7 @@ class JinaCrossEncoderReranker(Generic[MetaT]):
         rerankable: list[RAGNode[MetaT]] = []
         non_rerankable: list[RAGNode[MetaT]] = []
         for n in nodes:
-            if has_trait(n.granularity, TRAIT_RERANKABLE):
+            if has_trait(n.granularity, TRAIT_RERANKABLE) and is_ranked(n):   # never Tier 0 text (§8.2)
                 rerankable.append(n)
             else:
                 non_rerankable.append(n)

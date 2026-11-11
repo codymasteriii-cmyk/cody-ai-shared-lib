@@ -1,14 +1,40 @@
--- Reference SQL: Filtered Vector Search (§4.7, AC-RAG-67)
+-- MIGRATION CHECKLIST (RAG_SPEC 1.2.0 §4.7): check your own functions line by line against these.
+--   [ ] Upsert never deletes: only the rows in the write are inserted or updated; deletion is a separate RPC.
+--   [ ] Owner: every function takes the owner (tenant_or_user_id), raises when it is missing, filters on it,
+--       and refuses a write into a document or row another owner holds.
+--   [ ] search_path pinned on every SECURITY DEFINER function: `public, extensions, pg_temp`
+--       (Supabase installs pgvector in `extensions`; pg_temp last stops temp-schema shadowing).
+--   [ ] Summaries admitted only when char_end <= boundary; ranked searches read passages only.
+--   [ ] Scan mode: pgvector >= 0.8 iterative index scans, or an exact distance sort when every query is
+--       limited to one document (then no vector index is needed).
+--   [ ] Text by reference: slice chunk text with chunk-relative offsets (char_start - chunk.char_start).
+--   [ ] Fingerprints stored exactly as the engine sends them; never computed or rebuilt in SQL.
+
+-- Reference SQL: filtered vector search (§4.2, §4.6 check 7, §4.7)
+-- RAG_SPEC 1.2.0.
 -- StoreCapabilities:
 --   supports_vector_search=True
 --   returns_raw_scores=True
 --   supports_sequential_boundary=True
+--
+-- Contract:
+--   * The owner predicate is mandatory: with the service role this RPC is the only isolation (§5.6).
+--   * Ranked searches return passages only, never summaries (§4.2). Summaries come from
+--     fetch_parent_summaries (sequential_boundary.sql).
+--   * Boundary: a passage is a candidate when it starts before B; the engine cuts it at a sentence
+--     end before B (§5.2). Per-document boundaries come as a jsonb map {doc_id: boundary}.
+--   * Filtered recall (§4.6 check 7): pgvector >= 0.8 iterative index scans keep scanning until
+--     match_count rows pass the filters, instead of returning fewer for one small document.
+--   * Text by reference: chunk text is sliced with offsets relative to the chunk's own start.
 
 CREATE OR REPLACE FUNCTION match_passages_vector(
     query_vector vector(768),
+    p_tenant_or_user_id text,
     match_count int DEFAULT 8,
-    p_doc_id text DEFAULT NULL,
+    p_domain_id text DEFAULT NULL,
+    p_doc_ids text[] DEFAULT NULL,
     p_boundary int DEFAULT NULL,
+    p_boundaries jsonb DEFAULT NULL,          -- {"doc_id": boundary, ...}
     p_min_similarity float DEFAULT 0.0
 )
 RETURNS TABLE (
@@ -23,11 +49,14 @@ RETURNS TABLE (
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
 AS $$
 BEGIN
-    -- Avoid filtered-recall trap (§4.6 #7):
-    -- If p_doc_id is provided, exact table scan / indexed btree on (doc_id, embedding)
-    -- is preferred over early-terminated approximate HNSW scan.
+    IF p_tenant_or_user_id IS NULL OR p_tenant_or_user_id = '' THEN
+        RAISE EXCEPTION 'match_passages_vector: owner is required' USING ERRCODE = '42501';
+    END IF;
+    PERFORM set_config('hnsw.iterative_scan', 'relaxed_order', true);   -- pgvector >= 0.8
+
     RETURN QUERY
     SELECT
         p.id,
@@ -36,21 +65,24 @@ BEGIN
         p.section_seq,
         p.char_start,
         p.char_end,
-        -- text by reference variant
-        COALESCE(p.text, SUBSTRING(c.text FROM (p.char_start + 1) FOR (p.char_end - p.char_start))) AS content,
+        COALESCE(p.text, SUBSTRING(c.text FROM (p.char_start - c.char_start + 1) FOR (p.char_end - p.char_start))) AS content,
         (1.0 - (p.embedding <=> query_vector))::float AS similarity
     FROM passages p
     LEFT JOIN parent_chunks c ON c.id = p.parent_chunk_id
     WHERE
-        p.is_active = TRUE AND {active_predicate}
-        AND (p_doc_id IS NULL OR p.doc_id = p_doc_id)
-        AND (p_boundary IS NULL OR p.char_start < p_boundary)
+        p.tenant_or_user_id = p_tenant_or_user_id
+        AND (p_domain_id IS NULL OR p.domain_id = p_domain_id)
+        AND p.is_active = TRUE AND {active_predicate}
+        AND p.is_summary = FALSE
+        AND p.embedding IS NOT NULL
+        AND (p_doc_ids IS NULL OR p.doc_id = ANY(p_doc_ids))
+        AND (COALESCE((p_boundaries->>p.doc_id)::int, p_boundary) IS NULL
+             OR p.char_start < COALESCE((p_boundaries->>p.doc_id)::int, p_boundary))
         AND (1.0 - (p.embedding <=> query_vector)) >= p_min_similarity
     ORDER BY p.embedding <=> query_vector ASC
     LIMIT match_count;
 END;
 $$;
 
--- Security / Execution Rights (§4.7)
 REVOKE EXECUTE ON FUNCTION match_passages_vector FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION match_passages_vector TO service_role;

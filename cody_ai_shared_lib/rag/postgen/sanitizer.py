@@ -57,6 +57,19 @@ class OutputSanitizer:
             lambda m: m.group(0) if _is_trusted(m.group(2)) else m.group(1),
             cleaned,
         )
+        # Reference-style definitions `[x]: https://...` would turn `![img][x]` into a remote image
+        cleaned = re.sub(
+            r"^[ \t]*\[[^\]]+\]:[ \t]*<?(\S+?)>?(?:[ \t]+\S.*)?$",
+            lambda m: m.group(0) if _is_trusted(m.group(1)) else "",
+            cleaned,
+            flags=re.MULTILINE,
+        )
+        # Autolinks `<scheme://host/...>`: keep the text form only for trusted hosts
+        cleaned = re.sub(
+            r"<([a-zA-Z][a-zA-Z0-9+.\-]*:[^\s<>]+)>",
+            lambda m: m.group(0) if _is_trusted(m.group(1)) else "",
+            cleaned,
+        )
 
         # Strip fence tags, including a scrubbed copy: <data-...>, <history-...>, <question-...>, <node...>, </node>
         cleaned = re.sub(

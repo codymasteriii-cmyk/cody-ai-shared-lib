@@ -53,6 +53,7 @@ class StuffStrategy:
             "budget_guard": ctx.budget_guard,
             "temperature": self.profile.generation.temperature,
             "cache_breakpoints": prompt.cache_breakpoints,
+            "user_blocks": prompt.user_blocks or None,
         }
 
     def generate(self, prompt: AssembledPrompt[Any], ctx: GenerationContext) -> LLMResult:

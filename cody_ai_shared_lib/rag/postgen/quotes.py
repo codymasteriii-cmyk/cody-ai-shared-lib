@@ -9,7 +9,9 @@ from ..models import CitationCoverage, MetaT, RAGCitation, RAGNode
 from ..text.analyzer import CjkAwareAnalyzer, TextAnalyzer
 
 # A quoted span in English ("...", “...”) or CJK (「...」, 『...』) followed by its citation marker
-_QUOTED_CITE_RE = re.compile(r'(?:"([^"]{4,})"|“([^”]{4,})”|「([^」]{4,})」|『([^』]{4,})』)\s*(\[[^\]]+\])')
+# ASCII quotes need 4+ characters; CJK quotes may be 2+, since a name or term is often that short
+_QUOTED_CITE_RE = re.compile(r'(?:"([^"]{4,})"|“([^”]{2,})”|「([^」]{2,})」|『([^』]{2,})』)\s*(\[[^\]]+\])')
+_NUMBER_RE = re.compile(r"\d+")
 _NORM_WS_RE = re.compile(r"[\s\W_]+", flags=re.UNICODE)
 _MIN_COVERED_SENTENCE_CHARS = 20
 
@@ -89,7 +91,11 @@ class QuoteValidator(Generic[MetaT]):
         quotes_by_marker: dict[str, list[str]] = {}
         for match in _QUOTED_CITE_RE.finditer(answer_text or ""):
             quote = next(group for group in match.groups()[:4] if group)
-            quotes_by_marker.setdefault(match.group(5), []).append(quote)
+            raw = match.group(5)
+            # "[1, 2]" quotes for both [1] and [2]; other marker styles are keyed as written
+            keys = [f"[{n}]" for n in _NUMBER_RE.findall(raw)] if re.fullmatch(r"\[[\d,\s]+\]", raw) else [raw]
+            for key in keys:
+                quotes_by_marker.setdefault(key, []).append(quote)
 
         for citation in citations:
             if not citation.verified or citation.node_id not in node_text:
@@ -97,10 +103,11 @@ class QuoteValidator(Generic[MetaT]):
                 citation.verification_score = 0.0
                 continue
             source = node_text[citation.node_id]
-            quotes = quotes_by_marker.get(citation.marker) or ([citation.quote] if citation.quote else [])
+            quotes = quotes_by_marker.get(citation.marker)
             if not quotes:
-                citation.verified = False
-                citation.verification_score = 0.0
+                # The answer quotes nothing next to this marker: the quote check does not apply, and the
+                # citation keeps its marker verification. Comparing the source with its own excerpt would
+                # always "pass" and prove nothing.
                 continue
 
             score = min(quote_match_ratio(quote, source) for quote in quotes)
