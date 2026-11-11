@@ -9,8 +9,14 @@ from abc import ABC, abstractmethod
 from typing import Any, Callable, Generic, Protocol, TypeVar, get_origin, runtime_checkable
 from pydantic import BaseModel, Field
 
-from .errors import MissingRequiredScopeError, RAGEngineError, RetrievalError, UnsupportedFilterError
-from .models import FilterPatch, MetaT, RAGFilterSpec, RAGNode
+from .errors import (
+    MissingRequiredScopeError,
+    RAGEngineError,
+    RetrievalError,
+    StoreCapabilityError,
+    UnsupportedFilterError,
+)
+from .models import FilterPatch, MetaT, PreparedNode, RAGFilterSpec, RAGNode
 from .render import NodeRenderer
 from .text.analyzer import TokenGroup
 
@@ -77,6 +83,57 @@ class Fingerprint(BaseModel):
     fts_signature: str | None = None
 
 
+class OwnerScope(BaseModel):
+    """Who an ingestion runs for and which partition it writes into (§6.4.2, INT-04).
+
+    Key names match RAGFilterSpec, so a store's `required_filter_keys` apply to writes as they do to
+    reads. A key that is not a field here is looked up in `custom`. The same user both pays for the
+    calls (BudgetGuard reads `tenant_or_user_id`) and owns the rows written.
+    """
+    model_config = {"frozen": True, "extra": "forbid"}
+    tenant_or_user_id: str | None = None
+    domain_id: str | None = None
+    custom: dict[str, Any] = Field(default_factory=dict)
+
+    def value(self, key: str) -> Any:
+        """The value this owner gives a required filter key, or None."""
+        name = _FILTER_KEY_ALIASES.get(key, key)
+        if name in ("tenant_or_user_id", "domain_id"):
+            return getattr(self, name)
+        return self.custom.get(key)
+
+    def as_scope(self) -> dict[str, Any]:
+        """The non-empty keys, for CallContext.scope and logs."""
+        scope: dict[str, Any] = dict(self.custom)
+        if self.tenant_or_user_id is not None:
+            scope["tenant_or_user_id"] = self.tenant_or_user_id
+        if self.domain_id is not None:
+            scope["domain_id"] = self.domain_id
+        return scope
+
+
+class SummaryWrite(BaseModel, Generic[MetaT]):
+    """One summary to persist: the node, its fingerprint and, when summaries are embedded, its vector."""
+    node: RAGNode[MetaT]
+    vector: list[float] | None = None      # None when profile.ingestion.summaries.embed_summaries is False
+    fingerprint: Fingerprint
+    unit_seq: int | None = None            # 0-based unit index (gaps allowed); None for the section summary
+
+
+class SectionWrite(BaseModel, Generic[MetaT]):
+    """Everything one `upsert_section` call persists, in one structure (§4.4, INT-01).
+
+    An upsert never deletes: during sync a write may hold only the changed nodes of a section.
+    Passages always carry a vector. Fields may be added in later versions; adapters read what they need.
+    """
+    doc_id: str
+    section_seq: int
+    owner: OwnerScope = Field(default_factory=OwnerScope)
+    passages: list[PreparedNode[MetaT]] = Field(default_factory=list)   # document order
+    unit_summaries: list[SummaryWrite[MetaT]] = Field(default_factory=list)
+    section_summary: SummaryWrite[MetaT] | None = None
+
+
 _FILTER_KEY_ALIASES = {"tenant_id": "tenant_or_user_id", "document_ids": "doc_ids", "doc_id": "doc_ids"}
 
 
@@ -84,6 +141,32 @@ def filter_value(filters: RAGFilterSpec, key: str) -> Any:
     """The value a store's required filter key has in these filters, or None."""
     value = getattr(filters, _FILTER_KEY_ALIASES.get(key, key), None)
     return value if value is not None else filters.custom.get(key)
+
+
+def store_overrides(store: Any, method: str) -> bool:
+    """True when the store's class replaces the RAGStore default for `method`."""
+    return getattr(type(store), method, None) is not getattr(RAGStore, method)
+
+
+def validate_owner(owner: OwnerScope | None, capabilities: StoreCapabilities) -> None:
+    """Fail closed on a write that does not state the store's required scope (§5.6, INT-04).
+
+    "What you must state to read, you must state to write." `doc_ids` is satisfied by the
+    document being written.
+    """
+    missing = []
+    for key in capabilities.required_filter_keys:
+        if _FILTER_KEY_ALIASES.get(key, key) == "doc_ids":
+            continue
+        value = owner.value(key) if owner is not None else None
+        if value is None or value in ("", [], {}):
+            missing.append(key)
+    if missing:
+        raise MissingRequiredScopeError(
+            f"Ingestion owner is missing required scope keys: {sorted(missing)}",
+            missing_keys=sorted(missing),
+            stage="ingestion",
+        )
 
 
 def call_store(operation: str, call: Callable[[], T]) -> T:
@@ -192,11 +275,22 @@ class RAGStore(ABC, Generic[MetaT]):
         raise NotImplementedError("fetch_local_window not supported by this store")
 
     def scope_stats(self, filters: RAGFilterSpec) -> ScopeStats:
-        """Calculate aggregate scope statistics and current revision."""
+        """Size and revision of everything the filters allow (Tier 0 decision, cache key).
+
+        MUST describe exactly the content `fetch_full_scope(filters)` would return: the source text,
+        not indexed rows. A store that serves Tier 0 from text that is not embedded yet counts that
+        text here, or Tier 0 is never chosen for it (§4.2, INT-06).
+        """
         raise NotImplementedError("scope_stats not supported by this store")
 
     def fetch_full_scope(self, filters: RAGFilterSpec) -> list[RAGNode[MetaT]]:
-        """Fetch all content in scope in document order for Tier 0 context."""
+        """All content in scope, for Tier 0 (§8.2).
+
+        Nodes come in document order with real doc_id, section_seq, char_start, char_end and title.
+        They do not overlap, and no node crosses a section boundary: one node per section or finer
+        (e.g. passages). Each node becomes its own citation, so a single node for the whole scope
+        would give one citation that points at offset 0 (INT-07).
+        """
         raise NotImplementedError("fetch_full_scope not supported by this store")
 
     def fetch_nodes(self, node_ids: list[str], filters: RAGFilterSpec) -> list[RAGNode[MetaT]]:
@@ -211,15 +305,48 @@ class RAGStore(ABC, Generic[MetaT]):
         embeddings: list[list[float]],
         summary: RAGNode[MetaT] | None = None,
     ) -> int:
-        """Atomically upsert passages and optional summary for a section. Returns passages written."""
+        """Atomically upsert passages and optional summary for a section. Returns passages written.
+
+        Legacy shape: unit summaries ride in `nodes`, and the store gets no fingerprints. The engine
+        calls `upsert_section`, whose default delegates here; SQL adapters SHOULD override that instead.
+        """
         raise NotImplementedError("upsert_section_nodes not supported by this store")
+
+    def upsert_section(self, write: SectionWrite[MetaT]) -> int:
+        """Persist one section write atomically for readers (RAG-ING-10). Returns passages written.
+
+        Idempotent on node_id, never deletes. Persist each item's `fingerprint` as given: the engine
+        computes it, the store never does (§6.6). `node_id` is an opaque key: delete by it, never parse it.
+
+        The default delegates to `upsert_section_nodes` with its legacy argument shapes, so stores
+        written before 1.2.0 keep working. It needs a vector on every unit summary, which is why
+        `embed_summaries=False` requires a store that overrides this method.
+        """
+        nodes: list[RAGNode[MetaT]] = [p.node for p in write.passages]
+        vectors: list[list[float]] = [p.vector for p in write.passages]
+        for unit in write.unit_summaries:
+            if unit.vector is None:
+                raise StoreCapabilityError(
+                    "A unit summary without a vector needs a store that overrides upsert_section",
+                    stage="ingestion",
+                )
+            nodes.append(unit.node)
+            vectors.append(unit.vector)
+        summary = write.section_summary.node if write.section_summary is not None else None
+        return self.upsert_section_nodes(
+            doc_id=write.doc_id,
+            section_seq=write.section_seq,
+            nodes=nodes,
+            embeddings=vectors,
+            summary=summary,
+        )
 
     def get_fingerprints(self, doc_id: str) -> dict[str, Fingerprint]:
         """Return map of node_id -> Fingerprint for change detection."""
         raise NotImplementedError("get_fingerprints not supported by this store")
 
     def delete_nodes(self, node_ids: list[str]) -> int:
-        """Delete specific nodes by IDs. Returns count of nodes deleted."""
+        """Delete specific nodes by IDs (the stored node_id key; never parse it). Returns count deleted."""
         raise NotImplementedError("delete_nodes not supported by this store")
 
     def delete_document(self, doc_id: str) -> int:

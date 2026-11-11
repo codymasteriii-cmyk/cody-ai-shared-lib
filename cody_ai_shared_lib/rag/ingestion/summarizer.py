@@ -19,6 +19,7 @@ from ..gateway import FINISH_SKIPPED, ModelGateway
 from ..models import MetaT, RAGNode, SourceSpan, node_class_for
 from ..text.analyzer import CjkAwareAnalyzer, TextAnalyzer
 from ..usage import BudgetGuard, UsageTracker
+from .ids import format_node_id
 
 logger = logging.getLogger("shared-rag")
 
@@ -70,7 +71,7 @@ class SectionSummarizer(Generic[MetaT]):
         # 1. Check existing summary (usable even if LLM summarizer is disabled)
         if existing_summary:
             sec_node = node_class_for(metadata)(
-                node_id=f"{doc_id}#s{section_seq}_sum",
+                node_id=format_node_id(doc_id, section_seq, "section_summary"),
                 is_summary=True,
                 granularity="parent_summary",
                 parent_kind="section",
@@ -121,7 +122,7 @@ class SectionSummarizer(Generic[MetaT]):
             if res.finish_reason == FINISH_SKIPPED:
                 return SummarizerResult(summary_status="skipped")
             section_summary_node = node_class_for(metadata)(
-                node_id=f"{doc_id}#s{section_seq}_sum",
+                node_id=format_node_id(doc_id, section_seq, "section_summary"),
                 is_summary=True,
                 granularity="parent_summary",
                 parent_kind="section",
@@ -177,7 +178,7 @@ class SectionSummarizer(Generic[MetaT]):
                     if u_res.finish_reason == FINISH_SKIPPED:
                         continue
                     unit_node = node_class_for(metadata)(
-                        node_id=f"{doc_id}#s{section_seq}_u{u_idx}_sum",
+                        node_id=format_node_id(doc_id, section_seq, "unit_summary", u_idx),
                         is_summary=True,
                         granularity="parent_summary",
                         parent_kind="section_unit",

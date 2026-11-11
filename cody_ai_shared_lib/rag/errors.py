@@ -60,6 +60,18 @@ class MissingRequiredScopeError(RAGEngineError):
         self.missing_keys = list(missing_keys or [])
 
 
+class ScopeViolationError(RAGEngineError):
+    """Raised by a scoped store when a read or write names a scope other than the one it was built for.
+
+    The engine proves a scope was stated (MissingRequiredScopeError); a scoped store proves it is the
+    right one (§5.6). Typed, so it passes through call_store unchanged and the app can answer 403.
+    """
+
+    def __init__(self, message: str, key: str | None = None, **kwargs: Any):
+        super().__init__(message, **kwargs)
+        self.key = key
+
+
 class UnsupportedFilterError(RAGEngineError):
     """Raised when an unknown custom filter key or wrong value type is passed to a store."""
 

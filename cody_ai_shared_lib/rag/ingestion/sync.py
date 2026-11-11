@@ -6,17 +6,18 @@ from typing import Any, Generic
 from ..degradation import DegradationTracker
 from ..errors import StoreCapabilityError
 from ..models import IngestionProgress, MetaT, RAGDocumentInput, RAGNode
-from ..ports import Fingerprint, RAGStore, call_store
+from ..ports import Fingerprint, OwnerScope, RAGStore, SectionWrite, call_store
 from ..render import NodeRenderer
 from ..text.analyzer import TextAnalyzer
 from ..usage import BudgetGuard, UsageTracker
 from .embedder import BatchEmbedder
 from .nodes import (
     build_section_nodes,
-    embedding_signature,
     finalize_node,
     parse_node_id,
+    prepare_passages,
     prepare_summaries,
+    write_signatures,
 )
 from .splitter import TextSplitter
 from .summarizer import SectionSummarizer
@@ -37,6 +38,7 @@ class DocumentSynchronizer(Generic[MetaT]):
         summarizer: SectionSummarizer[MetaT],
         embedding_model: str,
         budget_guard: BudgetGuard | None = None,
+        embed_summaries: bool = True,
     ):
         self.store = store
         self.splitter = splitter
@@ -46,12 +48,14 @@ class DocumentSynchronizer(Generic[MetaT]):
         self.summarizer = summarizer
         self.embedding_model = embedding_model
         self.budget_guard = budget_guard
+        self.embed_summaries = embed_summaries
 
     def sync(
         self,
         doc: RAGDocumentInput[MetaT],
         usage_tracker: UsageTracker,
         degradation_tracker: DegradationTracker,
+        owner: OwnerScope | None = None,
     ) -> IngestionProgress:
         """Embed new or changed nodes, delete vanished ones, and skip unchanged ones.
 
@@ -67,7 +71,10 @@ class DocumentSynchronizer(Generic[MetaT]):
             )
 
         stored = call_store("get_fingerprints", lambda: self.store.get_fingerprints(doc.doc_id))
-        signature = embedding_signature(self.embedding_model, self.store.embedding_space(), self.splitter)
+        signatures = write_signatures(
+            self.embedding_model, self.store.embedding_space(), self.splitter, self.analyzer, caps.uses_analyzer_tokens
+        )
+        signature = signatures.embedding
         sections = sorted(doc.sections, key=lambda s: s.section_seq)
 
         current_ids: set[str] = set()
@@ -97,10 +104,12 @@ class DocumentSynchronizer(Generic[MetaT]):
                 if to_embed
                 else []
             )
-            nodes = [p[0] for p in pairs]
-            vectors = [p[1] for p in pairs]
-
-            section_summary = None
+            write = SectionWrite[MetaT](
+                doc_id=doc.doc_id,
+                section_seq=seq,
+                owner=owner or OwnerScope(),
+                passages=prepare_passages(pairs, signatures),
+            )
             if seq in changed_sections:
                 result = self.summarizer.summarize_section(
                     doc_id=doc.doc_id,
@@ -125,25 +134,16 @@ class DocumentSynchronizer(Generic[MetaT]):
                     usage_tracker,
                     degradation_tracker,
                     self.budget_guard,
+                    signatures=signatures,
+                    embed=self.embed_summaries,
                 )
-                section_summary = summaries.section_summary
-                nodes += summaries.unit_nodes
-                vectors += summaries.unit_vectors
-                regenerated_ids.update(n.node_id for n in summaries.unit_nodes)
-                if section_summary is not None:
-                    regenerated_ids.add(section_summary.node_id)
+                write.unit_summaries = summaries.unit_summaries
+                write.section_summary = summaries.section_summary
+                regenerated_ids.update(summaries.node_ids)
 
-            if nodes or section_summary is not None:
-                upserted += call_store(
-                    "upsert_section_nodes",
-                    lambda: self.store.upsert_section_nodes(
-                        doc_id=doc.doc_id,
-                        section_seq=seq,
-                        nodes=nodes,
-                        embeddings=vectors,
-                        summary=section_summary,
-                    ),
-                )
+            if write.passages or write.unit_summaries or write.section_summary is not None:
+                section_write = write
+                upserted += call_store("upsert_section", lambda: self.store.upsert_section(section_write))
 
         # Delete last: a failed sync leaves the old rows readable, and a re-run converges.
         section_seqs = {s.section_seq for s in sections}
@@ -191,8 +191,8 @@ class DocumentSynchronizer(Generic[MetaT]):
         }
         for node_id in stored:
             parsed = parse_node_id(doc_id, node_id)
-            if parsed is not None and not parsed[1] and node_id not in current_ids:
-                changed.add(parsed[0])
+            if parsed is not None and not parsed.is_summary and node_id not in current_ids:
+                changed.add(parsed.section_seq)
         return changed
 
     @staticmethod
@@ -203,7 +203,6 @@ class DocumentSynchronizer(Generic[MetaT]):
         changed_sections: set[int],
     ) -> bool:
         parsed = parse_node_id(doc_id, node_id)
-        if parsed is None or not parsed[1]:
+        if parsed is None or not parsed.is_summary:
             return False
-        seq = parsed[0]
-        return seq in section_seqs and seq not in changed_sections
+        return parsed.section_seq in section_seqs and parsed.section_seq not in changed_sections

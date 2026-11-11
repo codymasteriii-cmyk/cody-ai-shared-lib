@@ -15,6 +15,7 @@ from .errors import (
     RAGEngineError,
     RAGStageError,
     RetrievalError,
+    ScopeViolationError,
     StoreCapabilityError,
     UnsupportedFilterError,
 )
@@ -49,6 +50,7 @@ from .ingestion import (
     SummarizerResult,
     TextSplitter,
 )
+from .ingestion.ids import NodeIdParts, format_node_id, parse_node_id
 from .integrations.sse import format_event
 from .intent import (
     HybridIntentRouter,
@@ -100,9 +102,12 @@ from .ports import (
     EmbeddingSpace,
     Fingerprint,
     Guard,
+    OwnerScope,
     RAGStore,
     ScopeStats,
+    SectionWrite,
     StoreCapabilities,
+    SummaryWrite,
 )
 from .postgen import CitationExtractor, OutputSanitizer, QuoteValidator
 from .postgen.citations import CitationFormatter, RefCitationFormatter, strip_markers
@@ -179,6 +184,7 @@ __all__ = [
     "ProfileConfigError",
     "StoreCapabilityError",
     "MissingRequiredScopeError",
+    "ScopeViolationError",
     "UnsupportedFilterError",
     "EmbeddingProviderError",
     "EmbeddingSignatureMismatch",
@@ -234,6 +240,12 @@ __all__ = [
     "ScopeStats",
     "StoreCapabilities",
     "Fingerprint",
+    "OwnerScope",
+    "SectionWrite",
+    "SummaryWrite",
+    "NodeIdParts",
+    "format_node_id",
+    "parse_node_id",
     "RAGStore",
     "InMemoryRAGStore",
     "Guard",

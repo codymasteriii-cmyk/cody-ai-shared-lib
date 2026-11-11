@@ -1,6 +1,7 @@
 """Tier ladder AdaptiveRetrievalStrategy driven by ordered (predicate, strategy) rules (§8.9, §8.12)."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Generic
 
@@ -13,6 +14,8 @@ from .context import RetrievalContext, RetrievalStrategy
 
 # The lowest rate estimate_tokens can produce (non-CJK text), so a document ruled out is truly too large.
 _MIN_TOKENS_PER_CHAR = 0.25
+
+logger = logging.getLogger("shared-rag")
 
 OVERRIDE_STRATEGY = "$override"
 NO_STRATEGY = "none"
@@ -39,26 +42,42 @@ class RuleContext:
     caps: StoreCapabilities
     profile: EngineProfile
     stats: ScopeStats | None = field(default=None)
+    notes: list[str] = field(default_factory=list)
 
 
-def _hint_exceeds_gate(rc: RuleContext, gate: int) -> bool:
-    """True when doc_total_chars proves the visible text cannot fit, avoiding a store call (§8.2)."""
+def _visible_hint_chars(rc: RuleContext) -> int | None:
+    """The caller's doc_total_chars hint, limited to the visible range. Never trusted for a decision."""
     chars = rc.request.doc_total_chars
     if chars is None:
-        return False
+        return None
     if rc.filters.max_char_offset is not None:
         chars = min(chars, rc.filters.max_char_offset)
     if rc.filters.max_char_offset_by_doc:
         chars = min(chars, max(rc.filters.max_char_offset_by_doc.values()))
-    return chars * _MIN_TOKENS_PER_CHAR > gate
+    return chars
+
+
+def _hint_exceeds_gate(rc: RuleContext, gate: int) -> bool:
+    """True when doc_total_chars proves the visible text cannot fit, avoiding a store call (§8.2)."""
+    chars = _visible_hint_chars(rc)
+    return chars is not None and chars * _MIN_TOKENS_PER_CHAR > gate
 
 
 def fits_full_context(rc: RuleContext) -> bool:
     gate = rc.profile.retrieval.full_context_max_tokens
     if gate <= 0 or not rc.caps.supports_full_scope_fetch or _hint_exceeds_gate(rc, gate):
         return False
-    rc.stats = rc.store.scope_stats(rc.filters)
-    return 0 < rc.stats.total_tokens <= gate
+    stats = rc.stats = rc.store.scope_stats(rc.filters)
+    hint = _visible_hint_chars(rc)
+    if stats.total_tokens == 0 and hint:
+        # Diagnostic only: the store stays the source of truth (§4.2, INT-06)
+        note = (
+            f"scope_stats reports 0 tokens but doc_total_chars says {hint} visible chars; "
+            "scope_stats must describe the text fetch_full_scope returns, not indexed rows"
+        )
+        logger.warning(f"[RAG] {note}")
+        rc.notes.append(note)
+    return 0 < stats.total_tokens <= gate
 
 
 BUILTIN_PREDICATES = {
@@ -110,6 +129,8 @@ class AdaptiveRetrievalStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
                 if rc.stats is not None
                 else "Tier 0 not evaluated"
             )
+            if rc.notes:
+                measured += "; note: " + "; ".join(rc.notes)
             return QueryPlan(
                 strategy=strategy,
                 tier_decision_reason=f"{strategy}: rule {number} {predicate}; {measured}",

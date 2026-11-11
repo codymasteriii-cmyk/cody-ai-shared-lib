@@ -113,6 +113,9 @@ class SummariesConfig(BaseModel):
     enabled: bool = False
     min_chars_for_summary: int = 1500
     summary_unit_chars: int = 8000
+    # False skips the summary_embedding stage; the store then gets summaries without vectors and must
+    # override upsert_section (§6.3, INT-02). Keep True for a store that searches summaries by vector.
+    embed_summaries: bool = True
 
 
 class IngestionConfig(BaseModel):
