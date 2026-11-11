@@ -46,8 +46,9 @@ class WidenTimeWindow:
         window = state.filters.date_range_utc
         if not state.soft_date_window or window is None or window[0] is None or window[1] is None:
             return None
-        start, end = window
-        new_start = end - (end - start) * self.factor
+        start: datetime = window[0]
+        end: datetime = window[1]
+        new_start: datetime = end - (end - start) * self.factor
         hard = state.hard_date_range
         if hard is not None and hard[0] is not None:
             new_start = max(new_start, as_utc(hard[0]))

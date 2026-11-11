@@ -162,17 +162,17 @@ def prepare_summaries(
     prepared: PreparedSummaries[MetaT] = PreparedSummaries()
     if result.section_summary is not None:
         node = result.section_summary
-        vector = vectors.get(node.node_id)
+        summary_vector = vectors.get(node.node_id)
         prepared.section_summary = SummaryWrite[MetaT](
-            node=node, vector=vector, fingerprint=signatures.fingerprint(node, has_vector=vector is not None)
+            node=node, vector=summary_vector, fingerprint=signatures.fingerprint(node, has_vector=summary_vector is not None)
         )
     for position, unit in enumerate(result.unit_summaries):
-        vector = vectors.get(unit.node_id)
+        unit_vector = vectors.get(unit.node_id)
         prepared.unit_summaries.append(
             SummaryWrite[MetaT](
                 node=unit,
-                vector=vector,
-                fingerprint=signatures.fingerprint(unit, has_vector=vector is not None),
+                vector=unit_vector,
+                fingerprint=signatures.fingerprint(unit, has_vector=unit_vector is not None),
                 unit_seq=_unit_seq(unit.span.doc_id, unit, position),
             )
         )

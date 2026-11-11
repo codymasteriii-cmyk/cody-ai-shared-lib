@@ -8,7 +8,7 @@
 | **Target Runtime** | Python 3.13+ (1.2.0: the owner's floor for all projects; the models use PEP 696 `TypeVar` defaults), synchronous core (matching the rest of `cody_ai_shared_lib`) with a bounded thread pool for independent calls |
 | **Primary Consumers** | **AudioReading** (`audiolib.codymasterai.com`), **NewsIntelligence / Pulse Nexus** (`ai.codymasterai.com`), **KnowledgeBase** |
 | **Owner** | Cody (`codymasteriii@gmail.com`) / Cody AI Engineering Team |
-| **Last Updated** | 2026-11-08 |
+| **Last Updated** | 2026-11-11 |
 | **Previous version** | `specs/archive/RAG_SPEC_1.0.0-draft.md` |
 
 ---
@@ -270,6 +270,9 @@ cody_ai_shared_lib/
     ├── trace.py                        # RAGTrace, StageRecord, RAGObserver (§13.2)
     ├── degradation.py                  # Degradation records, agreed-degradation table, fallbacks (§13.3)
     ├── cache.py                        # Cache port, LRU default, ResultCache seam (§13.5)
+    ├── retrieval_pipeline.py           # filters, guards, strategies, fan-out, stages, relaxation (§5, §7.8, §8, §9)
+    ├── answering.py                    # AnswerFinalizer: citations, quotes, sanitizer, state (§11)
+    ├── vectors.py                      # zero-vector helpers (§6.4)
     ├── text/analyzer.py                # TextAnalyzer, CjkAwareAnalyzer, estimate_tokens (§6.1)
     ├── ingestion/                      # splitter.py, summarizer.py, embedder.py, nodes.py, ids.py (node ids), sync.py (§6)
     ├── intent/                         # models.py, heuristic.py, jev_gate.py, llm_rewriter.py, router.py, temporal.py (§7)
@@ -278,9 +281,9 @@ cody_ai_shared_lib/
     │                                   # hierarchical.py, adaptive.py, relaxation.py, graph and loop seams later (§8)
     ├── postretrieval/                  # base.py, threshold.py, dedup.py, rerank.py, boosters.py, stages.py;
     │                                   # expansion and MMR seams later (§9)
-    ├── context/                        # budgeter.py, conversation.py, compressor.py, fence.py, assembler.py (§10)
+    ├── context/                        # budgeter.py, conversation.py, fence.py, assembler.py; compressor.py later (§10)
     ├── generation/                     # GenerationStrategy, StuffStrategy, structured seam, streaming (§10)
-    ├── postgen/                        # citations.py, quotes.py, policy.py, repair.py, sanitizer.py (§11)
+    ├── postgen/                        # citations.py, quotes.py, sanitizer.py; policy.py, repair.py in P4 (§11)
     ├── integrations/sse.py             # framework-free SSE formatter (§10.9)
     ├── testing/                        # RAGStoreContractTests, BrokenStore, fixtures, canary helpers (§4.6)
     └── eval/                           # RESERVED: protocols only in v1, never imported by runtime modules (§14)
@@ -665,7 +668,8 @@ class RAGStore(ABC, Generic[MetaT]):
                       top_k: int) -> list[RAGNode[MetaT]]:
         """Descending raw cosine; vector_score and vector_rank (1-based) filled;
         score_kind='cosine'. MUST return up to top_k rows that satisfy filters
-        (no post-filter shortfall, see §4.6 filtered recall)."""
+        (no post-filter shortfall, see §4.6 filtered recall). Ranked searches
+        (vector, keyword, hybrid) return only non-summary rows (1.2.0)."""
 
     def keyword_search(self, query_text: str, filters: RAGFilterSpec, top_k: int,
                        analyzer_tokens: list["TokenGroup"] | None = None) -> list[RAGNode[MetaT]]:
@@ -730,6 +734,7 @@ class Fingerprint(BaseModel):
     embedding_signature: str | None   # f"{model}|{dims}|{task_type}|{splitter_version}"; None: stored without a vector
     fts_signature: str | None = None   # f"{analyzer_name}|{analyzer_version}" when uses_analyzer_tokens
 
+class RAGStore(ABC, Generic[MetaT]):       # continued: lifecycle methods
     def upsert_section_nodes(self, doc_id: str, section_seq: int, nodes: list[RAGNode[MetaT]],
                              embeddings: list[list[float]],
                              summary: RAGNode[MetaT] | None = None) -> int:
@@ -1310,7 +1315,7 @@ class IntentRouter(Protocol):
 - Uses the profile's `TextAnalyzer`.
 
 ### 7.4 Layer 2: Jev gate **[v1, default off, opt-in per app]**
-- Runs only when `profile.router.enable_jev=True` **and** `TYPESAFE_API_KEY` is present. **All presets ship with it off.**
+- Runs only when `profile.router.enable_jev=True` **and** `TYPESAFE_API_KEY` (or `VERCEL_API_KEY`, which the lib's `JevClient` also reads) is present. **All presets ship with it off.**
 - A single `system_one()` call (through `ModelGateway`) with:
   - `scope`: a `Choice` over the two scopes;
   - `needs_query_rewrite`: a `Noul`;
@@ -2794,7 +2799,7 @@ Each entry: the decision, the alternative rejected, and why. Sections refer here
 | **1.1.12-draft** | 2026-11-08 | cody-ai-shared-lib agent | Minor contract alignment from Phase 1–3 code review: added `"degradation"` to `RAGStreamEvent.event` in §3.11 (matching §10.8); added `doc_id: str | None = None` to `ReindexStatus` in §6.6; noted single-argument `(ctx: CallContext)` support on `BudgetGuard.before_call` in §13.1. |
 | **1.1.13-draft** | 2026-11-08 | cody-ai-shared-lib agent | `BudgetGuard.before_call` returns to the single five-argument signature; the optional one-argument form added in 1.1.12 is removed. |
 | **1.1.14-draft** | 2026-11-08 | cody-ai-shared-lib agent | Owner decisions after the Phase 1–3 review; **changes the contract the app agents agreed through 1.1.8.** Separate hydration removed: retrieval methods return complete rows, and apps choose fields through their adapter and renderer (§4.3). Embedding failures are all-or-nothing per section or single node, and per node in `prepare_nodes`, which now returns `PreparedBatch` (§6.4, §6.4.1, DG-08); `ingest_embedding` and `passages_failed` removed. `entity_mode="boost"` and `EntityBooster` removed; the default is `"ignore"`. `retrieval.rerank_candidates` added; `top_k`, rerank and variant fusion limit only ranked nodes. Follow-up reuse rule defined (§7.7). History capped by `reserved_history_tokens`, default 8,000. `no_retrieval` returns `answer_found=None`. Fence id is 16 hex; stateless ids derive from the request scope. `fallbacks` keys `intent`, `generation` and `observer` removed. `router` selection and layout corrected to match the code; `transforms/` and `postretrieval/` are the package names; `TransformContext` defined. Acceptance criteria added and revised. |
-| **1.2.0-draft** | 2026-11-11 | cody-ai-shared-lib agent | AudioReading integration feedback round 2 (INT-01..INT-09), agreed with its agent and the owner; the working files were removed after agreement (git history, commit `37d76fd`). All changes are additive. **Writes:** `RAGStore.upsert_section(SectionWrite)` with `OwnerScope`, `SummaryWrite` and `PreparedNode` passages; the default delegates to the unchanged `upsert_section_nodes`; the engine writes through it from `ingest_document` and `sync_document`, and the store persists the engine's fingerprints instead of computing them (§4.4.1). `unit_seq` is 0-based and gaps are allowed. Node ids are opaque keys to stores; `format_node_id` and `parse_node_id(doc_id, …)` are public. **Summaries:** `ingestion.summaries.embed_summaries` (default `True`); summaries are embedded in one batch (§6.3). **Ownership:** an `owner` on `ingest_document`, `sync_document` and `prepare_nodes`, required for every `required_filter_keys` entry (`doc_ids` excepted) and carried to `CallContext`, `SectionWrite` and observers (§6.4.2); isolation keys per app settled with the owner (News: user plus domain). Scoped stores, `ScopeViolationError` and `engine.with_store` (§5.6, §12.1); `InMemoryRAGStore` records owners and offers `scoped()`. **Kit:** `make_owner`, `make_filters`, `make_scoped_store` and `full_scope_filters` hooks; writes go through `upsert_section`; check 15 now checks fingerprints are persisted as given; checks 16–18 added (§4.6). **Contract text:** `scope_stats` describes what `fetch_full_scope` returns, with a WARNING when a caller hint disagrees (§4.2, §8.2); `fetch_full_scope` never crosses a section boundary (§4.2). **Streaming:** `RAGStream` is a context manager; `usage_total` is final after end or close; `done` carries `request_id`; a caller-contract box in §10.8. Audio's proposed AC-RAG-A33..A41 became AC-RAG-78..87. |
+| **1.2.0-draft** | 2026-11-11 | cody-ai-shared-lib agent | AudioReading integration feedback round 2 (INT-01..INT-09), agreed with its agent and the owner; the working files were removed after agreement (git history, commit `37d76fd`). All changes are additive. **Writes:** `RAGStore.upsert_section(SectionWrite)` with `OwnerScope`, `SummaryWrite` and `PreparedNode` passages; the default delegates to the unchanged `upsert_section_nodes`; the engine writes through it from `ingest_document` and `sync_document`, and the store persists the engine's fingerprints instead of computing them (§4.4.1). `unit_seq` is 0-based and gaps are allowed. Node ids are opaque keys to stores; `format_node_id` and `parse_node_id(doc_id, …)` are public. **Summaries:** `ingestion.summaries.embed_summaries` (default `True`); summaries are embedded in one batch (§6.3). **Ownership:** an `owner` on `ingest_document`, `sync_document` and `prepare_nodes`, required for every `required_filter_keys` entry (`doc_ids` excepted) and carried to `CallContext`, `SectionWrite` and observers (§6.4.2); isolation keys per app settled with the owner (News: user plus domain). Scoped stores, `ScopeViolationError` and `engine.with_store` (§5.6, §12.1); `InMemoryRAGStore` records owners and offers `scoped()`. **Kit:** `make_owner`, `make_filters`, `make_scoped_store` and `full_scope_filters` hooks; writes go through `upsert_section`; check 15 now checks fingerprints are persisted as given; checks 16–18 added (§4.6). **Contract text:** `scope_stats` describes what `fetch_full_scope` returns, with a WARNING when a caller hint disagrees (§4.2, §8.2); `fetch_full_scope` never crosses a section boundary (§4.2). **Streaming:** `RAGStream` is a context manager; `usage_total` is final after end or close; `done` carries `request_id`; a caller-contract box in §10.8. Audio's proposed AC-RAG-A33..A41 became AC-RAG-78..87. **Independent code review (2026-11-11), agreed with the owner:** Python ≥ 3.13; sync refreshes kept summaries and FTS tokens, and rows stored without a vector carry `embedding_signature=None`; `splitter_version` defaults to `None`; nodes carry the document `revision`; scoped stores refuse writes into another owner's document, rows without an owner fail closed on required keys, and a profile that requires the spoiler guard rejects a request with no boundary (the boundary is the furthest point reached, owner decision); explicit `empty_scope`; date windows intersect the hard range; ranked searches exclude summaries; Tier 3 keeps section or unit summaries, never both; full scope is de-overlapped; rerank per comparison variant; boosters and fusion leave ordered layers alone; Tier 0 flags `full_scope` and keeps atomic kinds whole; citation markers resolve regardless of the preceding character; summarizer forbids prior knowledge and fences its input; bounded error messages; structured cacheable prompt blocks for Claude; SQL templates rewritten; kit checks 19–24; `degradation_disclosure`, `FilterInferencer` and the optional extras built. AC-RAG-88..108. Positional node ids (§6.6) and whole-document sync are documented as intended. |
 
 ## Appendix C. Requests kept in the apps (pushbacks)
 
