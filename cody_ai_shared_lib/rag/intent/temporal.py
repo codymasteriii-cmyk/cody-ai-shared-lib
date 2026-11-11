@@ -165,3 +165,19 @@ class TemporalResolver:
     ) -> tuple[datetime | None, datetime | None]:
         """Resolve and validate a temporal range, repairing reversed bounds."""
         return self.repair_range(start, end)
+
+    def resolve(self, intent: Any) -> Any:
+        """Turn the intent's temporal fields into a concrete soft window (§7.6).
+
+        `date_window_days` counts back from the injected clock when the intent has a time expression
+        but no explicit range; reversed ranges are repaired. Applies to routed and caller-supplied
+        intents alike. Returns the same intent when nothing changes.
+        """
+        start, end = intent.range_start_utc, intent.range_end_utc
+        if intent.has_time_expression and start is None and end is None and intent.date_window_days:
+            end = self.clock.now_utc()
+            start = end - timedelta(days=intent.date_window_days)
+        start, end = self.repair_range(start, end)
+        if (start, end) == (intent.range_start_utc, intent.range_end_utc):
+            return intent
+        return intent.model_copy(update={"range_start_utc": start, "range_end_utc": end})

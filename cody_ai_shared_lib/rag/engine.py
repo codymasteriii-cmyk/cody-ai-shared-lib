@@ -454,7 +454,7 @@ class RAGEngine(Generic[MetaT]):
     def _resolve_intent(self, request: RAGQueryRequest, intent: QueryIntent | None, run: RequestRun) -> QueryIntent:
         if intent is not None:
             clamped = clamp_intent(intent.model_dump(exclude={"ext"}), run.degradations)
-            return self._with_ext(clamped, intent)
+            return self.temporal_resolver.resolve(self._with_ext(clamped, intent))
         started = run.trace.elapsed_ms()
         router = self._select_router(request)
         context = RouterContext(
@@ -471,7 +471,7 @@ class RAGEngine(Generic[MetaT]):
             "route": resolved.route,
             "scope": resolved.scope,
         }
-        return resolved
+        return self.temporal_resolver.resolve(resolved)
 
     @staticmethod
     def _with_ext(clamped: QueryIntent, original: QueryIntent) -> QueryIntent:
@@ -522,6 +522,17 @@ class RAGEngine(Generic[MetaT]):
             return self._variant_engine(request.variant).plan(request.model_copy(update={"variant": None}), intent)
         resolved = intent or QueryIntent(search_query=request.question, router_source="passthrough")
         filters, _, _ = self.pipeline.scoped_filters(request, resolved)
+        if filters.is_empty_scope:
+            # Hard constraints conflict: nothing can match, so no store call and no index is needed (§5.5)
+            return QueryPlan(
+                strategy="none",
+                tier_decision_reason="none: empty scope (hard constraints conflict)",
+                rule=0,
+                requires_index=False,
+                reads=frozenset(),
+                applied_filters=filters,
+                scope=None,
+            )
         return AdaptiveRetrievalStrategy.decide_tier(request, resolved, filters, self.store, self.profile, self.registry)
 
     def retrieve(self, request: RAGQueryRequest, intent: QueryIntent | None = None) -> RAGRetrievalResult[MetaT]:

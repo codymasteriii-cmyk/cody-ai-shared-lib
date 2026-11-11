@@ -286,19 +286,20 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         with self._lock:
             candidates: list[tuple[float, RAGNode[MetaT]]] = []
             for node in self._nodes.values():
-                if not self._passes_filters(node, filters):
-                    continue
+                if node.is_summary or not self._passes_filters(node, filters):
+                    continue                     # ranked searches never return summaries (§4.2)
                 if is_zero_vector(node.embedding):
                     continue
                 sim = self._cosine_similarity(query_vector, node.embedding)
                 if filters.min_similarity is not None and sim < filters.min_similarity:
                     continue
-                candidates.append((sim, copy.deepcopy(node)))
+                candidates.append((sim, node))
 
             # Sort descending by cosine similarity, break ties stably by node_id
             candidates.sort(key=lambda item: (-item[0], item[1].node_id))
             results: list[RAGNode[MetaT]] = []
-            for rank, (score, node) in enumerate(candidates[:top_k], start=1):
+            for rank, (score, stored) in enumerate(candidates[:top_k], start=1):
+                node = copy.deepcopy(stored)     # never mutate the stored row
                 node.score = score
                 node.score_kind = "cosine"
                 node.vector_score = score
@@ -323,8 +324,8 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         with self._lock:
             matched = []
             for node in self._nodes.values():
-                if not self._passes_filters(node, filters):
-                    continue
+                if node.is_summary or not self._passes_filters(node, filters):
+                    continue                     # ranked searches never return summaries (§4.2)
                 tokens = self._node_tokens(node)
                 if all(self._matches_group(tokens, group) for group in groups if group.tokens):
                     matched.append((node, tokens))
@@ -483,12 +484,35 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             )
             return [window_node]
 
+    def _full_scope(self, filters: RAGFilterSpec) -> list[RAGNode[MetaT]]:
+        """The scope's text in document order, without overlap (§4.2).
+
+        Passages overlap by design; each one contributes only the text after the previous one ended,
+        as fetch_local_window does. scope_stats measures this same list, so the two always agree.
+        """
+        matched = sorted(
+            (n for n in self._nodes.values() if self._passes_filters(n, filters) and not n.is_summary),
+            key=lambda n: (n.span.doc_id, n.span.section_seq, n.span.char_start),
+        )
+        stitched: list[RAGNode[MetaT]] = []
+        prev_doc, prev_end = None, 0
+        for node in matched:
+            trim = prev_end - node.span.char_start if node.span.doc_id == prev_doc else 0
+            if trim >= len(node.text):
+                continue
+            copy_node = copy.deepcopy(node)
+            if trim > 0:
+                copy_node.text = copy_node.text[trim:]
+                copy_node.span = copy_node.span.model_copy(update={"char_start": node.span.char_start + trim})
+                copy_node.token_estimate = estimate_tokens(copy_node.text)
+            stitched.append(copy_node)
+            prev_doc, prev_end = node.span.doc_id, max(prev_end if node.span.doc_id == prev_doc else 0, node.span.char_end)
+        return stitched
+
     def scope_stats(self, filters: RAGFilterSpec) -> ScopeStats:
         self._validate_filters(filters)
         with self._lock:
-            matched_nodes = [
-                n for n in self._nodes.values() if self._passes_filters(n, filters) and not n.is_summary
-            ]
+            matched_nodes = self._full_scope(filters)
             docs = {n.span.doc_id for n in matched_nodes}
             char_count = sum(len(n.text) for n in matched_nodes)
             est_tok = sum(
@@ -511,12 +535,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
     def fetch_full_scope(self, filters: RAGFilterSpec) -> list[RAGNode[MetaT]]:
         self._validate_filters(filters)
         with self._lock:
-            matched = [
-                copy.deepcopy(n) for n in self._nodes.values()
-                if self._passes_filters(n, filters) and not n.is_summary
-            ]
-            matched.sort(key=lambda n: (n.span.doc_id, n.span.section_seq, n.span.char_start))
-            return matched
+            return self._full_scope(filters)
 
     def fetch_nodes(self, node_ids: list[str], filters: RAGFilterSpec) -> list[RAGNode[MetaT]]:
         self._validate_filters(filters)

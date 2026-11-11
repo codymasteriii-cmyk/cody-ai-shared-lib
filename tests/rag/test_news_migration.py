@@ -263,7 +263,9 @@ def test_feed_search_sizing_and_2000_results():
     caps = StoreCapabilities(
         supports_vector_search=True,
     )
-    caps = caps.model_copy(update={"supports_keyword_fts": True})
+    # A feed-search store declares how many rows it can return (1.2.0, review item M17): the engine
+    # never asks a store for more than max_top_k, so news_search needs at least 2,001 here.
+    caps = caps.model_copy(update={"supports_keyword_fts": True, "max_top_k": 2001})
     store = InMemoryRAGStore(
         capabilities=caps,
         embedding_space=EmbeddingSpace(model="gemini-embedding-2", dims=768),

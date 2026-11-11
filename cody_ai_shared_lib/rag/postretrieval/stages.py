@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
+from ..granularity import is_ranked
+from ..transforms.fusion import fair_interleave
 from ..granularity import limit_ranked
 from ..models import RAGNode, ScoreKind
 from ..registry import ComponentDeps
@@ -34,12 +36,19 @@ class RerankStage:
         self.reranker = reranker
 
     def process(self, nodes: list[RAGNode[Any]], ctx: Any) -> list[RAGNode[Any]]:
-        reranked = self.reranker.rerank(
-            ctx.intent.search_query or ctx.request.question,
-            nodes,
-            ctx.target_limit(),
-            ctx,
-        )
+        limit = ctx.target_limit()
+        variants = list(getattr(ctx, "variants", None) or [])
+        if len(variants) <= 1:
+            reranked = self.reranker.rerank(ctx.intent.search_query or ctx.request.question, nodes, limit, ctx)
+        else:
+            # §9.3: rerank against each variant and merge fairly, so the second subject of a
+            # comparison is not scored against the first subject's query and crowded out
+            per_variant = [
+                [n for n in self.reranker.rerank(v.text, [n.model_copy() for n in nodes], limit, ctx) if is_ranked(n)]
+                for v in variants
+            ]
+            merged = fair_interleave(per_variant, limit)
+            reranked = [n for n in nodes if not is_ranked(n)] + merged
         ctx.reranked = any(n.rerank_score is not None for n in reranked)
         return reranked
 

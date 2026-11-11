@@ -344,7 +344,7 @@ class SourceSpan(BaseModel):
 | Trait | Meaning | Who reads it |
 | :--- | :--- | :--- |
 | `atomic` | Never split, compressed mid-unit, or truncated by budget; included whole or not at all. Sequential guards still apply (§5.2). | Splitter, compressor, budgeter |
-| `ordered` | Kept in document order; never reranked or reordered by score. | Rerankers, fusion, assembler |
+| `ordered` | Kept in document order; never reranked or reordered by score. Boosters and fusion rescore and reorder only ranked nodes; every other node keeps its position (1.2.0). | Rerankers, fusion, boosters, assembler |
 | `offset_addressable` | `text == document[char_start:char_end]`; offset snapping and boundary truncation are valid. | Guards, citation verifier, dedup |
 | `rerankable` | May be sent to a cross-encoder. | Reranker |
 | `summary` | Derived text describing a span (not a verbatim slice). | Sequential guard, assembler |
@@ -456,6 +456,7 @@ class RAGFilterSpec(BaseModel):
     date_field: str | None = None                        # which timestamp the range applies to
     min_similarity: float | None = None                  # raw cosine floor (§3.5)
     custom: dict[str, Any] = Field(default_factory=dict)
+    empty_scope: bool = False                            # 1.2.0: set by the engine on a hard conflict (§5.5)
 ```
 - **`custom` contract.** A store declares `StoreCapabilities.supported_custom_filters: dict[str, type]` (e.g. `{"favorites_only": bool, "categories_any": list[str]}`). The engine **MUST** reject unknown keys or values of the wrong type with `UnsupportedFilterError` before calling the store.
 - **`date_field`.** Names the timestamp a range applies to. A store declares `supported_date_fields` and a `time_basis` note (e.g. `"created_at = ingestion time; publication date not stored"`). A store may have only an ingestion timestamp; `time_basis` says so, and the assembler MAY state the note in the prompt.
@@ -974,6 +975,8 @@ See §10.3 and D-07.
   - boundaries take the minimum;
   - date ranges intersect;
   - `custom` keys must agree. A conflict yields an **empty scope**, and the engine returns the empty-retrieval answer (RAG-RES-4).
+  - **Empty scope is explicit (1.2.0).** A conflict sets `RAGFilterSpec.empty_scope`; the engine then makes no store call, `retrieve` returns no nodes, and `plan()` returns strategy `none` with reason "empty scope". This is distinct from a caller leaving a required key out, which still raises `MissingRequiredScopeError` (§5.6).
+  - **Date windows (1.2.0).** The intent's soft window is **intersected** with the caller's hard range, never dropped because one is set. When the two do not overlap, the hard range alone applies: a soft constraint never empties a hard scope. The guard enforces only the hard range, and relaxation widens or drops the soft window back to the hard range, never past it.
 - **Narrow-only inference.** An app-supplied `FilterInferencer` (KB-13) may propose extra filters from the question. Its patch is intersected, never unioned.
 - `applied_filters` on the result reports the final effective spec.
 
@@ -1320,7 +1323,8 @@ class IntentRouter(Protocol):
   - Windows are UTC calendar days with an inclusive end of day.
   - Reversed ranges are repaired.
   - "No usable dates" means no window.
-  - `date_window_days` counts back from `clock.now()`.
+  - `date_window_days` counts back from `clock.now()`: an intent with a time expression and no explicit range gets `[now - days, now]`.
+  - It runs on **every** intent, routed or supplied by the caller (`engine.query(req, intent=...)`), before the window is applied (1.2.0).
 - **The clock is injected** (`RAGEngine(clock=...)`). The engine never reads the system time directly (RAG-EVAL-4).
 - **Applied filters.** Every result carries `applied_filters`, so a UI can say "searched Oct 30 – Nov 6".
 - **Relaxation ladder (`profile.relaxation`, opt-in, default empty).**
@@ -1441,7 +1445,8 @@ class RetrievalStrategy(ABC, Generic[MetaT]):
   - **Diagnostic (1.2.0).** When the hint says the visible range has text but `scope_stats` reports zero tokens, the engine logs a WARNING and adds a note to `tier_decision_reason` naming `scope_stats`. Behaviour does not change; the note points at a store that counts indexed rows instead of source text (INT-06).
 - **Scope.** Tier 0 applies to any scope: one document (Audio), or a filtered corpus that fits (KB). The `tier_decision_reason` is recorded, e.g. `"full_context: 41k ≤ 120k tokens"`.
 - **Behaviour:**
-  1. Call `fetch_full_scope(filters)`. Nodes come back in document order, one per section or finer (§4.2), and the engine labels them `granularity="full_doc"`.
+  1. Call `fetch_full_scope(filters)`. Nodes come back in document order, one per section or finer (§4.2). The engine marks each with the flag `full_scope`; text kinds are relabelled `granularity="full_doc"`, while atomic kinds (`article`, `entry`) keep their granularity, so a budget drops them whole instead of cutting them (1.2.0). Nodes flagged `full_scope` are never ranked: `top_k`, thresholds, rerank and boosters leave them alone.
+  4. Tier 0 does not depend on the query, so with several query variants it runs once, not once per variant. Any strategy can declare `query_independent = True` for the same treatment.
   2. Guards apply as everywhere else (§5.4).
   3. No query embedding is computed.
 
@@ -1456,7 +1461,7 @@ class RetrievalStrategy(ABC, Generic[MetaT]):
 
 ### 8.3 Keyword tiers **[v1]**
 - **`KeywordOnlyStrategy`** (requires `supports_keyword_fts`): makes zero embedding calls.
-- **`KeywordFirstStrategy(min_hits=3, fallback="hybrid_rrf")`:**
+- **`KeywordFirstStrategy(min_hits=3, fallback="hybrid_rrf")`** (`min_hits` from `profile.retrieval.keyword_first_min_hits`; the fallback reason is appended to `tier_decision_reason`):
   - Runs keyword search first and returns its results when there are at least `min_hits` hits above the threshold.
   - Otherwise it runs the fallback strategy and records the reason.
 
@@ -1483,7 +1488,7 @@ class RetrievalStrategy(ABC, Generic[MetaT]):
 - **Requires:** `supports_parent_summaries`.
 - **Selected when** `intent.scope == "document_overview"` or `profile.retrieval.always_include_summaries` is set.
 - Steps:
-  1. `fetch_parent_summaries(filters, level)`. With `supports_summary_levels`, it picks the deepest level whose summaries fit the summary sub-budget.
+  1. `fetch_parent_summaries(filters, level)`. With `supports_summary_levels`, it picks the deepest level whose summaries fit the summary sub-budget. **Per section it keeps the section summary when it was admitted, else that section's unit summaries, never both** (§6.3; 1.2.0).
   2. Retrieve detail passages with Tier 2 (or Tier 1 when FTS is missing).
   3. Fetch the local window when a cursor is set, using the profile radius.
   4. Return all three layers.
@@ -1546,6 +1551,7 @@ default_registry = ComponentRegistry()   # built-ins pre-registered
 - The reranker runs only if it is enabled for the variant.
 - The `suggested_top_k` clamp does not apply. The result size is bounded by `profile.retrieval.retrieve_max_results`, and `truncated` is set when more results existed.
 - Guards, required scope and the trace all apply.
+- **Store limits (1.2.0).** The engine never asks a store for more than `capabilities().max_top_k` rows; when a request needs more, the result is marked `truncated`. A feed-search store therefore declares a `max_top_k` above its `retrieve_max_results`. `top_k_override` in retrieve mode is bounded by `retrieve_max_results`.
 - **Feed search is in scope (Q-08, D-21).** `retrieve()` MUST support NewsIntelligence's feed search: router `none`, explicit UI filters as hard filters, a store-side `min_similarity` floor (§9.1), no rerank, rows carrying the feed's fields (§4.3), and up to `retrieve_max_results` (2,000 for the `news_search` variant) with `truncated`.
 - **Boundary.** The engine returns a *relevance-ranked, filtered* list for a text query. Features of a search product stay in the app: re-sorting by date, pagination, facet counts, saved searches, and filter-only browsing with no query text (that is a plain SQL query, not retrieval).
 
@@ -1606,7 +1612,7 @@ class PostRetrievalStage(Protocol[MetaT]):
 - Drops nodes whose signal of the declared kind is below `min_similarity`. In a profile, `threshold(kind)` selects the kind; the value comes from `retrieval.min_similarity`. A threshold of `kind="cosine"` reads `vector_score`, never the fused `score`.
 - **A node with no value for the declared signal passes** (it was not scored on that signal). In a hybrid result, a keyword-only hit has `vector_score=None` and is kept by a cosine threshold.
 - **Hybrid profiles express the cosine floor store-side**, through `RAGFilterSpec.min_similarity` (default from `profile.retrieval.min_similarity`), which the store applies to the vector branch only. `ThresholdFilter(kind="cosine")` is for dense-only profiles. This keeps today's NewsIntelligence behaviour, where the full-text branch has no similarity gate.
-- A threshold configured for a kind the pipeline cannot produce raises `ProfileConfigError` at construction.
+- A threshold configured for a kind the pipeline cannot produce raises `ProfileConfigError` at construction. Checked in 1.2.0: `threshold(rerank)` needs a rerank stage before it; `threshold(bm25)` cannot follow `dense_vector`; `threshold(cosine)` cannot follow `keyword_only`.
 - Nodes with `ordered` or `atomic` traits from Tier 0 and local windows are exempt.
 
 ### 9.2 Deduplication
@@ -1622,7 +1628,7 @@ class Reranker(Protocol):
 ```
 - Reranks only nodes with the `rerankable` trait. `ordered` nodes keep their positions in their own budget zone.
 - **Candidate pool.** When a rerank stage is active, strategies fetch `retrieval.rerank_candidates` nodes (default `top_k × 3`, limited by the store's `max_top_k`) and the reranker returns `top_k`.
-- Sends `renderer.rerank_text(node)` with the primary query. For comparisons, it reranks per variant and merges with `fair_interleave`, so the second subject is not crowded out.
+- Sends `renderer.rerank_text(node)` with the primary query. For comparisons (implemented in 1.2.0), it reranks per variant and merges with `fair_interleave`, so the second subject is not crowded out.
 - Sets `rerank_score`, and `score_kind="rerank"`.
 - **Jina built-in.** The model id comes from `ModelBindings.reranker` (no default model in the lib). Endpoint `https://api.jina.ai/v1/rerank`, timeout `profile.reranker_timeout_seconds` (4.0 s).
 - **RAG-RES-2.** A non-200 response, a timeout or an exceeded deadline keeps the incoming order truncated to `top_k` (DG-06): ERROR log, degradation recorded with `impact="Results were not reranked; order comes from hybrid/vector search."`. How the answer treats it is the caller's choice (§10.10). A missing `JINA_API_KEY` while reranking is enabled is a startup error.
@@ -1630,6 +1636,7 @@ class Reranker(Protocol):
 ### 9.4 Fusion and boosters **[v1]**
 - **`ScoreFusionStage(weights)`.** Combines min-max-normalized signals: semantic, keyword, rerank, recency, and any app `renderer.features(meta)` such as News priority or KB confidence. The result is written as `score` with `score_kind="fused"`, and the weights are recorded in the trace.
 - **`RecencyBooster(half_life_days, weight)`.** Multiplies by `1 + weight · 2^(-age/half_life)`, using `renderer.timestamp` and `clock.now()`.
+- Both stages touch only ranked nodes; ordered layers and Tier 0 text keep their scores and positions (§3.3).
 - Weights come from the profile and are tuned with evaluation data. The lib never hardcodes app-specific weights.
 
 > **Rationale:**
@@ -1663,7 +1670,8 @@ Runs every guard's `verify` on every node, one final time, before assembly.
    - `summary` nodes: up to 25%;
    - `local_window`: up to 25%;
    - ranked nodes (`passage`, `article`, `entry`, `full_doc`): the remainder.
-   Unused sub-budget flows to ranked nodes.
+   Unused sub-budget flows to ranked nodes. (`context.local_window_ratio` defaults to 0.25 as stated; `context.retrieved_ratio` is deprecated and ignored, because ranked nodes take the remainder.)
+   When summaries do not all fit, the **oldest are dropped first**; the summaries nearest the reader's position are kept (1.2.0).
 
 `atomic` nodes are included whole or not at all. A first non-atomic node larger than its zone is truncated to fit and flagged `truncated_by_budget`. The verbose trace records tokens per zone.
 
@@ -1949,7 +1957,7 @@ class EngineProfile(BaseModel):
     def validate(self, registry: ComponentRegistry) -> None: ...  # raises ProfileConfigError(missing, unknown)
 ```
 - **No model id is hardcoded in the lib.** Presets take `models=` as a required argument: `EngineProfile.long_form_reader(models=ModelBindings(...))`.
-- `validate()` lists **every** problem at once: missing bindings for enabled stages, unknown component names, threshold/score-kind mismatches, a zone ratio sum above 1, and a Tier 0 gate that does not fit: `full_context_max_tokens` plus the reserved instruction, history and question zones must not exceed `max_context_tokens`.
+- `validate()` lists **every** problem at once: missing bindings for enabled stages, unknown component names, threshold/score-kind mismatches, a zone ratio sum above 1, and a Tier 0 gate that does not fit: `full_context_max_tokens` plus the reserved instruction, history and question zones must not exceed `max_context_tokens` (the question reserve is counted since 1.2.0).
 - **Model lists.** Each binding is an ordered list. Its models may come from the same provider (for example two Gemini models when an app has only a Gemini key). A one-model list is valid; the backup-model degradation (DG-02) then does not apply, and a failure after retries raises.
 - `fingerprint()` and `version` are recorded in every trace. Named variants (`news_chat`, `news_search`) share one base and differ only in their override block.
 - **Sibling engines.** `engine.with_profile(profile)` and `engine.with_store(store)` (1.2.0) return engines that share the pool, cache, gateway, registry, observers and guards, and differ only in the profile or the store. They also share the fence secret, so stateless fence ids, and with them the cacheable prompt prefix, stay the same across siblings (D-06). `with_store` is how an app serves each request from a store scoped to the signed-in user (§5.6) without building a pool per request.
@@ -2032,7 +2040,7 @@ class EngineProfile(BaseModel):
    resp = engine.query(req, intent=intent)
    ```
    The analytics branch stays in the app (R-06). Persona text comes from `system_prompt_variables`.
-4. **Feed search.** `engine.retrieve(req)` with the `news_search` variant (router `none`, no rerank, `retrieve_max_results` sized for the feed). See §8.10 for what stays in the app.
+4. **Feed search.** `engine.retrieve(req)` with the `news_search` variant (router `none`, no rerank, `retrieve_max_results` sized for the feed). The adapter declares `max_top_k` above `retrieve_max_results` (at least 2,001 for 2,000), or results are capped and marked `truncated` (§8.10). See §8.10 for what stays in the app.
 
 ### 12.5 Recipe C: KnowledgeBase
 1. **Store.** A Postgres adapter, or `InMemoryRAGStore` for evaluation.
@@ -2510,7 +2518,7 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-71** | Prepared nodes | RAG-ING-13, §4.6 #15 | A row inserted by the app from `prepare_nodes` is skipped by `sync_document` and `reconcile` (no re-embedding); changing the node's text makes it stale; the fingerprints equal those `upsert_section_nodes` would write. In a batch, a failed node is listed in `failed` with no vector or fingerprint, and the good nodes are returned; a batch with no success raises. |
 | **AC-RAG-72** | Flag streaming | §10.5 | `Based on…` is released at its first character with `answer_found=None`; `[Source](u)` at its second. `\n[[answer_found=partial]]\nText` emits only `Text` and sets the flag, under any chunking down to one character per chunk. `[[answer_found=maybe]]` is removed, logged at WARNING and gives `None`. A flag-like text that never closes is released at 32 characters; one still held at end of stream is released as a last delta. |
 | **AC-RAG-73** | Sentence cut | §5.2 rule 2, RAG-ING-2 | With `B` mid-sentence in English, Chinese and mixed text, the node ends at the last complete sentence before `B`, including closing quotes (`他说：“走吧。”`); `3.14` is not treated as a sentence end. `span.char_end` matches the shortened text and never exceeds `B`. A passage and a local window at the same `B` get the same cut. With no sentence end before `B`, or one more than `max_snap_back_chars` back, the cut is exactly `B`. A second guard pass changes nothing. The canary test (AC-RAG-23) passes with this cut. |
-| **AC-RAG-74** | Ranked limits | §9, §9.3 | With 30 summaries, a local window and passages, `top_k=8` keeps every summary and the window and cuts only passages. Tier 0 returns the whole scope under any strategy override or secondary query. A rerank stage receives `top_k × 3` candidates. |
+| **AC-RAG-74** | Ranked limits | §9, §9.3 | With 30 summaries, a local window and passages, `top_k=8` keeps every summary and the window and cuts only passages. When Tier 0 runs, whether chosen by the rules or by `strategy_override="full_context"`, the whole scope is returned: `top_k`, secondary queries and variant fusion never cut it. A rerank stage receives `top_k × 3` candidates. |
 | **AC-RAG-75** | Follow-up reuse | §7.7 | A follow-up with no new terms runs no search or embedding. One with new terms shares the ranked slots evenly with prior passages. A request with `cursor_offset` always gets a current local window. Repeated and oversized `prior_nodes` are capped on input. |
 | **AC-RAG-76** | History | §10.1, §10.2 | The history zone is capped by `reserved_history_tokens`. The last two exchanges are always present, shortened if oversized. Older turns are chosen by retention score and stay in chronological order. |
 | **AC-RAG-77** | Per-node preparation | §6.4.1 | `prepare_node` raises on failure. `prepare_nodes` returns the good nodes and names the failed ones, and raises only when none succeeded. |
@@ -2532,6 +2540,10 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-93** | Fail-closed scope | §4.5 | On a store with a required tenant, a row with no owner never matches a tenant filter; on a store without one, it still does. |
 | **AC-RAG-94** | Required boundary | §5.2 | With `long_form_reader`, a request without `max_char_offset` raises `MissingRequiredScopeError`; the document length as boundary is accepted; a per-document map missing a document in scope raises. |
 | **AC-RAG-95** | Guard inputs | §5.1, §12.1 | The temporal guard dates a node by its `date_field`, else `renderer.timestamp`, and drops an undated node unless the store applied the filter. `with_store` and `with_profile` siblings share the fence secret. |
+| **AC-RAG-96** | Empty scope | §5.5 | A store requiring `doc_ids`, with request `doc_ids=["a"]` and `document_id="b"`: `retrieve` returns no nodes and `plan()` returns `none` with no store call; a request that omits the key still raises `MissingRequiredScopeError`. |
+| **AC-RAG-97** | Date windows | §5.5, §7.6 | Hard range Jan–Jun plus intent window Jun 1–7 applies Jun 1–7; a window outside the hard range leaves the hard range. Relaxation widens or drops back to the hard range, never past it. `date_window_days=3` under a frozen clock gives `[now-3d, now]`; a reversed range is repaired. |
+| **AC-RAG-98** | Layer selection | §4.2, §8.6 | Ranked searches return no summaries. Tier 3 returns the section summary or its units, never both. Full scope has no overlapping text and `scope_stats` measures the same text. |
+| **AC-RAG-99** | Ranking contract | §3.3, §8.2, §9 | Reranking a comparison scores each subject against its own variant and keeps both. Boosters leave an ordered node in place with its score. Tier 0 keeps an `entry` atomic, flags it `full_scope`, and never ranks it. The engine never requests more than `max_top_k` rows and marks the result truncated. `threshold(rerank)` without a rerank stage fails at startup. Summaries over budget drop oldest first. |
 
 ### 16.2 Delivery phases (Q-04)
 Delivery follows production need: first what both production apps share, then AudioReading (which has no RAG today), then the NewsIntelligence migration, then KnowledgeBase (still in development, so the easiest to adapt) and everything else. Each step ends with every existing `cody-ai-shared-lib` test and every new `tests/rag/` test passing.

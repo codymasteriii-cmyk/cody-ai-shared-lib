@@ -16,6 +16,21 @@ from .hybrid_rrf import HybridRRFStrategy
 from .shared import fetch_window
 
 
+def select_summary_layer(summaries: list[RAGNode[MetaT]]) -> list[RAGNode[MetaT]]:
+    """Per section, the section summary when it was admitted, else that section's unit summaries (§6.3).
+
+    The store admits a section summary only if it ends before the boundary, so a section with one is
+    fully read and its units would repeat it. Document order is kept.
+    """
+    has_section_summary = {
+        (n.span.doc_id, n.span.section_seq) for n in summaries if n.parent_kind != "section_unit"
+    }
+    return [
+        n for n in summaries
+        if n.parent_kind != "section_unit" or (n.span.doc_id, n.span.section_seq) not in has_section_summary
+    ]
+
+
 class HierarchicalSummaryStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
     name: ClassVar[str] = "hierarchical"
     version: ClassVar[str] = "1.0.0"
@@ -26,8 +41,8 @@ class HierarchicalSummaryStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
         if not self.is_runnable(caps):
             raise StoreCapabilityError("HierarchicalSummaryStrategy requires store capability 'supports_parent_summaries'")
 
-        summaries = ctx.store.fetch_parent_summaries(ctx.filters)
-        cursor = ctx.request.cursor_offset if ctx.request.cursor_offset is not None else ctx.filters.max_char_offset
+        summaries = select_summary_layer(ctx.store.fetch_parent_summaries(ctx.filters))
+        cursor =ctx.request.cursor_offset if ctx.request.cursor_offset is not None else ctx.filters.max_char_offset
         window = fetch_window(ctx, cursor)
 
         if HybridRRFStrategy.is_runnable(caps):

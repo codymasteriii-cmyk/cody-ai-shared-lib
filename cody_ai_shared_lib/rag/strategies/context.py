@@ -45,11 +45,11 @@ class RetrievalContext(BaseModel, Generic[MetaT]):
     def target_limit(self) -> int:
         """Compute effective target candidate count based on mode (§7.1, §8.10)."""
         if self.mode == "retrieve":
-            return (
-                self.request.top_k_override
-                or self.profile.retrieval.retrieve_max_results
-                or self.profile.retrieval.top_k
-            )
+            cap = self.profile.retrieval.retrieve_max_results
+            override = self.request.top_k_override
+            if override and cap:
+                override = min(override, cap)        # retrieve size is bounded by retrieve_max_results
+            return override or cap or self.profile.retrieval.top_k
         return (
             self.request.top_k_override
             or self.intent.suggested_top_k
@@ -60,10 +60,15 @@ class RetrievalContext(BaseModel, Generic[MetaT]):
     def candidate_limit(self) -> int:
         """How many ranked candidates to fetch: one extra to detect truncation, or a reranker's pool (§9.3)."""
         floor = self.target_limit() + 1
+        store_max = self.store.capabilities().max_top_k
+        if floor > store_max:
+            # The store cannot return enough rows to tell whether more exist: report it as truncated
+            self.truncated = True
+            return store_max
         if not self.rerank_active:
             return floor
         pool = self.profile.retrieval.rerank_candidates or self.target_limit() * 3
-        return max(floor, min(pool, max(floor, self.store.capabilities().max_top_k)))
+        return max(floor, min(pool, store_max))
 
 
 class RetrievalStrategy(ABC, Generic[MetaT]):
@@ -72,6 +77,8 @@ class RetrievalStrategy(ABC, Generic[MetaT]):
     version: ClassVar[str] = "1.0.0"
     requires: ClassVar[frozenset[str]] = frozenset()
     experimental: ClassVar[bool] = False
+    # True when the result does not depend on the query text, so query variants need not re-run it
+    query_independent: ClassVar[bool] = False
 
     @classmethod
     def is_runnable(cls, capabilities: Any) -> bool:

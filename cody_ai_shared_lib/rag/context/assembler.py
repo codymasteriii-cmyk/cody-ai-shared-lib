@@ -9,7 +9,14 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Generic, Sequence
 
-from ..granularity import GRANULARITY_FULL_DOC, GRANULARITY_LOCAL_WINDOW, TRAIT_ATOMIC, TRAIT_SUMMARY, has_trait
+from ..granularity import (
+    FLAG_FULL_SCOPE,
+    GRANULARITY_FULL_DOC,
+    GRANULARITY_LOCAL_WINDOW,
+    TRAIT_ATOMIC,
+    TRAIT_SUMMARY,
+    has_trait,
+)
 from ..models import MetaT, RAGNode, RAGQueryRequest
 from ..ports import NodeRenderer
 from ..postgen.citations import CitationFormatter, RefCitationFormatter
@@ -198,7 +205,8 @@ class ContextAssembler(Generic[MetaT]):
             return accepted
 
         summary_budget = allocation.summary_budget + max(0, allocation.history_budget - history_used)
-        fitted_summaries = fit(summary_nodes, summary_budget)
+        nearest_first = sorted(summary_nodes, key=lambda item: self._document_order(item[1]), reverse=True)
+        fitted_summaries = fit(nearest_first, summary_budget)
         summary_used = sum(item[3] for item in fitted_summaries)
         for idx, node, block, _ in fitted_summaries:
             included.append((idx, node))
@@ -216,7 +224,8 @@ class ContextAssembler(Generic[MetaT]):
         ranked_used = sum(item[3] for item in fitted_ranked)
         for idx, node, block, _ in fitted_ranked:
             included.append((idx, node))
-            if node.granularity == GRANULARITY_FULL_DOC and not {"truncated_by_guard", "truncated_by_budget"} & set(node.flags):
+            in_full_scope = node.granularity == GRANULARITY_FULL_DOC or FLAG_FULL_SCOPE in node.flags
+            if in_full_scope and not {"truncated_by_guard", "truncated_by_budget"} & set(node.flags):
                 # Whole Tier 0 sections stay in the cacheable prefix (§10.3)
                 stable_blocks.append((self._document_order(node), block))
             else:

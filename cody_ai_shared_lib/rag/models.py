@@ -118,11 +118,18 @@ class RAGFilterSpec(BaseModel):
     date_field: str | None = None
     min_similarity: float | None = None
     custom: dict[str, Any] = Field(default_factory=dict)
+    # Set by the engine when hard constraints conflict (§5.5). The engine then answers "not found"
+    # without calling the store. Distinct from a caller leaving a required key out, which is an error.
+    empty_scope: bool = False
 
     @property
     def is_empty_scope(self) -> bool:
-        """True when the filters can match nothing, such as after a hard conflict (§5.5)."""
-        return self.doc_ids is not None and not self.doc_ids
+        """True when the filters can match nothing: after a hard conflict, or an explicit empty doc list."""
+        return self.empty_scope or (self.doc_ids is not None and not self.doc_ids)
+
+    def _mark_empty(self) -> None:
+        self.empty_scope = True
+        self.doc_ids = []               # stores that receive it anyway match nothing
 
     def patch(self, patch: Any) -> RAGFilterSpec:
         """Combine a patch by narrowing only; a conflict yields an empty scope (§5.5)."""
@@ -141,13 +148,18 @@ class RAGFilterSpec(BaseModel):
             if current is None:
                 setattr(self, key, value)
             elif current != value:
-                self.doc_ids = []
+                self._mark_empty()
         elif key == "doc_ids":
-            self.doc_ids = list(value) if self.doc_ids is None else [d for d in self.doc_ids if d in value]
+            if self.doc_ids is None:
+                self.doc_ids = list(value)
+            else:
+                self.doc_ids = [d for d in self.doc_ids if d in value]
+                if not self.doc_ids:
+                    self._mark_empty()
         elif key == "categories":
             self.categories = list(value) if self.categories is None else [c for c in self.categories if c in value]
             if not self.categories:
-                self.doc_ids = []
+                self._mark_empty()
         elif key == "max_char_offset":
             self.max_char_offset = value if self.max_char_offset is None else min(self.max_char_offset, value)
         elif key == "max_char_offset_by_doc":
@@ -179,11 +191,11 @@ class RAGFilterSpec(BaseModel):
         end = min(old_end, new_end) if (old_end and new_end) else (old_end or new_end)
         self.date_range_utc = (start, end)
         if start and end and start > end:
-            self.doc_ids = []
+            self._mark_empty()
 
     def _narrow_custom(self, key: str, value: Any) -> None:
         if key in self.custom and self.custom[key] != value:
-            self.doc_ids = []
+            self._mark_empty()
         else:
             self.custom[key] = value
 

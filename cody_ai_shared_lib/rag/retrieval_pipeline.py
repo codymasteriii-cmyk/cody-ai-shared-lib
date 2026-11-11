@@ -2,16 +2,18 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any, Callable, Generic, Literal
 
 from .context.conversation import FollowupTermCheck, reusable_node_ids
 from .errors import EmbeddingSignatureMismatch, ProfileConfigError
 from .granularity import is_ranked, limit_ranked
 from .guards import BUILTIN_GUARDS, build_turn_guards
-from .models import MetaT, QueryIntent, RAGFilterSpec, RAGNode, RAGQueryRequest, RAGRetrievalResult
+from .models import MetaT, QueryIntent, RAGFilterSpec, RAGNode, RAGQueryRequest, RAGRetrievalResult, as_utc
 from .ports import Guard, RAGStore, call_store, validate_scope
 from .registry import ComponentDeps, split_component_name
 from .runtime import RequestRun
+from .strategies.adaptive import AdaptiveRetrievalStrategy
 from .strategies.context import RetrievalContext, RetrievalStrategy
 from .strategies.relaxation import RelaxationState, build_relaxation
 from .transforms import QueryVariant, TransformContext, fair_interleave, fuse_variants
@@ -72,22 +74,42 @@ class RetrievalPipeline(Generic[MetaT]):
         if floor is not None:
             filters.min_similarity = max(floor, filters.min_similarity or floor)
 
-        if self.has_soft_date_window(request, intent):
-            filters.date_range_utc = (intent.range_start_utc, intent.range_end_utc)
+        window = self.soft_date_window(request, intent)
+        if window is not None:
+            filters.date_range_utc = window
         return filters
 
     @staticmethod
-    def has_soft_date_window(request: RAGQueryRequest, intent: QueryIntent | None) -> bool:
-        return (
-            intent is not None
-            and intent.has_time_expression
-            and request.filters.date_range_utc is None
-            and bool(intent.range_start_utc or intent.range_end_utc)
-        )
+    def soft_date_window(
+        request: RAGQueryRequest, intent: QueryIntent | None
+    ) -> tuple[datetime | None, datetime | None] | None:
+        """The intent's time window intersected with the caller's hard range (§5.5, D-04).
+
+        None when the intent has no window, or when the window lies outside the hard range: a soft
+        constraint never empties a hard scope, so the hard range alone applies then.
+        """
+        if intent is None or not intent.has_time_expression or not (intent.range_start_utc or intent.range_end_utc):
+            return None
+        start, end = _utc(intent.range_start_utc), _utc(intent.range_end_utc)
+        hard = request.filters.date_range_utc
+        if hard is not None:
+            hard_start, hard_end = _utc(hard[0]), _utc(hard[1])
+            start = max(start, hard_start) if (start and hard_start) else (start or hard_start)
+            end = min(end, hard_end) if (end and hard_end) else (end or hard_end)
+            if start and end and start > end:
+                return None
+        return start, end
+
+    @classmethod
+    def has_soft_date_window(cls, request: RAGQueryRequest, intent: QueryIntent | None) -> bool:
+        return cls.soft_date_window(request, intent) is not None
 
     def turn_guards(self, request: RAGQueryRequest, filters: RAGFilterSpec, soft_date: bool = False) -> list[Guard]:
         """Build the guards active for this turn; a soft date window is not a guard (D-04)."""
-        guard_filters = filters.model_copy(update={"date_range_utc": None}) if soft_date else filters
+        # The guard enforces only the caller's hard range; the soft window is the relaxable part (D-04)
+        guard_filters = (
+            filters.model_copy(update={"date_range_utc": request.filters.date_range_utc}) if soft_date else filters
+        )
         return build_turn_guards(
             filters=guard_filters,
             analyzer=self.deps.analyzer,
@@ -108,7 +130,9 @@ class RetrievalPipeline(Generic[MetaT]):
         guards = self.turn_guards(request, filters, soft_date)
         for guard in guards:
             filters = filters.patch(guard.to_filter())
-        validate_scope(filters, self.store.capabilities())
+        if not filters.empty_scope:
+            # A hard conflict means no store call happens at all; a missing key is still an error
+            validate_scope(filters, self.store.capabilities())
         return filters, guards, soft_date
 
     # ── Pipeline ──────────────────────────────────────────────────────────
@@ -303,8 +327,23 @@ class RetrievalPipeline(Generic[MetaT]):
             nodes = self._enforce_guards(nodes, guards, run)
         return nodes
 
+    def _query_independent(self, ctx: RetrievalContext[MetaT], strategy: RetrievalStrategy[MetaT]) -> bool:
+        """True when the tier this request runs gives the same result for every query variant (§8.2)."""
+        if getattr(strategy, "query_independent", False):
+            return True
+        if not isinstance(strategy, AdaptiveRetrievalStrategy):
+            return False
+        plan = AdaptiveRetrievalStrategy.decide_tier(
+            ctx.request, ctx.intent, ctx.filters, ctx.store, ctx.profile, ctx.registry
+        )
+        if plan.strategy == "none":
+            return True
+        chosen = (ctx.registry or self.deps.registry).get("strategy", plan.strategy)
+        return bool(getattr(chosen, "query_independent", False))
+
     def _fetch(self, ctx: RetrievalContext[MetaT], strategy: RetrievalStrategy[MetaT]) -> list[RAGNode[MetaT]]:
-        if len(ctx.variants) <= 1:
+        if len(ctx.variants) <= 1 or self._query_independent(ctx, strategy):
+            # Tier 0 and "no retrieval" do not depend on the query: run them once, not per variant
             return call_store(strategy.name, lambda: strategy.retrieve(ctx))
 
         def run_variant(variant: QueryVariant) -> tuple[list[RAGNode[MetaT]], RetrievalContext[MetaT]]:
@@ -395,7 +434,9 @@ class RetrievalPipeline(Generic[MetaT]):
     ) -> tuple[list[RAGNode[MetaT]], RetrievalContext[MetaT], list[str]]:
         """Walk the opt-in ladder while results are too few; hard limits stay out of reach (§7.6)."""
         applied: list[str] = []
-        state = RelaxationState(ctx.filters, ctx.intent, soft_date, request.filters.min_similarity)
+        state = RelaxationState(
+            ctx.filters, ctx.intent, soft_date, request.filters.min_similarity, request.filters.date_range_utc
+        )
         budget = self.profile.runtime.stage_budgets.get("relaxation", 0.0)
         for step in self.relaxation_steps:
             if len(nodes) >= self.profile.retrieval.min_results_before_relax:
@@ -442,3 +483,7 @@ def apply_guards(
             record_effect(guard.name, len(result) - len(kept), truncated)
         result = kept
     return result
+
+
+def _utc(value: datetime | None) -> datetime | None:
+    return as_utc(value) if value is not None else None

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Generic
 from ..errors import ProfileConfigError
-from ..granularity import TRAIT_ORDERED, has_trait
+from ..granularity import is_ranked
 from ..models import MetaT, RAGNode
 
 VALID_THRESHOLD_KINDS = frozenset(["cosine", "rerank", "bm25", "score"])
@@ -36,8 +36,8 @@ class ThresholdFilter(Generic[MetaT]):
         """
         passed: list[RAGNode[MetaT]] = []
         for n in nodes:
-            if has_trait(n.granularity, TRAIT_ORDERED):
-                # Tier 0 text and local windows are not ranked by similarity (§9.1)
+            if not is_ranked(n):
+                # Tier 0 text, summaries and local windows are not ranked by similarity (§9.1)
                 passed.append(n)
                 continue
             if self.kind == "cosine":
