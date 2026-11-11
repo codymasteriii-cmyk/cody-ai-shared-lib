@@ -315,8 +315,8 @@ class QueryIntent(BaseModel, Generic[ExtT]):
     route: Literal["rag", "no_retrieval"] = "rag"
     scope: Literal["local_lookup", "document_overview"] = "local_lookup"
     search_query: str = ""
+    # Extra searches, one per comparison subject or other part of the question (§7.8)
     secondary_queries: list[str] = Field(default_factory=list)
-    sub_questions: list[str] = Field(default_factory=list)
     is_comparison: bool = False
     is_followup: bool = False
 

@@ -2,7 +2,7 @@
 
 | | |
 | :--- | :--- |
-| **Document Version** | 1.2.0-draft |
+| **Document Version** | 1.2.1-draft |
 | **Status** | Draft, design agreed. Sibling feedback (AUD-01..26, NF-01..40, KB-01..23) was consolidated into C-01..C-39 and folded in; owner decisions Q-01..Q-08, the failure model and the pushbacks (Appendix C) are settled, and all three app agents (AudioReading, NewsIntelligence, KnowledgeBase) agreed through 1.1.8. Version 1.1.14 changes parts of that agreed contract after the Phase 1–3 review (Appendix B). Version 1.2.0 adds the changes agreed with AudioReading after its first integration (INT-01..INT-09); they are additive. This file records the outcome and its reasoning; the exchange itself was removed after agreement and remains in git history (commit `37d76fd`). This file is the only record of the design and its reasoning; the round's working files were removed on 2026-11-08. |
 | **Package Namespace** | `cody_ai_shared_lib.rag` (`cody-ai-shared-lib >= 0.8.0`) |
 | **Target Runtime** | Python 3.13+ (1.2.0: the owner's floor for all projects; the models use PEP 696 `TypeVar` defaults), synchronous core (matching the rest of `cody_ai_shared_lib`) with a bounded thread pool for independent calls |
@@ -1253,8 +1253,7 @@ class QueryIntent(BaseModel, Generic[ExtT]):
     route: Literal["rag", "no_retrieval"] = "rag"   # no_retrieval: greetings, thanks, meta-chat
     scope: Literal["local_lookup", "document_overview"] = "local_lookup"
     search_query: str
-    secondary_queries: list[str] = Field(default_factory=list)  # max 4
-    sub_questions: list[str] = Field(default_factory=list)      # max 4
+    secondary_queries: list[str] = Field(default_factory=list)  # max 4; one extra search per other subject or part
     is_comparison: bool = False
     is_followup: bool = False
 
@@ -1284,6 +1283,7 @@ class QueryIntent(BaseModel, Generic[ExtT]):
   - fusion weights (`exact_terms`, `negation`);
   - routing (`route`, `scope`).
   Everything else goes in `ext`.
+- **`sub_questions` removed (1.2.1).** Through 1.2.0 the intent had a `sub_questions` list that the router filled and nothing searched, which broke the core facet rule above: a compound question routed into it lost its second part. Every extra search is now a `secondary_queries` item (§7.8). An app that still constructs `QueryIntent(sub_questions=...)` gets no error (unknown fields are ignored) and no effect; it should use `secondary_queries`. A model output that still uses the old key is folded into `secondary_queries` when clamped.
 - `global_summary` was renamed `document_overview`; `comparison` and `conversational` became the orthogonal flags `is_comparison` and `is_followup`.
 - **RAG-SEC-3 (validation of model output).** Two cases are handled differently:
   - **Out-of-range values in valid output are clamped** (DG-05): numbers are clamped to their ranges, invalid enum values fall back to their defaults, lists are capped. Each clamp logs a WARNING. `ext` is validated by its own Pydantic validators.
@@ -1316,6 +1316,16 @@ class IntentRouter(Protocol):
 - An intent can never widen access. Every constraint it yields is soft and is intersected with hard filters (§5.5).
 - The `LLMIntentRouter` takes `intent_schema=MyIntent` (a subclass carrying `ext`) and an app prompt fragment. An app extends the JSON schema by subclassing, not by forking the router.
 
+> **Contract for callers: questions (1.2.1)**
+> - **Pass the user's question whole.** Do not split, rewrite or decompose it before calling the engine. Understanding the question (its parts, comparisons, dates, entities, follow-ups) is the router's job, and the router needs the whole question to do it.
+> - **Splitting needs a model.** Only an LLM router (`"llm"`, or `"auto"` with `models.intent` bound) turns a compound question such as "who is X and what is his job" or a comparison into extra searches (`secondary_queries`, §7.8). The heuristic router searches the question as one string: splitting on "and" without a model would break "Romeo and Juliet" or "pros and cons". `"auto"` without `models.intent` logs a startup WARNING saying so.
+> - **An app that understands its questions better owns that step**, through one of two seams, and the engine does not split again:
+>   - its own router (`RAGEngine(router=...)` or a registered name), for example News parsing comparisons and dates its own way;
+>   - or a precomputed intent (`engine.query(request, intent=...)`), with `secondary_queries` filled in.
+>
+>   Either way the engine searches `search_query` plus each `secondary_queries` item, merges them fairly (§7.8) and answers the whole question in one generation call.
+> - **Choosing is a profile decision, not code.** AudioReading can rely on the default LLM router; News can supply its own. Both use the same retrieval path.
+
 > **Rationale:** A public `route()` lets News branch to its analytics service before calling the engine, so the engine never dispatches work it does not understand (R-06). Passing the intent back avoids paying for routing twice.
 
 ### 7.3 Layer 1: heuristic (0 ms)
@@ -1345,7 +1355,7 @@ class IntentRouter(Protocol):
 - Generalized from NewsIntelligence's `intent_analyzer.py`.
 - Uses `ModelBindings.intent` and produces the JSON schema of `intent_schema`:
   - pronouns are resolved against the last three turns of fenced history;
-  - comparisons yield `secondary_queries`;
+  - comparisons and compound questions yield `secondary_queries`: one focused search per other subject or part that needs different passages, empty when one search covers everything (1.2.1);
   - temporal fields are filled when present.
 - Output is clamped per RAG-SEC-3.
 
@@ -1429,7 +1439,7 @@ class TransformContext:
     budget_guard: "BudgetGuard | None" = None
 ```
 - Built-ins:
-  - `SecondaryQueryFanOut` (**on by default**): one variant per `secondary_queries` item. This fixes Tier 2 ignoring the second subject of a comparison (NF-03).
+  - `SecondaryQueryFanOut` (**on by default**): one variant per `secondary_queries` item. This fixes Tier 2 ignoring the second subject of a comparison (NF-03), and since 1.2.1 the second part of a compound question.
   - `LexiconExpander(lexicon)`: app-supplied synonym or inflection map (KB-13).
   - `HyDETransform` (**seam**, later).
 - Variants are retrieved through the same strategy, run in parallel (§13.4), and merged by the shared `fuse_variants` helper:
@@ -2589,6 +2599,7 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-107** | Caching blocks | §10.3, §15 | With Tier 0 text, `user_blocks` join to `user_message`, the first is cacheable and holds the stable data, the last holds the question; Claude content marks only that block; the gateway passes the blocks to the client. |
 | **AC-RAG-108** | P1 gaps | §5.5, §10.10, §2.5 | `degradation_disclosure="note"` puts the impacts in the volatile part of the prompt, `"silent"` does not. A `FilterInferencer` narrows the scope and cannot widen it. `rag-cjk` and `rag-eval` extras are declared. |
 | **AC-RAG-109** | Summary search tokens | §6.6 | On a store with analyzer tokens, summaries are written with `fts_signature=None`, passages with the analyzer's signature; `needs_reindex` reports nothing stale and an unchanged sync writes nothing. Every SQL template starts with the migration checklist and pins `search_path = public, extensions, pg_temp`. |
+| **AC-RAG-110** | Compound questions | §7.1, §7.2, §7.8 | A question whose two parts live in different sections retrieves both when the router returns the second part in `secondary_queries`, and also when a model still returns it under the old `sub_questions` key; one search alone retrieves only the first part. Clamping merges both keys without duplicates and caps the total at 4 (DG-05). `QueryIntent` has no `sub_questions` field and the router prompt does not mention it. A supplied intent is searched as given, with no router call. |
 
 ### 16.2 Delivery phases (Q-04)
 Delivery follows production need: first what both production apps share, then AudioReading (which has no RAG today), then the NewsIntelligence migration, then KnowledgeBase (still in development, so the easiest to adapt) and everything else. Each step ends with every existing `cody-ai-shared-lib` test and every new `tests/rag/` test passing.
@@ -2813,6 +2824,7 @@ Each entry: the decision, the alternative rejected, and why. Sections refer here
 | **1.1.13-draft** | 2026-11-08 | cody-ai-shared-lib agent | `BudgetGuard.before_call` returns to the single five-argument signature; the optional one-argument form added in 1.1.12 is removed. |
 | **1.1.14-draft** | 2026-11-08 | cody-ai-shared-lib agent | Owner decisions after the Phase 1–3 review; **changes the contract the app agents agreed through 1.1.8.** Separate hydration removed: retrieval methods return complete rows, and apps choose fields through their adapter and renderer (§4.3). Embedding failures are all-or-nothing per section or single node, and per node in `prepare_nodes`, which now returns `PreparedBatch` (§6.4, §6.4.1, DG-08); `ingest_embedding` and `passages_failed` removed. `entity_mode="boost"` and `EntityBooster` removed; the default is `"ignore"`. `retrieval.rerank_candidates` added; `top_k`, rerank and variant fusion limit only ranked nodes. Follow-up reuse rule defined (§7.7). History capped by `reserved_history_tokens`, default 8,000. `no_retrieval` returns `answer_found=None`. Fence id is 16 hex; stateless ids derive from the request scope. `fallbacks` keys `intent`, `generation` and `observer` removed. `router` selection and layout corrected to match the code; `transforms/` and `postretrieval/` are the package names; `TransformContext` defined. Acceptance criteria added and revised. |
 | **1.2.0-draft** | 2026-11-11 | cody-ai-shared-lib agent | AudioReading integration feedback round 2 (INT-01..INT-09), agreed with its agent and the owner; the working files were removed after agreement (git history, commit `37d76fd`). All changes are additive. **Writes:** `RAGStore.upsert_section(SectionWrite)` with `OwnerScope`, `SummaryWrite` and `PreparedNode` passages; the default delegates to the unchanged `upsert_section_nodes`; the engine writes through it from `ingest_document` and `sync_document`, and the store persists the engine's fingerprints instead of computing them (§4.4.1). `unit_seq` is 0-based and gaps are allowed. Node ids are opaque keys to stores; `format_node_id` and `parse_node_id(doc_id, …)` are public. **Summaries:** `ingestion.summaries.embed_summaries` (default `True`); summaries are embedded in one batch (§6.3). **Ownership:** an `owner` on `ingest_document`, `sync_document` and `prepare_nodes`, required for every `required_filter_keys` entry (`doc_ids` excepted) and carried to `CallContext`, `SectionWrite` and observers (§6.4.2); isolation keys per app settled with the owner (News: user plus domain). Scoped stores, `ScopeViolationError` and `engine.with_store` (§5.6, §12.1); `InMemoryRAGStore` records owners and offers `scoped()`. **Kit:** `make_owner`, `make_filters`, `make_scoped_store` and `full_scope_filters` hooks; writes go through `upsert_section`; check 15 now checks fingerprints are persisted as given; checks 16–18 added (§4.6). **Contract text:** `scope_stats` describes what `fetch_full_scope` returns, with a WARNING when a caller hint disagrees (§4.2, §8.2); `fetch_full_scope` never crosses a section boundary (§4.2). **Streaming:** `RAGStream` is a context manager; `usage_total` is final after end or close; `done` carries `request_id`; a caller-contract box in §10.8. Audio's proposed AC-RAG-A33..A41 became AC-RAG-78..87. **Independent code review (2026-11-11), agreed with the owner:** Python ≥ 3.13; sync refreshes kept summaries and FTS tokens, and rows stored without a vector carry `embedding_signature=None`; `splitter_version` defaults to `None`; nodes carry the document `revision`; scoped stores refuse writes into another owner's document, rows without an owner fail closed on required keys, and a profile that requires the spoiler guard rejects a request with no boundary (the boundary is the furthest point reached, owner decision); explicit `empty_scope`; date windows intersect the hard range; ranked searches exclude summaries; Tier 3 keeps section or unit summaries, never both; full scope is de-overlapped; rerank per comparison variant; boosters and fusion leave ordered layers alone; Tier 0 flags `full_scope` and keeps atomic kinds whole; citation markers resolve regardless of the preceding character; summarizer forbids prior knowledge and fences its input; bounded error messages; structured cacheable prompt blocks for Claude; SQL templates rewritten; kit checks 19–24; `degradation_disclosure`, `FilterInferencer` and the optional extras built. AC-RAG-88..108. Positional node ids (§6.6) and whole-document sync are documented as intended. **AudioReading's reply to the review update:** summaries carry no search-token signature; template `search_path` includes `extensions`; a migration checklist heads every template (AC-RAG-109). The process-wide granularity table is recorded as Open Item OI-1. |
+| **1.2.1-draft** | 2026-11-11 | cody-ai-shared-lib agent | **Bug fix: compound questions.** `QueryIntent.sub_questions` was filled by the LLM router and never searched, so the second part of a question such as "who is X and what is his job" could be lost. It is removed; every extra search is a `secondary_queries` item, the router prompt says when to add one, and a model output still using the old key is folded in (§7.1, §7.5, §7.8). New caller contract in §7.2: pass the question whole; splitting needs an LLM router; an app that wants its own splitting supplies a router or an intent. AC-RAG-110. Not additive for code that reads `intent.sub_questions` (none known). |
 
 ## Appendix C. Requests kept in the apps (pushbacks)
 

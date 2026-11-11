@@ -29,8 +29,7 @@ Analyze the user's question and any conversation history. Return a JSON object w
   "route": "rag" | "no_retrieval",
   "scope": "local_lookup" | "document_overview",
   "search_query": "<focused search keywords or canonical question>",
-  "secondary_queries": ["<alternative phrasing or second comparison subject>", ...],
-  "sub_questions": ["<sub question if complex>", ...],
+  "secondary_queries": ["<one extra search per other subject or part of the question>", ...],
   "is_comparison": false,
   "is_followup": false,
   "has_time_expression": false,
@@ -43,6 +42,9 @@ Analyze the user's question and any conversation history. Return a JSON object w
   "suggested_top_k": 8
 }
 Use "require" only when the answer must come from passages that name the entity exactly; otherwise use "ignore".
+"search_query" covers the main part of the question. When the question has another part that needs different
+passages (a second subject to compare, or a second question such as "who is X and what is his job"), add one
+focused search per extra part to "secondary_queries" (at most 4). Leave it empty when one search covers everything.
 Output strictly valid JSON and nothing else."""
 
 # Conversation sent to the router is untrusted and is capped, so a long turn cannot inflate the call (§7.7)
@@ -104,18 +106,17 @@ def clamp_intent(
         except (ValueError, TypeError):
             date_win = None
 
-    # Cap list sizes
-    sec_q = list(raw.get("secondary_queries") or [])
+    # Extra searches: one list for comparison subjects and question parts (§7.8). A model output that still
+    # uses the pre-1.2.1 "sub_questions" key is folded in, so its parts are searched rather than dropped.
+    sec_q: list[str] = []
+    for item in [*(raw.get("secondary_queries") or []), *(raw.get("sub_questions") or [])]:
+        text = str(item).strip()
+        if text and text not in sec_q:
+            sec_q.append(text)
     if len(sec_q) > 4:
         if tracker:
             tracker.record("DG-05", "intent", f"secondary_queries size {len(sec_q)} capped to 4", "List capped")
         sec_q = sec_q[:4]
-
-    sub_q = list(raw.get("sub_questions") or [])
-    if len(sub_q) > 4:
-        if tracker:
-            tracker.record("DG-05", "intent", f"sub_questions size {len(sub_q)} capped to 4", "List capped")
-        sub_q = sub_q[:4]
 
     entities = list(raw.get("entity_terms") or [])
     if len(entities) > 8:
@@ -152,8 +153,7 @@ def clamp_intent(
         route=route,
         scope=scope,
         search_query=str(raw.get("search_query") or "").strip(),
-        secondary_queries=[str(q).strip() for q in sec_q if str(q).strip()],
-        sub_questions=[str(q).strip() for q in sub_q if str(q).strip()],
+        secondary_queries=sec_q,
         is_comparison=bool(raw.get("is_comparison", False)),
         is_followup=bool(raw.get("is_followup", False)),
         has_time_expression=bool(raw.get("has_time_expression", False)),
