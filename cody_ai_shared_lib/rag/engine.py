@@ -66,6 +66,7 @@ from .models import (
     ReindexStatus,
     UsageTotal,
 )
+from .render import renderer_problems
 from .ports import (
     Fingerprint,
     Guard,
@@ -169,6 +170,8 @@ class RAGEngine(Generic[MetaT]):
         self._variant_engines: dict[str, "RAGEngine[MetaT]"] = {}
         self._variant_lock = threading.Lock()
         self.dispatcher = ObserverDispatcher(observers=self._observers, observer_errors=profile.observer_errors)
+        # Bound before validation so a renderer that only stubs the protocol fails here (AC-RAG-111)
+        self.renderer = renderer or self.registry.get("renderer", profile.renderer)()
 
         self._raise_on_startup_problems()
 
@@ -177,7 +180,6 @@ class RAGEngine(Generic[MetaT]):
             self.cache = InMemoryLRUCache(max_bytes=profile.cache.max_bytes)
         self._pool = pool or make_bounded_pool(profile.runtime.pool_size)
 
-        self.renderer = renderer or self.registry.get("renderer", profile.renderer)()
         self.analyzer = self.registry.get("analyzer", profile.analyzer)()
         self.splitter = self.registry.get("splitter", profile.ingestion.splitter)(
             target_size=profile.ingestion.target_size,
@@ -284,6 +286,8 @@ class RAGEngine(Generic[MetaT]):
             problems.append(
                 f"models.embedding '{profile.models.embedding}' is not the model the lib embeds with ('{EMBEDDING_MODEL}')"
             )
+
+        problems.extend(renderer_problems(self.renderer))
 
         summaries = profile.ingestion.summaries
         if summaries.enabled and not summaries.embed_summaries and not store_overrides(self.store, "upsert_section"):

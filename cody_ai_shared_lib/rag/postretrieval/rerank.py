@@ -69,6 +69,8 @@ class JinaCrossEncoderReranker(Generic[MetaT]):
         if not rerankable:
             return nodes
 
+        # A renderer that only inherits the NodeRenderer stub is refused at startup (AC-RAG-111), so
+        # hasattr here only covers duck-typed renderers that leave rerank_text out
         doc_texts = [
             self.renderer.rerank_text(n) if hasattr(self.renderer, "rerank_text") else n.text
             for n in rerankable

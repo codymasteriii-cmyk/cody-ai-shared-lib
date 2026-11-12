@@ -141,7 +141,7 @@ from .profile import (
     news_search,
 )
 from .registry import ComponentDeps, ComponentRegistry, create_default_registry
-from .render import DefaultRenderer, NodeRenderer
+from .render import DefaultRenderer, NodeRenderer, renderer_problems
 from .runtime import (
     Clock,
     Deadline,
@@ -259,6 +259,7 @@ __all__ = [
     "build_turn_guards",
     "NodeRenderer",
     "DefaultRenderer",
+    "renderer_problems",
     # Cache
     "Cache",
     "InMemoryLRUCache",
