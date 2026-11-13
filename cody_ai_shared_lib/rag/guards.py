@@ -18,6 +18,7 @@ from .models import (
     RAGNode,
     as_utc,
 )
+from .render import metadata_value, parse_timestamp
 from .text.analyzer import CjkAwareAnalyzer, TextAnalyzer
 
 
@@ -167,17 +168,14 @@ class TemporalGuard:
         return node
 
     def _timestamp(self, node: RAGNode[Any]) -> datetime | None:
-        """The caller's date field when the node has it, else the renderer's timestamp (§5.1)."""
-        extra = getattr(node.metadata, "extra", {}) if hasattr(node.metadata, "extra") else {}
-        if isinstance(node.metadata, dict):
-            value = node.metadata.get(self.date_field)
-        else:
-            value = getattr(node.metadata, self.date_field, None) or (
-                extra.get(self.date_field) if isinstance(extra, dict) else None
-            )
-        if value is None and self.renderer is not None:
-            value = self.renderer.timestamp(node.metadata)
-        return value if isinstance(value, datetime) else None
+        """The caller's date field when the node has a readable one, else the renderer's timestamp (§5.1).
+
+        A datetime, a date or an ISO 8601 string all count: rows from JSON or SQL often carry dates as text.
+        """
+        parsed = parse_timestamp(metadata_value(node.metadata, self.date_field))
+        if parsed is None and self.renderer is not None:
+            parsed = parse_timestamp(self.renderer.timestamp(node.metadata))
+        return parsed
 
     def verify_citation(self, citation: RAGCitation) -> bool:
         return True
@@ -204,13 +202,7 @@ class TenantGuard:
     def verify(self, node: RAGNode[Any]) -> RAGNode[Any] | None:
         if self.tenant_or_user_id is None:
             return node
-        extra = getattr(node.metadata, "extra", {}) if hasattr(node.metadata, "extra") else {}
-        if isinstance(node.metadata, dict):
-            node_tenant = node.metadata.get("tenant_id")
-        else:
-            node_tenant = getattr(node.metadata, "tenant_id", None) or (
-                extra.get("tenant_id") if isinstance(extra, dict) else None
-            )
+        node_tenant = metadata_value(node.metadata, "tenant_id")   # only None is "no tenant"; "" or 0 is a value
         if node_tenant is not None and node_tenant != self.tenant_or_user_id:
             return None
         return node
@@ -255,30 +247,18 @@ class ScopeGuard:
     def verify(self, node: RAGNode[Any]) -> RAGNode[Any] | None:
         if self.doc_ids is not None and node.span.doc_id not in self.doc_ids:
             return None
-        extra = getattr(node.metadata, "extra", {}) if hasattr(node.metadata, "extra") else {}
+        # A node without the field is kept (the store filtered it); a present value, even False, 0 or "", must match
+        meta = node.metadata
         if self.domain_id is not None:
-            if isinstance(node.metadata, dict):
-                node_domain = node.metadata.get("domain_id")
-            else:
-                node_domain = getattr(node.metadata, "domain_id", None) or (
-                    extra.get("domain_id") if isinstance(extra, dict) else None
-                )
+            node_domain = metadata_value(meta, "domain_id")
             if node_domain is not None and node_domain != self.domain_id:
                 return None
         if self.categories is not None:
-            if isinstance(node.metadata, dict):
-                node_cat = node.metadata.get("category")
-            else:
-                node_cat = getattr(node.metadata, "category", None) or (
-                    extra.get("category") if isinstance(extra, dict) else None
-                )
+            node_cat = metadata_value(meta, "category")
             if node_cat is not None and node_cat not in self.categories:
                 return None
         for k, v in self.custom.items():
-            if isinstance(node.metadata, dict):
-                node_v = node.metadata.get(k)
-            else:
-                node_v = getattr(node.metadata, k, None) or (extra.get(k) if isinstance(extra, dict) else None)
+            node_v = metadata_value(meta, k)
             if node_v is not None and node_v != v:
                 return None
         return node

@@ -2,7 +2,7 @@
 
 | | |
 | :--- | :--- |
-| **Document Version** | 1.2.4-draft |
+| **Document Version** | 1.2.5-draft |
 | **Status** | Draft, design agreed. Sibling feedback (AUD-01..26, NF-01..40, KB-01..23) was consolidated into C-01..C-39 and folded in; owner decisions Q-01..Q-08, the failure model and the pushbacks (Appendix C) are settled, and all three app agents (AudioReading, NewsIntelligence, KnowledgeBase) agreed through 1.1.8. Version 1.1.14 changes parts of that agreed contract after the Phase 1–3 review (Appendix B). Version 1.2.0 adds the changes agreed with AudioReading after its first integration (INT-01..INT-09); they are additive. This file records the outcome and its reasoning; the exchange itself was removed after agreement and remains in git history (commit `37d76fd`). This file is the only record of the design and its reasoning; the round's working files were removed on 2026-11-08. |
 | **Package Namespace** | `cody_ai_shared_lib.rag` (`cody-ai-shared-lib >= 0.8.0`) |
 | **Target Runtime** | Python 3.13+ (1.2.0: the owner's floor for all projects; the models use PEP 696 `TypeVar` defaults), synchronous core (matching the rest of `cody_ai_shared_lib`) with a bounded thread pool for independent calls |
@@ -938,9 +938,11 @@ class Guard(Protocol):
 | Guard | Built from | `to_filter` | `verify` |
 | :--- | :--- | :--- | :--- |
 | `SequentialBoundaryGuard` | `max_char_offset`, `max_char_offset_by_doc` | Boundary fields | §5.2 |
-| `TemporalGuard` | `date_range_utc` set by the **caller** in `request.filters` | Date range and field | Drops nodes whose date is outside the range. The date is the node's `date_field` value when it has one, else `renderer.timestamp`. A node without a date is kept only if the store applied the filter (`date_field` in `supported_date_fields`). |
+| `TemporalGuard` | `date_range_utc` set by the **caller** in `request.filters` | Date range and field | Drops nodes whose date is outside the range. The date is the node's `date_field` value when it has a readable one, else `renderer.timestamp`: a `datetime`, a `date` (midnight) or an ISO 8601 string (a trailing `Z` is UTC) all count (1.2.5). A node without a readable date is kept only if the store applied the filter (`date_field` in `supported_date_fields`). |
 | `TenantGuard` | `tenant_or_user_id` | Tenant field | Drops nodes whose metadata tenant differs, when the renderer exposes it. |
 | `ScopeGuard` | `doc_ids`, `domain_id`, `categories`, `custom` | Those fields | Drops nodes outside them when the values are visible on the node. |
+
+- **What "visible" means (1.2.5).** A guard reads a field from a dict, an attribute, or `extra`. Only `None` (or an absent field) means the node does not carry it, and such a node is kept, because the store filtered it. Any other value, including `False`, `0` and `""`, must match the filter, or the node is dropped.
 
 Apps add guards by passing objects in `request.guards`, or by registering a guard name for a profile (`profile.guards=["not_superseded"]`).
 
@@ -1833,7 +1835,7 @@ class GenerationStrategy(Protocol):
 | `delta` | per model chunk | `{"text": "..."}`, raw text (markers included, flag withheld) |
 | `citations` | after the full text is verified | verified `citations`, `sources`, `citation_coverage` (the ratio, a number; the full `CitationCoverage` is in `RAGResponse`) |
 | `degradation` | immediately when an agreed degradation fires | the `Degradation` record; pre-generation ones arrive before the first `delta`, so a UI can show a notice |
-| `done` | last | `answer_id`, `answer_final`, the full `citations` and `sources` lists (same as the `citations` event), `usage`, `degradations`, `state`, `grounded`, `answer_found`, `request_id`, `message_id` if supplied |
+| `done` | last | `answer_id`, `answer_final`, the full `citations` and `sources` lists (same as the `citations` event), `usage`, `usage_total`, `degradations`, `state`, `grounded`, `answer_found`, `abstained`, `request_id`, `message_id` if supplied |
 | `error` | when the engine raises | `{"type": ..., "stage": ..., "message": ..., "request_id": ..., "usage": [...], "usage_total": {...}}` (no stack traces; usage of the calls already made, RAG-OPS-1); the iterator then raises the same exception. That exception is for the caller's logging and control flow; the route MUST NOT send a second error to the client |
 
 - **Verification happens at end of stream.** Deltas carry raw text. A UI that needs clean text uses `answer_final` from `done`, or `strip_markers(text, formatter)` while streaming.
@@ -2239,7 +2241,7 @@ RAGEngineError
 ├── EmbeddingSignatureMismatch
 ├── IntentParseError
 ├── RetrievalError
-├── GenerationError(reason: "all_models_failed" | "truncated" | "blocked", retrieval)
+├── GenerationError(reason: "all_models_failed" | "truncated" | "blocked" | "other", retrieval)   # "other": a stream broke after text was sent
 ├── RAGStageError(stage, cause)
 ├── BudgetExceeded
 ├── DeadlineExceeded
@@ -2608,6 +2610,7 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-111** | Renderer stubs | §3.4 | An engine given a renderer that subclasses `NodeRenderer` and leaves a method out raises `ProfileConfigError` at construction, naming each inherited stub and pointing to `DefaultRenderer`; this includes a class that lists `NodeRenderer` before `DefaultRenderer` in its bases. A `DefaultRenderer` subclass and a duck-typed class that implements every method are accepted. `renderer_problems` returns the same message. |
 | **AC-RAG-112** | Instruction budget | §10.1 | Instructions at or under `reserved_instruction_tokens` leave every zone as before. Longer instructions shrink the usable budget by the difference, so ranked passages get less and the prompt still fits `max_context_tokens`. Instructions above half of `max_context_tokens` raise `ProfileConfigError`, on the retrieval and the no-retrieval route alike. |
 | **AC-RAG-113** | Cancel token | §10.8, §13.4 | A token that is never set changes nothing. A token set before the call makes no model call and raises `RequestCancelled`. Set while the router runs (including from another thread), the request stops after the router with no retrieval or generation, and the error's `usage_total` includes the router call. Set during retrieval, no generation call is made. `retrieve` honours it. A stream cancelled after its first delta emits no further delta and no `done`, ends with an `error` event of type `RequestCancelled` carrying the spend, and `usage_total` is final. Observers receive `on_complete(trace, None)`. `RequestCancelled` is in the never-degradable list. |
+| **AC-RAG-114** | Guard reads | §5.1, RAG-OPS-1 | A `custom` filter wanting `True` drops a node with `False`, and one wanting `2` drops a node with `0`, for dict and model metadata and for a value in `extra`; a node without the field is kept. An empty `domain_id`, `category` or `tenant_id` does not pass a filter for another value. `TemporalGuard` keeps a node dated inside the range by an ISO string (with offset or `Z`), a date-only string, a `date` or a `datetime`, drops one outside it, and falls back to `renderer.timestamp` when the field is unreadable. A failed Jev call is recorded with `billing="unknown"`. |
 
 ### 16.2 Delivery phases (Q-04)
 Delivery follows production need: first what both production apps share, then AudioReading (which has no RAG today), then the NewsIntelligence migration, then KnowledgeBase (still in development, so the easiest to adapt) and everything else. Each step ends with every existing `cody-ai-shared-lib` test and every new `tests/rag/` test passing.
@@ -2836,6 +2839,7 @@ Each entry: the decision, the alternative rejected, and why. Sections refer here
 | **1.2.2-draft** | 2026-11-11 | cody-ai-shared-lib agent | **Hardening: renderer stubs** (AudioReading note `audio_renderer_hardening_note.md`). A renderer that subclassed the `NodeRenderer` protocol inherited empty bodies, so `embed_text` returned `None` and ingestion failed later as "empty input". The engine now refuses such a renderer at startup, and §3.4 and the docstring say to extend `DefaultRenderer`. New export `renderer_problems`. AC-RAG-111. Spec text corrected: the rolling summary is not built yet, so §7.7 now agrees with §10.2. Stricter at startup: a renderer that inherits any stub now fails, even one whose missing method the app's profile never read; `DefaultRenderer` subclasses and duck-typed renderers are unaffected. |
 | **1.2.3-draft** | 2026-11-12 | cody-ai-shared-lib agent | **Instruction budget measured** (§10.1). The budgeter subtracted a fixed 4,000 tokens for instructions whatever their size, so a long persona or custom instruction overran the window unnoticed, while the spec said "about 10%, minimum 1,500". The zone is now the measured system prompt with `reserved_instruction_tokens` as its floor, and instructions above half of `max_context_tokens` are refused. AC-RAG-112. With the default floor, a prompt under 4,000 tokens budgets exactly as before; only a longer one changes the passage budget. |
 | **1.2.4-draft** | 2026-11-12 | cody-ai-shared-lib agent | **Cancel token** (AudioReading integration test). A caller could stop generation by closing the stream, but not while the engine was routing or retrieving, because a generator cannot be closed from another thread while it runs. New `CancelToken` and `RequestCancelled`; `route`, `retrieve`, `query`, `stream_query` and `generate_from_nodes` take an optional keyword-only `cancel` (§10.8, §13.4, error tree). AC-RAG-113. Additive: calls without `cancel` behave as before. Granularity is the engine's stage boundaries, not a provider call in flight. |
+| **1.2.5-draft** | 2026-11-13 | cody-ai-shared-lib agent | **Pre-production review fixes.** (1) `TenantGuard` and `ScopeGuard` read metadata with `getattr(...) or extra.get(...)`, so a present `False`, `0` or `""` was taken as a missing field and the node was kept against a filter it did not match (affects `generate_from_nodes` and any store that misses a filter); only `None` now means missing (§5.1). (2) `TemporalGuard` treated a date stored as an ISO string or a `date` as no date, so a caller date range dropped every such node; it now parses them, as `DefaultRenderer.timestamp` already did. (3) A failed Jev call is recorded with `billing="unknown"` (RAG-OPS-1). (4) Spec text: the `done` event lists `usage_total` and `abstained`, and `GenerationError` lists the `"other"` reason, as the code already sent. AC-RAG-114. |
 
 ## Appendix C. Requests kept in the apps (pushbacks)
 

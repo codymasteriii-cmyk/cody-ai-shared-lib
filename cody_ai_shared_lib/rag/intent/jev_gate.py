@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 from ...pricing import compute_cost
 from ...tokens import estimate_tokens
@@ -63,6 +64,8 @@ class JevGateRouter:
                 )
                 return None
 
+        recorded = False
+        started = time.perf_counter()
         try:
             from ...jev import Choice, Noul
 
@@ -93,6 +96,7 @@ class JevGateRouter:
                     price_table_version=jev_res.price_table_version,
                 )
             )
+            recorded = True
 
             # Evaluate fast path criteria (AC-RAG-14)
             scope_ans = jev_res.answers.get("scope")
@@ -119,6 +123,20 @@ class JevGateRouter:
             return None
 
         except Exception as exc:
+            if not recorded:
+                # A failed attempt may still be billed; record it as unknown so the spend is not lost (RAG-OPS-1)
+                usage_tracker.record(
+                    StageUsage(
+                        stage="intent_jev",
+                        model="jev",
+                        input_tokens=estimate_tokens(query),
+                        calls=1,
+                        latency_ms=(time.perf_counter() - started) * 1000.0,
+                        estimated=True,
+                        billing="unknown",
+                        outcome="error",
+                    )
+                )
             if (fallbacks or {}).get("jev") == "raise":
                 raise RAGStageError(stage="intent_jev", message=f"Jev fast gate failed: {exc}", cause=exc) from exc
 

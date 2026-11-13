@@ -5,7 +5,7 @@ and citations without altering node storage.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Generic, Protocol, runtime_checkable
 
 from .models import MetaT, RAGNode
@@ -86,13 +86,35 @@ def renderer_problems(renderer: Any) -> list[str]:
     ]
 
 
-def _metadata_value(meta: Any, field: str) -> Any:
+def metadata_value(meta: Any, field: str) -> Any:
+    """A metadata field from a dict, an attribute or `extra`. Only None counts as missing, never False, 0 or ""."""
     if isinstance(meta, dict):
         return meta.get(field)
     value = getattr(meta, field, None)
     if value is None:
-        value = (getattr(meta, "extra", None) or {}).get(field)
+        extra = getattr(meta, "extra", None)
+        value = extra.get(field) if isinstance(extra, dict) else None
     return value
+
+
+_metadata_value = metadata_value
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    """A datetime from a datetime, a date (midnight) or an ISO 8601 string (a trailing "Z" is UTC); else None."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    if isinstance(value, str) and value.strip():
+        text = value.strip()
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    return None
 
 
 class DefaultRenderer(Generic[MetaT]):
@@ -119,14 +141,9 @@ class DefaultRenderer(Generic[MetaT]):
     def timestamp(self, meta: MetaT) -> datetime | None:
         """The first date-like metadata field, for apps that do not supply a renderer."""
         for field in ("created_at", "timestamp", "published_at", "date"):
-            value = _metadata_value(meta, field)
-            if isinstance(value, datetime):
-                return value
-            if isinstance(value, str):
-                try:
-                    return datetime.fromisoformat(value)
-                except ValueError:
-                    continue
+            parsed = parse_timestamp(_metadata_value(meta, field))
+            if parsed is not None:
+                return parsed
         return None
 
     def features(self, meta: MetaT) -> dict[str, float]:
