@@ -6,6 +6,7 @@ from .engine import RAGEngine, RAGStream
 from .errors import (
     BudgetExceeded,
     DeadlineExceeded,
+    RequestCancelled,
     EmbeddingProviderError,
     EmbeddingSignatureMismatch,
     GenerationError,
@@ -144,6 +145,7 @@ from .registry import ComponentDeps, ComponentRegistry, create_default_registry
 from .render import DefaultRenderer, NodeRenderer, renderer_problems
 from .runtime import (
     Clock,
+    CancelToken,
     Deadline,
     DeterministicRng,
     FrozenClock,
@@ -195,6 +197,7 @@ __all__ = [
     "RAGStageError",
     "BudgetExceeded",
     "DeadlineExceeded",
+    "RequestCancelled",
     # Granularity & traits
     "TRAIT_ATOMIC",
     "TRAIT_ORDERED",
@@ -305,6 +308,7 @@ __all__ = [
     "Rng",
     "SystemRng",
     "DeterministicRng",
+    "CancelToken",
     "Deadline",
     "make_bounded_pool",
     # Facade & Intent

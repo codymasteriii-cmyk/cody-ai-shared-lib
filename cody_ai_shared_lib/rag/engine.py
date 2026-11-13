@@ -27,6 +27,7 @@ from .errors import (
     GenerationError,
     ProfileConfigError,
     RAGEngineError,
+    RequestCancelled,
     StoreCapabilityError,
 )
 from .gateway import ModelGateway
@@ -85,7 +86,7 @@ from .postgen.sanitizer import OutputSanitizer
 from .profile import EngineProfile, ValidationReport
 from .registry import ComponentDeps, ComponentRegistry, create_default_registry
 from .retrieval_pipeline import RetrievalPipeline, apply_guards
-from .runtime import Clock, Deadline, RequestRun, Rng, SystemClock, SystemRng, make_bounded_pool
+from .runtime import CancelToken, Clock, Deadline, RequestRun, Rng, SystemClock, SystemRng, make_bounded_pool
 from .strategies.adaptive import AdaptiveRetrievalStrategy
 from .trace import ObserverDispatcher, RAGObserver, TraceCollector
 from .usage import BudgetGuard, UsageTracker
@@ -409,7 +410,7 @@ class RAGEngine(Generic[MetaT]):
 
     # ── Per-request plumbing ──────────────────────────────────────────────
 
-    def _begin(self, request: RAGQueryRequest) -> RequestRun:
+    def _begin(self, request: RAGQueryRequest, cancel: CancelToken | None = None) -> RequestRun:
         request_id = request.request_id or f"req-{uuid.uuid4().hex[:12]}"
         filters = request.filters
         variant = request.variant or self._variant_name
@@ -430,7 +431,7 @@ class RAGEngine(Generic[MetaT]):
             request_id=request_id,
             usage=usage,
             degradations=degradations,
-            deadline=Deadline(self.profile.runtime.deadline_seconds, clock=self.clock),
+            deadline=Deadline(self.profile.runtime.deadline_seconds, clock=self.clock, cancel=cancel),
             trace=TraceCollector(
                 request_id,
                 self.profile,
@@ -459,7 +460,8 @@ class RAGEngine(Generic[MetaT]):
 
     def _fail(self, exc: Exception, run: RequestRun, retrieval: RAGRetrievalResult[MetaT] | None = None) -> None:
         self._attach_failure_context(exc, run, retrieval)
-        logger.error(f"[RAG] id={run.request_id} error={type(exc).__name__} stage={getattr(exc, 'stage', None)}")
+        level = logging.INFO if isinstance(exc, RequestCancelled) else logging.ERROR   # a cancel is the caller's choice
+        logger.log(level, f"[RAG] id={run.request_id} error={type(exc).__name__} stage={getattr(exc, 'stage', None)}")
         try:
             trace = run.trace.build(None, run.degradations.degradations, run.usage.stage_usages, run.usage.total())
             run.trace.dispatcher.notify_complete(trace, None)
@@ -480,6 +482,7 @@ class RAGEngine(Generic[MetaT]):
         if intent is not None:
             clamped = clamp_intent(intent.model_dump(exclude={"ext"}), run.degradations)
             return self.temporal_resolver.resolve(self._with_ext(clamped, intent))
+        run.deadline.raise_if_cancelled("routing")
         started = run.trace.elapsed_ms()
         router = self._select_router(request)
         context = RouterContext(
@@ -491,6 +494,7 @@ class RAGEngine(Generic[MetaT]):
         )
         resolved = router.route(request, request.state, context)
         run.trace.record_stage(router.name, "router", started, version=router.version)
+        run.deadline.raise_if_cancelled("routing")
         run.trace.router_decision = {
             "source": resolved.router_source,
             "route": resolved.route,
@@ -541,11 +545,13 @@ class RAGEngine(Generic[MetaT]):
 
     # ── Public API ────────────────────────────────────────────────────────
 
-    def route(self, request: RAGQueryRequest) -> QueryIntent:
+    def route(self, request: RAGQueryRequest, *, cancel: CancelToken | None = None) -> QueryIntent:
         """Public routing entry point (§7.2, AC-RAG-16)."""
         if request.variant:
-            return self._variant_engine(request.variant).route(request.model_copy(update={"variant": None}))
-        return self._resolve_intent(request, None, self._begin(request))
+            return self._variant_engine(request.variant).route(
+                request.model_copy(update={"variant": None}), cancel=cancel
+            )
+        return self._resolve_intent(request, None, self._begin(request, cancel))
 
     def plan(self, request: RAGQueryRequest, intent: QueryIntent | None = None) -> QueryPlan:
         """Evaluate the adaptive rules without retrieval or generation (§8.12, AC-RAG-48, AC-RAG-58)."""
@@ -566,11 +572,15 @@ class RAGEngine(Generic[MetaT]):
             )
         return AdaptiveRetrievalStrategy.decide_tier(request, resolved, filters, self.store, self.profile, self.registry)
 
-    def retrieve(self, request: RAGQueryRequest, intent: QueryIntent | None = None) -> RAGRetrievalResult[MetaT]:
+    def retrieve(
+        self, request: RAGQueryRequest, intent: QueryIntent | None = None, *, cancel: CancelToken | None = None
+    ) -> RAGRetrievalResult[MetaT]:
         """Ranked list retrieval mode (§8.10, AC-RAG-51)."""
         if request.variant:
-            return self._variant_engine(request.variant).retrieve(request.model_copy(update={"variant": None}), intent)
-        run = self._begin(request)
+            return self._variant_engine(request.variant).retrieve(
+                request.model_copy(update={"variant": None}), intent, cancel=cancel
+            )
+        run = self._begin(request, cancel)
         try:
             resolved = self._resolve_intent(request, intent, run)
             result, _ = self.pipeline.run(request, resolved, "retrieve", run)
@@ -583,11 +593,15 @@ class RAGEngine(Generic[MetaT]):
         run.trace.dispatcher.notify_complete(result.trace, result)
         return result
 
-    def query(self, request: RAGQueryRequest, intent: QueryIntent | None = None) -> RAGResponse[MetaT]:
-        """End-to-end question answering (§14)."""
+    def query(
+        self, request: RAGQueryRequest, intent: QueryIntent | None = None, *, cancel: CancelToken | None = None
+    ) -> RAGResponse[MetaT]:
+        """End-to-end question answering (§14). `cancel` lets the caller stop it from another thread (§13.4)."""
         if request.variant:
-            return self._variant_engine(request.variant).query(request.model_copy(update={"variant": None}), intent)
-        run = self._begin(request)
+            return self._variant_engine(request.variant).query(
+                request.model_copy(update={"variant": None}), intent, cancel=cancel
+            )
+        run = self._begin(request, cancel)
         retrieval: RAGRetrievalResult[MetaT] | None = None
         try:
             resolved = self._resolve_intent(request, intent, run)
@@ -602,13 +616,15 @@ class RAGEngine(Generic[MetaT]):
         request: RAGQueryRequest,
         nodes: list[RAGNode[MetaT]],
         intent: QueryIntent | None = None,
+        *,
+        cancel: CancelToken | None = None,
     ) -> RAGResponse[MetaT]:
         """Run guards, assembly, generation and citation checks on caller-supplied nodes (§14.4)."""
         if request.variant:
             return self._variant_engine(request.variant).generate_from_nodes(
-                request.model_copy(update={"variant": None}), nodes, intent
+                request.model_copy(update={"variant": None}), nodes, intent, cancel=cancel
             )
-        run = self._begin(request)
+        run = self._begin(request, cancel)
         resolved = intent or QueryIntent(search_query=request.question, router_source="passthrough")
         retrieval: RAGRetrievalResult[MetaT] | None = None
         try:
@@ -641,6 +657,7 @@ class RAGEngine(Generic[MetaT]):
         started = run.trace.elapsed_ms()
         result = self.generator.generate(prompt, self._generation_context(request, run, stage))
         run.trace.record_stage(self.generator.name, "generation", started, version=self.generator.version)
+        run.deadline.raise_if_cancelled("generation")      # a cancelled request gets no answer to save
 
         buffer = FlagStreamBuffer()
         visible = "".join(buffer.feed(result.text) + buffer.finalize())
@@ -664,13 +681,18 @@ class RAGEngine(Generic[MetaT]):
             citations, _ = self.quote_validator.verify(citations, nodes, answer_text=clean_text)
         return citations
 
-    def stream_query(self, request: RAGQueryRequest, intent: QueryIntent | None = None) -> RAGStream[MetaT]:
-        """Event streaming query pipeline (§10.8, AC-RAG-45, RAG-OPS-1, RAG-OPS-2)."""
+    def stream_query(
+        self, request: RAGQueryRequest, intent: QueryIntent | None = None, *, cancel: CancelToken | None = None
+    ) -> RAGStream[MetaT]:
+        """Event streaming query pipeline (§10.8, AC-RAG-45, RAG-OPS-1, RAG-OPS-2).
+
+        Closing the stream stops generation; `cancel` also stops routing and retrieval from another thread (§13.4).
+        """
         if request.variant:
             return self._variant_engine(request.variant).stream_query(
-                request.model_copy(update={"variant": None}), intent
+                request.model_copy(update={"variant": None}), intent, cancel=cancel
             )
-        run = self._begin(request)
+        run = self._begin(request, cancel)
         return RAGStream[MetaT](self._stream_events(request, intent, run), usage_tracker=run.usage)
 
     def _stream_events(
@@ -732,12 +754,14 @@ class RAGEngine(Generic[MetaT]):
 
             if self.profile.generation.stream_mode == "buffered":
                 result = self.generator.generate(prompt, context)
+                run.deadline.raise_if_cancelled("generation")
                 raw_parts.append(result.text)
                 yield from new_degradations()
                 yield from deltas_for(buffer.feed(result.text))
             else:
                 chunks = self.generator.stream(prompt, context)
                 for chunk in chunks:
+                    run.deadline.raise_if_cancelled("generation")
                     yield from new_degradations()
                     if chunk.delta:
                         raw_parts.append(chunk.delta)
@@ -803,6 +827,8 @@ class RAGEngine(Generic[MetaT]):
                 logger.error(f"[RAG] id={run.request_id} on_complete failed for a cancelled stream", exc_info=True)
             raise
         except Exception as exc:
+            if isinstance(exc, RequestCancelled) and chunks is not None:
+                chunks.close()                      # records the cut-off model call as cancelled (RAG-OPS-2)
             self._fail(exc, run, retrieval)
             yield RAGStreamEvent(
                 event="error",

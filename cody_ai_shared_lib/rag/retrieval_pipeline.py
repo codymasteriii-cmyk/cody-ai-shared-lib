@@ -167,6 +167,7 @@ class RetrievalPipeline(Generic[MetaT]):
 
         ctx = self._build_context(request, intent, filters, mode, run)
         ctx.variants = self._variants(request, intent, run)
+        run.deadline.raise_if_cancelled("retrieval")
         strategy = self._resolve_strategy(request)
         stages = self._stages_for(request)
         ctx.rerank_active = any(stage.name == "rerank" for stage in stages)
@@ -315,6 +316,7 @@ class RetrievalPipeline(Generic[MetaT]):
             nodes = self._merge_prior(self._enforce_guards(nodes, guards, run), prior, ctx)
 
         for stage in stages:
+            run.deadline.raise_if_cancelled(stage.name)
             budget_key = getattr(stage, "deadline_budget_key", None)
             if budget_key is not None:
                 budget = self.profile.runtime.stage_budgets.get(budget_key, 0.0)
@@ -449,6 +451,7 @@ class RetrievalPipeline(Generic[MetaT]):
         for step in self.relaxation_steps:
             if len(nodes) >= self.profile.retrieval.min_results_before_relax:
                 break
+            run.deadline.raise_if_cancelled(f"relaxation:{step.label}")
             if run.degradations.skip_for_deadline(run.deadline, f"relaxation:{step.label}", budget):
                 break
             relaxed = step.apply(state)

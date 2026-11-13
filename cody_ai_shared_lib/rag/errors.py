@@ -170,10 +170,16 @@ class DeadlineExceeded(RAGEngineError):
     pass
 
 
-# Errors that no agreed degradation may absorb (§13.3): configuration, scope, budget and deadline
+class RequestCancelled(RAGEngineError):
+    """Raised when the caller's CancelToken was set; the request stopped at its next checkpoint (§10.8, §13.4)."""
+    pass
+
+
+# Errors that no agreed degradation may absorb (§13.3): configuration, scope, budget, deadline and cancel
 NEVER_DEGRADABLE: tuple[type[RAGEngineError], ...] = (
     BudgetExceeded,
     DeadlineExceeded,
+    RequestCancelled,
     ProfileConfigError,
     StoreCapabilityError,
     MissingRequiredScopeError,

@@ -26,6 +26,7 @@ def query_token_groups(ctx: RetrievalContext[MetaT]) -> list[TokenGroup] | None:
 
 def embed_query(ctx: RetrievalContext[MetaT]) -> list[float]:
     """Return the query vector, or an empty list when embedding failed."""
+    ctx.deadline.raise_if_cancelled("retrieval_embedding")
     try:
         result = ctx.gateway.embed(
             texts=query_text(ctx),

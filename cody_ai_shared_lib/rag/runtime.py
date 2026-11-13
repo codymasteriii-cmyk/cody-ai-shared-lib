@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import random
 import secrets
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol, Sequence, TypeVar, runtime_checkable
 
-from .errors import DeadlineExceeded
+from .errors import DeadlineExceeded, RequestCancelled
 
 T = TypeVar("T")
 
@@ -92,13 +93,44 @@ class DeterministicRng:
         return self._rng.choice(seq)
 
 
-class Deadline:
-    """Tracks remaining execution time budget (§13.4)."""
+class CancelToken:
+    """A thread-safe "stop now" flag the app hands to a request and sets from any thread (§13.4).
 
-    def __init__(self, deadline_seconds: float, clock: Clock | None = None):
+    The engine looks at it at its stage boundaries: around routing, before each query embedding and
+    post-stage, between relaxation steps, before generation and between streamed chunks. It cannot
+    interrupt a provider call that is already in flight, so a request stops at the next boundary.
+    One token covers one request; do not reuse it.
+    """
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self.reason: str | None = None
+
+    def cancel(self, reason: str | None = None) -> None:
+        """Ask the request to stop. Safe to call from any thread, and more than once."""
+        if not self._event.is_set():
+            self.reason = reason
+            self._event.set()
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._event.is_set()
+
+
+class Deadline:
+    """Tracks remaining execution time budget (§13.4) and carries the request's CancelToken."""
+
+    def __init__(self, deadline_seconds: float, clock: Clock | None = None, cancel: CancelToken | None = None):
         self.deadline_seconds = deadline_seconds
         self.clock = clock or SystemClock()
         self.start_mono = self.clock.monotonic()
+        self.cancel = cancel
+
+    def raise_if_cancelled(self, stage: str) -> None:
+        """Raise RequestCancelled when the caller has set the request's CancelToken."""
+        if self.cancel is not None and self.cancel.is_cancelled:
+            reason = f": {self.cancel.reason}" if self.cancel.reason else ""
+            raise RequestCancelled(f"Request cancelled before stage '{stage}'{reason}", stage=stage)
 
     def elapsed_seconds(self) -> float:
         return self.clock.monotonic() - self.start_mono
@@ -115,7 +147,8 @@ class Deadline:
         return self.remaining_seconds() >= stage_budget_seconds
 
     def check(self, stage: str) -> None:
-        """Raise DeadlineExceeded when no time is left for a required stage."""
+        """Raise RequestCancelled when cancelled, else DeadlineExceeded when no time is left for a required stage."""
+        self.raise_if_cancelled(stage)
         if self.is_expired():
             raise DeadlineExceeded(
                 f"Deadline of {self.deadline_seconds:.1f}s exceeded before required stage '{stage}'",
