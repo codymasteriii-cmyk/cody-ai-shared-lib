@@ -5,6 +5,7 @@ import math
 from dataclasses import dataclass
 from typing import Sequence
 
+from ..errors import ProfileConfigError
 from ..models import ChatTurn
 from ..profile import ContextConfig
 from ..text.analyzer import CjkAwareAnalyzer, TextAnalyzer, estimate_tokens
@@ -54,11 +55,29 @@ class TokenBudgeter:
         has_history: bool = True,
         has_summaries: bool = True,
         has_local_window: bool = True,
+        instruction_tokens: int | None = None,
     ) -> BudgetAllocation:
+        """Split `max_context_tokens` into zones (§10.1).
+
+        `instruction_tokens` is the estimated size of the finished system prompt: the persona, rules and
+        citation instruction the app supplies are part of it. The instructions zone is that size, never
+        less than `reserved_instruction_tokens`, so a long preamble takes its room from the passages instead
+        of silently overrunning the window. Without it (no prompt yet) the reserve alone is used.
+        """
+        instructions = self.config.reserved_instruction_tokens
+        if instruction_tokens is not None:
+            if instruction_tokens > self.config.max_context_tokens // 2:
+                raise ProfileConfigError(
+                    f"The instructions are about {instruction_tokens} tokens, more than half of "
+                    f"max_context_tokens ({self.config.max_context_tokens}); shorten the persona or custom "
+                    "instruction, or raise max_context_tokens (§10.1)",
+                    stage="context",
+                )
+            instructions = max(instructions, instruction_tokens)
         usable = max(
             256,
             self.config.max_context_tokens
-            - self.config.reserved_instruction_tokens
+            - instructions
             - self.config.question_reserve_tokens
             - self.config.answer_reserve_tokens,
         )

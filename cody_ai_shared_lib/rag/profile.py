@@ -64,7 +64,7 @@ class RetrievalConfig(BaseModel):
 class ContextConfig(BaseModel):
     model_config = {"frozen": True, "extra": "forbid"}
     max_context_tokens: int = 160_000
-    reserved_instruction_tokens: int = 4000
+    reserved_instruction_tokens: int = 4000  # minimum for the instructions zone; the measured prompt is used when larger (§10.1)
     reserved_history_tokens: int = 8000  # hard cap on the history zone
     question_reserve_tokens: int = 1000
     answer_reserve_tokens: int = 4000

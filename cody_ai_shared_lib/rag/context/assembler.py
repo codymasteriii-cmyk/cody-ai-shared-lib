@@ -181,6 +181,7 @@ class ContextAssembler(Generic[MetaT]):
             has_history=bool(request.history or rolling_summary),
             has_summaries=bool(summary_nodes),
             has_local_window=bool(window_nodes),
+            instruction_tokens=estimate_tokens(system_prompt),
         )
         history_text, history_used = self.budgeter.select_history(
             request.history, rolling_summary, allocation.history_budget, request.question
@@ -316,7 +317,8 @@ class ContextAssembler(Generic[MetaT]):
         )
         rolling_summary = request.state.rolling_summary if request.state else None
         allocation = self.budgeter.allocate(
-            has_history=bool(request.history or rolling_summary), has_summaries=False, has_local_window=False
+            has_history=bool(request.history or rolling_summary), has_summaries=False, has_local_window=False,
+            instruction_tokens=estimate_tokens(system_prompt),
         )
         history_text, history_used = self.budgeter.select_history(
             request.history, rolling_summary, allocation.history_budget, request.question
