@@ -9,15 +9,24 @@ from .context.conversation import FollowupTermCheck, reusable_node_ids
 from .errors import EmbeddingSignatureMismatch, ProfileConfigError
 from .granularity import is_ranked, limit_ranked
 from .guards import BUILTIN_GUARDS, build_turn_guards
-from .models import MetaT, QueryIntent, RAGFilterSpec, RAGNode, RAGQueryRequest, RAGRetrievalResult, as_utc
+from .models import (
+    Completeness,
+    MetaT,
+    QueryIntent,
+    RAGFilterSpec,
+    RAGNode,
+    RAGQueryRequest,
+    RAGRetrievalResult,
+    as_utc,
+)
 from .ports import Guard, RAGStore, call_store, validate_scope
+from .postretrieval.rule_boost import TextRuleBoost
 from .registry import ComponentDeps, split_component_name
 from .runtime import RequestRun
 from .strategies.adaptive import AdaptiveRetrievalStrategy
 from .strategies.context import RetrievalContext, RetrievalStrategy
-from .postretrieval.rule_boost import TextRuleBoost
-from .text.rules import derive_rules
 from .strategies.relaxation import RelaxationState, build_relaxation
+from .text.rules import derive_rules
 from .transforms import QueryVariant, TransformContext, fair_interleave, fuse_variants
 
 logger = logging.getLogger("shared-rag.retrieval")
@@ -169,7 +178,7 @@ class RetrievalPipeline(Generic[MetaT]):
         if filters.is_empty_scope:
             return self._empty_scope_result(intent, filters, run), guards
 
-        ctx = self._build_context(request, intent, filters, mode, run)
+        ctx = self.build_context(request, intent, filters, mode, run)
         ctx.variants = self._variants(request, intent, run)
         run.deadline.raise_if_cancelled("retrieval")
         strategy = self._resolve_strategy(request)
@@ -205,11 +214,16 @@ class RetrievalPipeline(Generic[MetaT]):
         return result, guards
 
     @staticmethod
-    def _completeness(intent: QueryIntent, ctx: RetrievalContext[MetaT]) -> Literal["whole_scope", "partial"] | None:
-        """Only reading the whole visible scope proves a list complete; a ranked search never can (OI-4)."""
+    def _completeness(intent: QueryIntent, ctx: RetrievalContext[MetaT]) -> Completeness | None:
+        """Only reading the whole visible scope proves a list complete (OI-4). Reading around every hit of a search
+        is "searched"; a plain top-k search read only the best passages, a known loss, so it is "partial" (1.2.16)."""
         if not intent.wants_list:
             return None
-        return "whole_scope" if ctx.scope_complete and not ctx.truncated else "partial"
+        if ctx.truncated:
+            return "partial"
+        if ctx.scope_complete:
+            return "whole_scope"
+        return "searched" if ctx.scope_searched else "partial"
 
     def _empty_scope_result(
         self,
@@ -228,7 +242,7 @@ class RetrievalPipeline(Generic[MetaT]):
             usage=run.usage.stage_usages,
         )
 
-    def _build_context(
+    def build_context(
         self,
         request: RAGQueryRequest,
         intent: QueryIntent,

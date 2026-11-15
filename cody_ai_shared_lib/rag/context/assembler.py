@@ -142,14 +142,17 @@ class ContextAssembler(Generic[MetaT]):
         fence_id: str | None = None,
         guards: Sequence[Any] | None = None,
         service_notes: Sequence[str] | None = None,
+        force_strict: bool = False,
     ) -> AssembledPrompt[MetaT]:
         """Build the 3-block prompt per §10.1–§10.5.
 
         service_notes: impacts of degradations to disclose (§10.10). They go in the volatile part, after
         the data, so the cacheable prefix does not change.
+        force_strict: strict grounding whatever the profile says; `query_batched` lists come only from the
+        sources (§8.13, 1.2.16).
         """
         active_guards = list(guards if guards is not None else request.guards)
-        grounding_mode = self._effective_grounding(active_guards)
+        grounding_mode = "strict" if force_strict else self._effective_grounding(active_guards)
 
         untrusted = [self.renderer.prompt_text(n) for n in nodes] + [t.content for t in request.history] + [request.question]
         active_fence_id = self._fence_for(request, fence_id, untrusted)

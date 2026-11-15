@@ -4,22 +4,29 @@ from __future__ import annotations
 import math
 
 
+# The one list of CJK code point ranges; every CJK check in the library derives from it.
+CJK_RANGES: tuple[tuple[int, int], ...] = (
+    (0x4E00, 0x9FFF),      # CJK Unified Ideographs
+    (0x3400, 0x4DBF),      # CJK Unified Ideographs Extension A
+    (0x20000, 0x2A6DF),    # Extension B
+    (0x2A700, 0x2B73F),    # Extension C
+    (0x2B740, 0x2B81F),    # Extension D
+    (0x2B820, 0x2CEAF),    # Extension E
+    (0xF900, 0xFAFF),      # CJK Compatibility Ideographs
+    (0x2F800, 0x2FA1F),    # Compatibility Supplement
+    (0x3040, 0x309F),      # Hiragana
+    (0x30A0, 0x30FF),      # Katakana
+    (0xAC00, 0xD7AF),      # Hangul Syllables
+)
+
+# The same ranges as the inside of a regular-expression character class, e.g. for `[^\W_{CJK_CHAR_CLASS}]`.
+CJK_CHAR_CLASS = "".join(f"{chr(lo)}-{chr(hi)}" for lo, hi in CJK_RANGES)
+
+
 def is_cjk_char(ch: str) -> bool:
     """Return True if character falls in CJK Unified Ideographs, Kana, Hangul, or related ranges."""
     cp = ord(ch)
-    return (
-        0x4E00 <= cp <= 0x9FFF          # CJK Unified Ideographs
-        or 0x3400 <= cp <= 0x4DBF      # CJK Unified Ideographs Extension A
-        or 0x20000 <= cp <= 0x2A6DF    # Extension B
-        or 0x2A700 <= cp <= 0x2B73F    # Extension C
-        or 0x2B740 <= cp <= 0x2B81F    # Extension D
-        or 0x2B820 <= cp <= 0x2CEAF    # Extension E
-        or 0xF900 <= cp <= 0xFAFF      # CJK Compatibility Ideographs
-        or 0x2F800 <= cp <= 0x2FA1F    # Compatibility Supplement
-        or 0x3040 <= cp <= 0x309F      # Hiragana
-        or 0x30A0 <= cp <= 0x30FF      # Katakana
-        or 0xAC00 <= cp <= 0xD7AF      # Hangul Syllables
-    )
+    return any(lo <= cp <= hi for lo, hi in CJK_RANGES)
 
 
 def estimate_tokens(text: str) -> int:

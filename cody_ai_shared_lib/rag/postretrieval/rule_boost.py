@@ -22,7 +22,7 @@ class TextRuleBoost:
     def process(self, nodes: list[RAGNode[Any]], ctx: Any) -> list[RAGNode[Any]]:
         prefer = [rule for rule in ctx.rules if rule.strength == "prefer"]
         factor = ctx.profile.text_rules.prefer_boost
-        if not prefer or factor <= 0 or factor == 1.0:
+        if not prefer or factor <= 1.0:                    # the profile rejects values below 1.0; 1.0 is off
             return nodes
         return apply_to_ranked(nodes, lambda ranked: self._reorder(ranked, prefer, factor, ctx.renderer))
 

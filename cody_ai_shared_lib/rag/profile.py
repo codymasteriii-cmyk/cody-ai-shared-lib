@@ -30,7 +30,9 @@ class TextRulesConfig(BaseModel):
     names: Literal["prefer", "filter"] = "prefer"       # names the router guessed
     names_droppable: bool | None = None                  # None: droppable exactly when `names` is "prefer"
     must_not: Literal["prefer", "filter"] = "prefer"    # exclusions the router read from the question
-    prefer_boost: float = 2.0                            # a passage satisfying a `prefer` rule ranks as if its rank were divided by this; 1.0 turns it off (untuned)
+    # A passage satisfying a `prefer` rule ranks as if its rank were divided by this. 1.0 turns it off; below 1.0
+    # would demote matching passages, so it is rejected (1.2.16). The default is untuned.
+    prefer_boost: float = Field(default=2.0, ge=1.0)
 
 
 class ClarificationConfig(BaseModel):

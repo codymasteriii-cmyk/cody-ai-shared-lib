@@ -10,10 +10,15 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Literal, Protocol, Sequence, runtime_checkable
+from typing import Any, Iterable, Literal, Protocol, Sequence, runtime_checkable
 from pydantic import BaseModel
 
 from ...tokens import estimate_tokens, is_cjk_char  # estimate_tokens is public here (§2.5)
+
+
+def node_tokens(nodes: Iterable[Any]) -> int:
+    """Token size of some nodes: each node's own estimate when it has one, else an estimate of its text."""
+    return sum(node.token_estimate if node.token_estimate else estimate_tokens(node.text) for node in nodes)
 
 
 @runtime_checkable

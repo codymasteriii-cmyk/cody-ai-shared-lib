@@ -43,6 +43,7 @@ class RetrievalContext(BaseModel, Generic[MetaT]):
     scope_revision: str | None = None
     rules: list[TextRule] = Field(default_factory=list)      # text rules for this request (§7.9); never in `filters`
     scope_complete: bool = False                              # a strategy read the whole visible scope (OI-4)
+    scope_searched: bool = False                              # a search found the text and all of it around every hit was read (1.2.16)
     rule_checks: list[str] = Field(default_factory=list)     # rules the engine checked itself
 
     def target_limit(self) -> int:
@@ -63,7 +64,7 @@ class RetrievalContext(BaseModel, Generic[MetaT]):
     def boost_active(self) -> bool:
         """True when a `prefer` rule will boost passages, which can only promote what the search fetched (§7.9)."""
         factor = self.profile.text_rules.prefer_boost
-        return factor not in (0, 1.0) and any(rule.strength == "prefer" for rule in self.rules)
+        return factor > 1.0 and any(rule.strength == "prefer" for rule in self.rules)
 
     def candidate_limit(self) -> int:
         """How many ranked candidates to fetch: one extra to detect truncation, or a wider pool for a reranker (§9.3)

@@ -136,7 +136,8 @@ def test_find_then_read_reads_the_section_of_each_hit_not_the_whole_document():
     assert result.strategy_used == "find_then_read"
     assert [n.node_id for n in result.nodes] == ["docA-1"], "only the section holding the hit, not sections 0 and 2"
     assert all(not is_ranked(n) for n in result.nodes), "read text is Tier 0 style, never ranked candidates"
-    assert result.completeness == "partial", "a ranked finder can never prove the list complete"
+    # A ranked finder never proves the list complete, but every hit was read in full: "searched" (1.2.16)
+    assert result.completeness == "searched"
 
 
 def test_hits_in_one_section_become_one_read_and_two_sections_are_both_read():
@@ -256,7 +257,7 @@ def _ask(eng, **kw):
 def test_query_batched_returns_a_normal_response_with_a_report_of_what_was_read():
     llm = ListLLM()
     response = _ask(_batched(_store(_docs(3)), llm))
-    assert response.answer_found == "yes" and response.completeness == "partial"      # a ranked finder: never "whole_scope"
+    assert response.answer_found == "yes" and response.completeness == "searched"     # found by search, nothing lost (1.2.16)
     assert response.batches.documents_found == 3 and response.batches.documents_read == 3
     assert response.batches.batches_read == 3 and response.batches.capped_by is None
     assert llm.calls.count("map") == 3 and llm.calls.count("merge") == 1

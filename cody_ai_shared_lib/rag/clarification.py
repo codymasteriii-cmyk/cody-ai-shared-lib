@@ -8,7 +8,8 @@ Rules this module keeps:
     confirm two or more distinct candidates in passages inside the visible scope.
   * Every option label, and so every name in the question, comes from those passages, never from a model.
   * Nothing is checked unless there is a reason: an unresolved reference the router flagged, or an app hook for
-    telling referents apart together with a named entity.
+    telling referents apart (in-memory grouping only; with a named entity it is `several_matches`, without one
+    `too_broad`, which is a mark and never asked).
   * `recent_entities` in the conversation state is untrusted. It is capped and trimmed on every read, and a name
     is only a hint until a visible passage confirms it.
 """
@@ -23,6 +24,9 @@ from .text.rules import mentions
 
 MAX_ENTITIES = 20
 MAX_ENTITY_CHARS = 60
+
+# node -> (key, label) | None: how an app tells referents apart (two characters both called Li Ming)
+CandidateKey = Callable[[RAGNode[Any]], "tuple[str, str] | None"]
 
 DEFAULT_TEMPLATES = {
     "en": "Which one do you mean: {options}?",
@@ -51,9 +55,17 @@ def _rule(name: str) -> TextRule:
     return TextRule(text=name, kind="must_mention")
 
 
-def remember_entities(current: Sequence[str], intent: QueryIntent, shown: Sequence[RAGNode[Any]]) -> list[str]:
-    """Add the names the router found that also occur in a passage shown this turn (never the router's own knowledge)."""
-    texts = [node.text for node in shown]
+def remember_entities(
+    current: Sequence[str],
+    intent: QueryIntent,
+    shown: Sequence[RAGNode[Any]],
+    prompt_text: Callable[[RAGNode[Any]], str],
+) -> list[str]:
+    """Add the names the router found that also occur in a passage shown this turn (never the router's own knowledge).
+
+    The passage is read as the model read it (`prompt_text`), the same text a stored name is later confirmed against.
+    """
+    texts = [prompt_text(node) for node in shown]
     seen = [
         name for name in clean_entities(intent.entity_terms)
         if any(mentions(text, _rule(name)) for text in texts)
@@ -98,7 +110,7 @@ def _from_referent(
 def _from_hook(
     intent: QueryIntent,
     nodes: Sequence[RAGNode[Any]],
-    candidate_key: Callable[[RAGNode[Any]], tuple[str, str] | None],
+    candidate_key: CandidateKey,
     min_group_hits: int,
     dominance: float,
     max_options: int,
@@ -129,7 +141,7 @@ def find_clarification(
     intent: QueryIntent,
     nodes: Sequence[RAGNode[Any]],
     prior: Callable[[], list[RAGNode[Any]]],
-    candidate_key: Callable[[RAGNode[Any]], tuple[str, str] | None] | None,
+    candidate_key: CandidateKey | None,
     config: Any,
     prompt_text: Callable[[RAGNode[Any]], str],
 ) -> Clarification | None:
@@ -144,9 +156,12 @@ def find_clarification(
     return None
 
 
+ASKABLE_REASONS = ("several_matches", "unresolved_referent")
+
+
 def may_ask(clarification: Clarification | None) -> bool:
     """`too_broad` is a mark only: it is never asked (there is no evidence an app needs it)."""
-    return clarification is not None and clarification.reason in ("several_matches", "unresolved_referent")
+    return clarification is not None and clarification.reason in ASKABLE_REASONS
 
 
 # ── wording ────────────────────────────────────────────────────────────────
@@ -158,10 +173,12 @@ def question_text(clarification: Clarification, user_question: str, templates: d
     template = templates.get(lang) or DEFAULT_TEMPLATES[lang]
     labels = [option.label for option in clarification.options]
     comma, last = _JOINERS[lang]
-    joined = labels[0] if len(labels) == 1 else comma.join(labels[:-1]) + (last if lang == "zh" else last) + labels[-1]
+    joined = labels[0] if len(labels) == 1 else comma.join(labels[:-1]) + last + labels[-1]
     return template.replace("{options}", joined)
 
 
 def hedge_note(clarification: Clarification) -> str:
-    labels = " or ".join(option.label for option in clarification.options)
-    return f"The question may refer to {labels}; answer for the most likely one and say which."
+    """The prompt note for a best-guess answer; model-facing, so English whatever the question's language."""
+    labels = [option.label for option in clarification.options]
+    labels_text = labels[0] if len(labels) == 1 else ", ".join(labels[:-1]) + " or " + labels[-1]
+    return f"The question may refer to {labels_text}; answer for the most likely one and say which."

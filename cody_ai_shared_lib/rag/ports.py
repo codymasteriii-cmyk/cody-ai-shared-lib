@@ -6,7 +6,7 @@ The library contains no SQL, table name, or database client (D-01).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Literal, Any, Callable, Generic, Protocol, TypeVar, get_origin, runtime_checkable
+from typing import Any, Callable, Generic, Literal, Protocol, TypeVar, get_origin, runtime_checkable
 from pydantic import BaseModel, Field
 
 from .errors import (

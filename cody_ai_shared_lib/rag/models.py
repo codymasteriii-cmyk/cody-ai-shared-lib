@@ -418,6 +418,13 @@ class RAGQueryRequest(BaseModel):
     clarify: Literal["answer", "ask"] | None = None                    # overrides profile.clarification.mode (§7.10)
 
 
+# How much of a list's source text was read (OI-4, §8.13; "searched" since 1.2.16):
+#   "whole_scope": the whole visible scope was read, so the list is proven complete;
+#   "searched":    a search found the documents and the text around every hit was read; nothing is known to be missing;
+#   "partial":     something is known to be missing (a cap, a failed batch, a budget cut, or only the top passages read).
+Completeness = Literal["whole_scope", "searched", "partial"]
+
+
 class ClarificationOption(BaseModel):
     """One thing the user may have meant; the label comes only from passages inside the visible scope (§7.10)."""
     label: str
@@ -442,8 +449,8 @@ class RAGRetrievalResult(BaseModel, Generic[MetaT]):
     relaxations: list[str] = Field(default_factory=list)
     reranked: bool = False
     truncated: bool = False
-    # Only for a `wants_list` question: "whole_scope" when the whole visible scope was read, else "partial" (OI-4)
-    completeness: Literal["whole_scope", "partial"] | None = None
+    # Only for a `wants_list` question (and always for query_batched), OI-4, 1.2.16: see `Completeness`
+    completeness: Completeness | None = None
     clarification: Clarification | None = None      # §7.10: set in every mode; `asked` only when the engine asked
     degradations: list[Degradation] = Field(default_factory=list)
     usage: list[StageUsage] = Field(default_factory=list)
@@ -459,6 +466,7 @@ class BatchReport(BaseModel):
     batches_failed: list[int] = Field(default_factory=list)          # 0-based batch numbers
     capped_by: Literal["documents", "batches"] | None = None
     merge_skipped: bool = False          # the deadline skipped the merge: items may repeat, none are missing (DG-10)
+    text_cut: bool = False               # a read or a batch prompt had to leave text out for budget: partial (1.2.16)
     items_dropped_unverified: int = 0
 
 
@@ -473,7 +481,7 @@ class RAGResponse(BaseModel, Generic[MetaT]):
     grounded: bool = True
     answer_found: Literal["yes", "no", "partial"] | None = None
     abstained: bool = False
-    completeness: Literal["whole_scope", "partial"] | None = None   # see RAGRetrievalResult.completeness
+    completeness: Completeness | None = None   # see `Completeness`
     degraded: bool = False
     citation_coverage: CitationCoverage | None = None
     batches: BatchReport | None = None             # set by query_batched only (OI-4)

@@ -150,7 +150,7 @@ def clamp_intent(
         entity_mode = "ignore"
 
     rules: list[TextRule] = []
-    for item in list(raw.get("rules") or [])[:16]:          # rules an app router or caller already set (§7.9)
+    for item in list(raw.get("rules") or [])[:16]:          # rules an app router or caller set; never the LLM router's (§7.9)
         try:
             rules.append(TextRule.model_validate(item))
         except Exception:
@@ -306,6 +306,9 @@ class LLMIntentRouter:
                             if temp_info.get("has_time_expression"):
                                 parsed.update(temp_info)
 
+                        # The model never sets rules itself: only `must_not`, checked against the question below.
+                        # `rules` is for app routers and callers (§7.9, 1.2.16).
+                        parsed.pop("rules", None)
                         intent = clamp_intent(parsed, degradation_tracker, self.intent_schema)
                         if not intent.search_query:
                             intent.search_query = query

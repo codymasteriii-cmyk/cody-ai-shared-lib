@@ -10,12 +10,12 @@ import re
 import unicodedata
 from typing import Any, Callable, Sequence
 
-from ...tokens import is_cjk_char
+from ...tokens import CJK_CHAR_CLASS, is_cjk_char
 from ..models import QueryIntent, RAGNode, TextRule, merge_text_rules
 
-_CJK_RANGES = "\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\uac00-\ud7af"
-# A letter or digit that is not CJK: a Latin form must not touch one on either side. CJK text has no word boundary.
-_WORD_CHAR = rf"[^\W_{_CJK_RANGES}]"
+# A letter or digit that is not CJK (the same ranges as `is_cjk_char`): a Latin form must not touch one on either
+# side. CJK text has no word boundary.
+_WORD_CHAR = rf"[^\W_{CJK_CHAR_CLASS}]"
 
 
 def _norm(text: str) -> str:
