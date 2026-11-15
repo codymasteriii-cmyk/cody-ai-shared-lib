@@ -2,6 +2,13 @@
 
 Combines dense vector and keyword search with Reciprocal Rank Fusion, through the store's native
 hybrid search (Path A) or by fusing the two legs in the engine (Path B).
+
+Reciprocal Rank Fusion in one line: a passage's score is the sum over the searches of weight / (rrf_k + rank), so
+a passage near the top of both searches beats one that tops only one. Ranks are used, never raw scores, because a
+vector similarity and a keyword score are not on the same scale.
+
+Dummy example (rrf_k = 60, equal weights): passage P is rank 1 in vector search and rank 3 in keyword search,
+passage Q is rank 2 in vector search only.  P = 1/61 + 1/63 = 0.0323;  Q = 1/62 = 0.0161.  P ranks first.
 """
 from __future__ import annotations
 
@@ -15,19 +22,25 @@ from .shared import embed_query, keyword_fallback, query_text, ranked_store_call
 
 
 class HybridRRFStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
+    """Vector + keyword search, fused. The default for a store that has both."""
     name: ClassVar[str] = "hybrid_rrf"
     version: ClassVar[str] = "1.0.0"
     requires: ClassVar[frozenset[str]] = frozenset(["supports_vector_search", "supports_keyword_fts"])
 
     @classmethod
     def is_runnable(cls, capabilities: Any) -> bool:
+        """Needs vectors, plus either keyword search (fuse here) or a store-native hybrid call."""
         return capabilities.supports_vector_search and (
             capabilities.supports_keyword_fts or capabilities.supports_native_hybrid_rpc
         )
 
     @staticmethod
     def _fusion_weights(ctx: RetrievalContext[MetaT]) -> tuple[float, float]:
-        """The first intent facet with a table row wins (§8.5)."""
+        """The first intent facet with a table row wins (§8.5).
+
+        Returns (vector weight, keyword weight). A question with exact terms leans on keywords (1.3 against 0.7),
+        because a quoted word must be found as written; a plain question weighs both the same.
+        """
         weights = ctx.profile.retrieval.fusion_weights
         if ctx.intent.exact_terms:
             return weights.get("exact_terms", (0.7, 1.3))
@@ -47,8 +60,9 @@ class HybridRRFStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
         top_k = ctx.candidate_limit()
         query_vector = embed_query(ctx)
         if is_zero_vector(query_vector):
-            return keyword_fallback(ctx, top_k)
+            return keyword_fallback(ctx, top_k)            # the embedding failed: DG-07, only if the app allowed it
 
+        # Path A: the store fuses both searches itself, in one call. Path B: the engine runs both and fuses them.
         if caps.supports_native_hybrid_rpc:
             w_vec, w_fts = self._fusion_weights(ctx)
             results = ranked_store_call(
@@ -97,6 +111,7 @@ class HybridRRFStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
         else:
             vector_nodes, keyword_nodes = vector_leg(), keyword_leg()
 
+        # Fuse: add each passage's weight / (rrf_k + rank) from every search that returned it
         rrf_k = ctx.profile.retrieval.rrf_k
         w_vec, w_fts = self._fusion_weights(ctx)
         scores: dict[str, float] = {}
@@ -113,6 +128,7 @@ class HybridRRFStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
                 nodes[node.node_id].keyword_score = node.keyword_score
                 nodes[node.node_id].keyword_rank = node.keyword_rank
 
+        # Ties are broken by node id so the same query always gives the same order
         ranked = sorted(scores, key=lambda node_id: (-scores[node_id], node_id))
         results = []
         for node_id in ranked[:top_k]:

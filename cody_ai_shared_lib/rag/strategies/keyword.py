@@ -11,6 +11,7 @@ from .shared import query_text, ranked_store_call
 
 
 def _keyword_hits(ctx: RetrievalContext[MetaT]) -> list[RAGNode[MetaT]]:
+    """One ranked keyword search under the request's text rules; shared by both keyword strategies."""
     return ranked_store_call(
         ctx,
         ctx.candidate_limit(),
@@ -21,6 +22,7 @@ def _keyword_hits(ctx: RetrievalContext[MetaT]) -> list[RAGNode[MetaT]]:
 
 
 class KeywordOnlyStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
+    """Keyword search only: the choice for a store with no vectors, or the last rung of the adaptive ladder."""
     name: ClassVar[str] = "keyword_only"
     version: ClassVar[str] = "1.0.0"
     requires: ClassVar[frozenset[str]] = frozenset(["supports_keyword_fts"])
@@ -32,6 +34,11 @@ class KeywordOnlyStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
 
 
 class KeywordFirstStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
+    """Keyword search first, for questions with exact terms; widens to hybrid search when it finds too few.
+
+    Dummy example: the question quotes "Model-X7" and `keyword_first_min_hits` is 3. Keyword search finds 1 passage,
+    which is under 3, so hybrid search runs as well and the reason is added to the trace.
+    """
     name: ClassVar[str] = "keyword_first"
     version: ClassVar[str] = "1.0.0"
     requires: ClassVar[frozenset[str]] = frozenset(["supports_keyword_fts"])

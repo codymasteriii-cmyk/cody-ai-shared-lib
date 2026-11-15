@@ -6,6 +6,11 @@ Provides instant 0ms classification without model calls for:
   - No-retrieval chat (greetings, thanks)
   - Exact term extraction from quotes and code symbols
   - Comparison queries
+  - List questions ("list every ...")
+
+It answers "None" for everything it is not sure about, and the next layer then decides. A pattern here should
+be cheap, bilingual where the apps need it, and wrong rarely: a false match skips the intent model, which is
+worse than a miss, which merely costs one model call.
 """
 from __future__ import annotations
 
@@ -45,10 +50,27 @@ COMPARISON_PATTERNS = [
 
 
 class HeuristicRouter:
-    """Classifies queries via regex patterns and extracts lexical signals."""
+    """Classifies queries via regex patterns and extracts lexical signals.
+
+    Dummy examples (checked by the doctests below):
+        "thanks!"                                  -> no_retrieval, no search at all
+        "list every model mentioned this year"     -> a list question (`wants_list`)
+        'what does "Model-X7" mean?'               -> exact term "Model-X7", kept for the keyword search
+        "what is the weather"                      -> None: the heuristic has no opinion
+    """
 
     def classify(self, query: str) -> QueryIntent | None:
-        """Classify query if matched by high-confidence heuristic rules, else None."""
+        """Classify query if matched by high-confidence heuristic rules, else None.
+
+        >>> HeuristicRouter().classify("thanks!").route
+        'no_retrieval'
+        >>> HeuristicRouter().classify("list every model mentioned this year").wants_list
+        True
+        >>> HeuristicRouter().classify('what does "Model-X7" mean?').exact_terms
+        ['Model-X7']
+        >>> HeuristicRouter().classify("what is the weather") is None
+        True
+        """
         text = query.strip()
         lower = text.lower()
 

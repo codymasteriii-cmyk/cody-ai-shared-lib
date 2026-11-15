@@ -1,4 +1,10 @@
-"""RetrievalContext and the RetrievalStrategy contract (§8.1)."""
+"""RetrievalContext and the RetrievalStrategy contract (§8.1).
+
+The context is the single object every strategy and post stage receives. It carries the request, the intent, the
+filters to search under and the services a strategy needs (store, gateway, pool, cache), so a strategy never
+reaches back into the engine. It also carries a few outputs a strategy sets for the pipeline to read afterwards
+(`last_strategy_used`, `truncated`, `scope_complete`, `scope_searched`, ...).
+"""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -14,7 +20,12 @@ from ..usage import UsageTracker
 
 
 class RetrievalContext(BaseModel, Generic[MetaT]):
-    """Unified context passed to retrieval strategies (§8.1)."""
+    """Unified context passed to retrieval strategies (§8.1).
+
+    Inputs are set when the pipeline builds it; result fields such as `last_strategy_used`, `truncated` and
+    `scope_complete` are written by strategies and stages while they run. When the pipeline fans out over query variants or relaxation steps it
+    works on copies (`model_copy`), so a variant never overwrites another's outputs.
+    """
     model_config = {"arbitrary_types_allowed": True}
 
     request: RAGQueryRequest
@@ -47,7 +58,11 @@ class RetrievalContext(BaseModel, Generic[MetaT]):
     rule_checks: list[str] = Field(default_factory=list)     # rules the engine checked itself
 
     def target_limit(self) -> int:
-        """Compute effective target candidate count based on mode (§7.1, §8.10)."""
+        """Compute effective target candidate count based on mode (§7.1, §8.10).
+
+        The number of passages the caller wants back. "retrieve" mode honours the caller's `top_k_override` but
+        never above `retrieve_max_results`; "query" mode uses the override, else the router's suggestion, else the profile.
+        """
         if self.mode == "retrieve":
             cap = self.profile.retrieval.retrieve_max_results
             override = self.request.top_k_override
@@ -69,7 +84,7 @@ class RetrievalContext(BaseModel, Generic[MetaT]):
     def candidate_limit(self) -> int:
         """How many ranked candidates to fetch: one extra to detect truncation, or a wider pool for a reranker (§9.3)
         or for a `prefer` boost (§7.9), which has nothing to promote without one."""
-        floor = self.target_limit() + 1
+        floor = self.target_limit() + 1          # one more than wanted, so "there were more" can be told from "that was all"
         store_max = self.store.capabilities().max_top_k
         if floor > store_max:
             # The store cannot return enough rows to tell whether more exist: report it as truncated
@@ -82,7 +97,12 @@ class RetrievalContext(BaseModel, Generic[MetaT]):
 
 
 class RetrievalStrategy(ABC, Generic[MetaT]):
-    """Abstract retrieval strategy interface (§8.1)."""
+    """Abstract retrieval strategy interface (§8.1).
+
+    To add a strategy: subclass this, set `name` and `requires` (the store capabilities it needs), implement
+    `retrieve`, and register the class in the component registry under "strategy". `is_runnable` then lets the
+    adaptive ladder skip it on a store that cannot serve it.
+    """
     name: ClassVar[str]
     version: ClassVar[str] = "1.0.0"
     requires: ClassVar[frozenset[str]] = frozenset()

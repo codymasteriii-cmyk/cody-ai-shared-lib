@@ -1,4 +1,26 @@
-"""IntentRouter implementations and HybridIntentRouter (§7.2, AC-RAG-12, AC-RAG-13, AC-RAG-14, AC-RAG-16)."""
+"""IntentRouter implementations and HybridIntentRouter (§7.2, AC-RAG-12, AC-RAG-13, AC-RAG-14, AC-RAG-16).
+
+A router reads the question (and a little history) and returns a `QueryIntent`: what kind of question it is, what
+to search for, which names and exact terms matter, whether it is a follow-up. Four routers, chosen by the profile's
+`router.name`:
+
+    "none"       PassthroughRouter       no model call; searches with the question as written
+    "heuristic"  HeuristicIntentRouter   regex rules only (intent/heuristic.py), no model call
+    "llm"        LLMOnlyRouter           always asks the intent model (intent/llm_rewriter.py)
+    "auto"       HybridIntentRouter      the layered default, below
+
+HybridIntentRouter.route() tries cheap layers first and stops at the first that decides:
+
+    route()
+    ├─ heuristic.classify()      0 ms; decides at once for small talk and "summarize this" questions
+    ├─ jev_gate.route()          (opt-in) a fast classifier; decides only when it is confident
+    ├─ llm_router.route()        the intent model, when `models.intent` is set; the usual path for real questions
+    └─ passthrough + dates       no model configured: use the heuristic result or the raw question, add date words
+
+Dummy example: "thanks!" -> heuristic says no_retrieval (no search, no model). "summarize chapter 3" -> heuristic
+says document_overview. "what did Li Wei do after the festival?" -> the heuristic has no opinion, so the intent
+model runs and returns search_query "Li Wei actions after festival", entity_terms ["Li Wei"], is_followup False.
+"""
 from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
@@ -16,7 +38,7 @@ from .temporal import TemporalResolver
 
 
 class RouterContext(BaseModel):
-    """Context passed to router."""
+    """What a router may use besides the question: where to record usage and degradations, the profile, the deadline."""
     model_config = {"arbitrary_types_allowed": True}
     usage_tracker: UsageTracker
     degradation_tracker: DegradationTracker
@@ -27,6 +49,8 @@ class RouterContext(BaseModel):
 
 @runtime_checkable
 class IntentRouter(Protocol):
+    """The contract for a router. An app can supply its own (e.g. one that sets `rules` from app knowledge)
+    through `RAGEngine(router=...)`; it must return a `QueryIntent` and may use `state` to resolve follow-ups."""
     name: str
     version: str
 
@@ -84,6 +108,7 @@ class HeuristicIntentRouter:
 
 
 def _route_with_llm(llm_router: LLMIntentRouter, request: RAGQueryRequest, ctx: RouterContext) -> QueryIntent:
+    """Ask the intent model, giving it only the last three turns: enough to resolve "he", cheap to send."""
     return llm_router.route(
         query=request.question,
         usage_tracker=ctx.usage_tracker,
@@ -128,6 +153,7 @@ class HybridIntentRouter:
         self.temporal_resolver = temporal_resolver
 
     def _jev_gate_usable(self, ctx: RouterContext) -> bool:
+        """The Jev gate is optional work: off unless the profile enables it, and skipped when the deadline is short (DG-10)."""
         if not ctx.profile.router.enable_jev or self.jev_gate is None:
             return False
         if ctx.deadline is None:
@@ -143,6 +169,8 @@ class HybridIntentRouter:
         # Layer 1: Heuristic classification (0 ms, AC-RAG-13)
         h_intent = self.heuristic.classify(request.question)
         if h_intent is not None:
+            # Only the two confident cases end here; other heuristic hits (exact terms, a list cue) are kept
+            # as a fallback below and may still be refined by the model
             if h_intent.route == "no_retrieval" or h_intent.scope == "document_overview":
                 return h_intent
 
@@ -163,6 +191,7 @@ class HybridIntentRouter:
         if self.llm_router is not None and intent_models:
             return _route_with_llm(self.llm_router, request, ctx)
 
+        # No model is configured: the heuristic's reading, or the question as written, plus any date words in it
         intent = h_intent if h_intent is not None else QueryIntent(
             route="rag",
             scope="local_lookup",
@@ -182,7 +211,10 @@ class HybridIntentRouter:
         return intent
 
 
+# The `build_*_router` functions are the registry factories: the engine calls them with its shared dependencies
+# when the profile names a router, so a profile can say router.name = "auto" without building anything by hand.
 def _build_llm_rewriter(deps: Any) -> LLMIntentRouter | None:
+    """The intent-model router, or None when the profile configures no intent model."""
     models = deps.profile.models.intent
     if not models:
         return None

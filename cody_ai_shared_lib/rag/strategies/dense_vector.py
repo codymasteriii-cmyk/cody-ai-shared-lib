@@ -1,4 +1,4 @@
-"""Tier 1 DenseVectorStrategy (§8.4)."""
+"""Tier 1 DenseVectorStrategy (§8.4): embed the question, then search the store's vectors for the closest passages."""
 from __future__ import annotations
 
 from typing import ClassVar, Generic
@@ -11,6 +11,7 @@ from .shared import embed_query, keyword_fallback, ranked_store_call, with_local
 
 
 class DenseVectorStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
+    """Vector search only. Good for meaning ("a trip abroad"), weaker for exact names; see `hybrid_rrf` for both."""
     name: ClassVar[str] = "dense_vector"
     version: ClassVar[str] = "1.0.0"
     requires: ClassVar[frozenset[str]] = frozenset(["supports_vector_search"])
@@ -21,6 +22,7 @@ class DenseVectorStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
 
         top_k = ctx.candidate_limit()
         query_vector = embed_query(ctx)
+        # An empty or all-zero vector means the embedding failed: fall back to keyword search if the app allowed it (DG-07)
         if is_zero_vector(query_vector):
             return keyword_fallback(ctx, top_k)
 

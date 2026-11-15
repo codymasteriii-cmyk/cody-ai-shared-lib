@@ -3,6 +3,13 @@
 Only reranks nodes whose granularity carries TRAIT_RERANKABLE, preserving
 non-rerankable (e.g., ordered local window or parent summary) nodes in place.
 Sets node.rerank_score, node.score, and node.score_kind = 'rerank'.
+
+Why rerank at all: the first search compares the question with each passage separately and cheaply. A cross-encoder
+reads the question and one passage together, which is slower but much better at telling a passage that really
+answers the question from one that merely shares its words. So the search fetches a wider pool (see
+`RetrievalContext.candidate_limit`) and the reranker picks the best few.
+
+If the reranker fails, the original order is kept and a degradation is recorded (DG-06): a worse order, not an error.
 """
 from __future__ import annotations
 
@@ -17,7 +24,11 @@ from ..usage import BudgetGuard, UsageTracker
 
 
 class JinaCrossEncoderReranker(Generic[MetaT]):
-    """Reranks candidate nodes with Jina Rerank API with DG-06 degradation on failure."""
+    """Reranks candidate nodes with Jina Rerank API with DG-06 degradation on failure.
+
+    Only passages that are rerankable and ranked are sent; ordered layers (summaries, windows, Tier 0 text) are
+    passed through untouched and placed ahead of the reranked ones.
+    """
     name: ClassVar[str] = "jina"
     version: ClassVar[str] = "1.0.0"
 

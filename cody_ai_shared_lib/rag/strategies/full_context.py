@@ -14,6 +14,10 @@ from .context import RetrievalContext, RetrievalStrategy
 
 
 class FullContextStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
+    """Tier 0: no search. The whole visible scope goes to the model, so nothing relevant can be missed.
+
+    It sets `ctx.scope_complete`, which is what lets a list question report completeness "whole_scope" (§8.13).
+    """
     name: ClassVar[str] = "full_context"
     version: ClassVar[str] = "1.0.0"
     requires: ClassVar[frozenset[str]] = frozenset(["supports_full_scope_fetch"])

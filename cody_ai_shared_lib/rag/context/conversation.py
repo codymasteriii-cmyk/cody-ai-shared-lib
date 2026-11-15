@@ -1,4 +1,15 @@
-"""Conversation state bounds and follow-up reuse (§7.7, RAG-CTX-3, AC-RAG-67)."""
+"""Conversation state bounds and follow-up reuse (§7.7, RAG-CTX-3, AC-RAG-67).
+
+The engine keeps no conversation. The app stores the `ConversationState` each answer returns and sends it back with
+the next question; it is the only memory. Two things here keep that state useful and safe:
+
+  * `ConversationManager.prune_state` keeps it small (turn cap, node cap, byte cap), because it travels in requests
+    and may sit in a browser;
+  * `FollowupTermCheck` decides whether a follow-up ("and what else?") adds anything new. If not, the engine reuses
+    last turn's passages and skips the search; if it names something new ("and the harbour?"), it searches.
+
+The state comes from the client, so every limit is applied on the way in as well as on the way out.
+"""
 from __future__ import annotations
 
 from typing import Iterable
@@ -21,7 +32,18 @@ _FOLLOWUP_PHRASES = (
 
 
 class FollowupTermCheck:
-    """Decides, by comparing words locally, whether a follow-up asks about something new (§7.7)."""
+    """Decides, by comparing words locally, whether a follow-up asks about something new (§7.7).
+
+    No model call: it removes filler and continuation words ("tell me more about the"), then asks whether any
+    meaningful word of the question is missing from the text already shown.
+
+    >>> from cody_ai_shared_lib.rag.text.analyzer import CjkAwareAnalyzer
+    >>> check = FollowupTermCheck(CjkAwareAnalyzer())
+    >>> check.introduces_new_terms("tell me more about the festival", ["The festival began in May."])
+    False
+    >>> check.introduces_new_terms("and what about the harbour?", ["The festival began in May."])
+    True
+    """
 
     def __init__(self, analyzer: TextAnalyzer):
         self.analyzer = analyzer
@@ -29,6 +51,7 @@ class FollowupTermCheck:
         self.ignored = {token for phrase in ignored for token in self._tokens(phrase)}
 
     def _tokens(self, text: str) -> list[str]:
+        """The analyzer's tokens for a text, normalized the same way for the question and the known passages."""
         return self.analyzer.tokenize(self.analyzer.normalize(text))
 
     def introduces_new_terms(self, query: str, known_texts: Iterable[str]) -> bool:
@@ -43,7 +66,11 @@ class FollowupTermCheck:
 
 
 def reusable_node_ids(state: ConversationState, max_turns: int, max_nodes: int) -> list[str]:
-    """Node ids a follow-up may reuse, newest first; state comes from the client, so it is capped here too."""
+    """Node ids a follow-up may reuse, newest first; state comes from the client, so it is capped here too.
+
+    Only ids from the last `max_turns` turns, each once, at most `max_nodes`. These are ids only: the passages
+    themselves are re-fetched under today's filters and guards, so a changed boundary hides what is now off limits.
+    """
     oldest_kept_turn = state.turn_count - max_turns
     ids: list[str] = []
     seen: set[str] = set()
@@ -57,7 +84,10 @@ def reusable_node_ids(state: ConversationState, max_turns: int, max_nodes: int) 
 
 
 class ConversationManager:
-    """Keeps the client-held conversation state small."""
+    """Keeps the client-held conversation state small.
+
+    The defaults (3 turns, 24 nodes, 16 KB, 400 summary tokens) come from the profile's `context` settings.
+    """
 
     def __init__(
         self,
@@ -72,10 +102,15 @@ class ConversationManager:
         self.rolling_summary_max_tokens = rolling_summary_max_tokens
 
     def _size(self, state: ConversationState) -> int:
+        """The state's size as stored (JSON, UTF-8 bytes)."""
         return len(state.model_dump_json().encode("utf-8"))
 
     def prune_state(self, state: ConversationState) -> ConversationState:
-        """Apply the turn and node caps, then prune oldest node refs first, then the summary."""
+        """Apply the turn and node caps, then prune oldest node refs first, then the summary.
+
+        Order of loss when the state is too big: old passages first (cheapest to rediscover), then the rolling
+        summary is shortened. The fence id and the entity names are never pruned here: they are small and needed.
+        """
         oldest_kept_turn = state.turn_count - self.max_reused_turns
         seen: set[str] = set()
         kept = []

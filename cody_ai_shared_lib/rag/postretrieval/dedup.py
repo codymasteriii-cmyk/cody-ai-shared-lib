@@ -1,4 +1,14 @@
-"""Deduplication post-retrieval stages (§9.2, §9.3, AC-RAG-32, AC-RAG-33)."""
+"""Deduplication post-retrieval stages (§9.2, §9.3, AC-RAG-32, AC-RAG-33).
+
+Two different questions, two stages:
+
+    identity_dedup   "is this the same item?"   same key (node id, or an app field such as a URL) -> keep the best score
+    offset_dedup     "is this the same text?"   overlapping character ranges in one document -> keep the broader one
+
+Dummy example for offset_dedup: a window covering characters 100-400 and a passage covering 150-300 of the same
+document. The passage lies fully inside the window (100% >= the 80% threshold), so only the window is kept; the model
+would otherwise read the same sentences twice.
+"""
 from __future__ import annotations
 
 from typing import Any, Callable, ClassVar, Generic
@@ -13,12 +23,14 @@ class IdentityDeduplicator(Generic[MetaT]):
     accepts_score_kinds: ClassVar[frozenset[str] | None] = None
 
     def process(self, nodes: list[RAGNode[MetaT]], ctx: Any) -> list[RAGNode[MetaT]]:
+        """Stage entry point."""
         return self.deduplicate(nodes)
 
     def __init__(self, key: str | Callable[[RAGNode[MetaT]], Any] | None = None) -> None:
         self.key = key
 
     def _extract_key(self, node: RAGNode[MetaT]) -> Any:
+        """The identity of a node: the app's function, or a named metadata field (e.g. "url"), else the node id."""
         if callable(self.key):
             return self.key(node)
         if isinstance(self.key, str):
@@ -31,6 +43,7 @@ class IdentityDeduplicator(Generic[MetaT]):
         return node.node_id
 
     def deduplicate(self, nodes: list[RAGNode[MetaT]]) -> list[RAGNode[MetaT]]:
+        """Keep one node per key: the highest-scored, in the position where the key first appeared."""
         seen: dict[Any, RAGNode[MetaT]] = {}
         ordered_keys: list[Any] = []
 
@@ -60,12 +73,14 @@ class OffsetDeduplicator(Generic[MetaT]):
     accepts_score_kinds: ClassVar[frozenset[str] | None] = None
 
     def process(self, nodes: list[RAGNode[MetaT]], ctx: Any) -> list[RAGNode[MetaT]]:
+        """Stage entry point."""
         return self.deduplicate(nodes)
 
     def __init__(self, threshold: float = 0.80) -> None:
         self.threshold = threshold
 
     def _priority(self, node: RAGNode[MetaT]) -> tuple[int, float]:
+        """Which node survives an overlap: a whole document beats a window, a window beats a passage, then score."""
         gran = node.granularity
         if gran == GRANULARITY_FULL_DOC:
             p = 3
@@ -77,6 +92,10 @@ class OffsetDeduplicator(Generic[MetaT]):
         return (p, score)
 
     def deduplicate(self, nodes: list[RAGNode[MetaT]]) -> list[RAGNode[MetaT]]:
+        """Drop each node that is at least `threshold` covered by a higher-priority node of the same document.
+
+        Nodes without character offsets (summaries, entity facts) cannot overlap by position and are always kept.
+        """
         if not nodes:
             return []
 

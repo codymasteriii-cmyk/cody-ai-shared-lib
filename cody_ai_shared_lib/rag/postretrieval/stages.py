@@ -1,4 +1,8 @@
-"""Built-in post-retrieval stages and their registry factories (§9)."""
+"""Built-in post-retrieval stages and their registry factories (§9).
+
+`BUILTIN_STAGES` at the bottom maps each profile name ("threshold", "rerank", "top_k", ...) to a factory. The
+profile lists names (optionally "name:argument", e.g. "identity_dedup:url"); the pipeline builds them once, in order.
+"""
 from __future__ import annotations
 
 from typing import Any, ClassVar
@@ -54,9 +58,11 @@ class RerankStage:
 
 
 def _build_rerank_stage(deps: ComponentDeps, argument: str | None = None) -> RerankStage:
+    """The rerank stage with the registered "jina" cross-encoder (the one built-in reranker)."""
     return RerankStage(deps.registry.get("reranker", "jina")(deps))
 
 
+# Name -> factory(deps, argument). Registered in the component registry, so an app can add or replace stages.
 BUILTIN_STAGES = {
     "threshold": lambda deps, argument=None: ThresholdFilter(
         min_similarity=deps.profile.retrieval.min_similarity or 0.0, kind=argument or "cosine"

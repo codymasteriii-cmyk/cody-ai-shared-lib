@@ -1,4 +1,17 @@
-"""Token budgets per prompt zone and history selection (§10.1, §10.2, AC-RAG-38)."""
+"""Token budgets per prompt zone and history selection (§10.1, §10.2, AC-RAG-38).
+
+The model's window is finite, so before any text is added the window is divided into zones:
+
+    max_context_tokens
+    ├─ instructions         the system prompt (never less than `reserved_instruction_tokens`)
+    ├─ question reserve     room for the user's question
+    ├─ answer reserve       room for the answer to be written
+    └─ usable               what is left, split into: history | summaries | local window | retrieved passages
+
+Dummy example: a 6,000-token window, 800 for instructions, 200 for the question and 1,000 for the answer leaves
+4,000 usable. With illustrative ratios of 15% for history and 15% for summaries that is 600 each
+(when there is any history or any summary); the passages get what remains, never less than 128.
+"""
 from __future__ import annotations
 
 import math
@@ -22,7 +35,16 @@ class BudgetAllocation:
 
 
 def truncate_to_tokens(text: str, max_tokens: int) -> str:
-    """Cut text proportionally so its estimated size fits, marking the cut."""
+    """Cut text proportionally so its estimated size fits, marking the cut.
+
+    The cut is an estimate (tokens are not counted exactly), so it keeps 95% of the proportional length to stay
+    safely under the budget.
+
+    >>> truncate_to_tokens("short", 100)
+    'short'
+    >>> truncate_to_tokens("word " * 500, 10).endswith("…")
+    True
+    """
     tokens = estimate_tokens(text)
     if tokens <= max_tokens:
         return text
@@ -40,6 +62,7 @@ def _turn_pairs(history: Sequence[ChatTurn]) -> list[list[ChatTurn]]:
 
 
 def _render_pair(pair: Sequence[ChatTurn]) -> str:
+    """One exchange as text: "User: ..." then "Assistant: ..."."""
     return "\n".join(f"{turn.role.capitalize()}: {turn.content or ''}" for turn in pair)
 
 
@@ -94,6 +117,7 @@ class TokenBudgeter:
         )
 
     def _tokens(self, text: str) -> set[str]:
+        """The distinct words of a text, as the analyzer sees them, for measuring overlap with the question."""
         return set(self.analyzer.tokenize(self.analyzer.normalize(text)))
 
     def _retention(self, pair_text: str, question_tokens: set[str], age: int) -> float:
@@ -108,7 +132,12 @@ class TokenBudgeter:
         budget_tokens: int,
         question: str = "",
     ) -> tuple[str, int]:
-        """Return (history text, tokens used): recent exchanges always, older ones by score (§10.2)."""
+        """Return (history text, tokens used): recent exchanges always, older ones by score (§10.2).
+
+        Order of decisions: the most recent `min_recent_turns_kept` exchanges are always kept (shortened evenly if
+        they alone are too big); then the rolling summary, if it fits; then older exchanges, best score first, while
+        room remains. Output keeps chronological order, summary first.
+        """
         if budget_tokens <= 0 or (not history and not rolling_summary):
             return "", 0
 
@@ -129,6 +158,8 @@ class TokenBudgeter:
             else:
                 summary_line = ""
 
+        # An older exchange scores high when it is recent or shares words with the question ("he" -> the earlier talk
+        # about that person); `age` counts exchanges back from now
         question_tokens = self._tokens(question)
         best_first = sorted(
             range(len(older)),

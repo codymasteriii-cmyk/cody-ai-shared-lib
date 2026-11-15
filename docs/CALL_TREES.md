@@ -182,3 +182,81 @@ prepare_nodes()                      for apps that insert rows themselves (§6.4
 
 needs_reindex()                      compare stored fingerprints with what the profile would write now
 ```
+
+---
+
+## 9. Routing: reading the question (intent/router.py)
+
+```
+route()                              HybridIntentRouter, the "auto" router; stops at the first layer that decides
+├─ classify()                        heuristic regex rules, 0 ms: small talk and "summarize this" end here
+├─ route()                           (optional) JevGateRouter: a fast classifier; decides only when confident
+├─ route()                           LLMIntentRouter, when `models.intent` is set: the usual path for real questions
+│  ├─ generate()                     one low-temperature model call, fenced question and history
+│  ├─ extract_json_block()           pull the JSON out of the model's text
+│  ├─ extract()                      TemporalResolver: "last week" -> a date range
+│  ├─ clamp_intent()                 force every value into its legal range (DG-05)
+│  └─ _must_not_rules()              keep an exclusion only if the question really contains it
+└─ extract()                         no model configured: add date words to the heuristic or raw-question intent
+```
+
+Other routers: `none` (PassthroughRouter) returns the question as written; `heuristic` stops after `classify()`; `llm` always uses the intent model.
+
+---
+
+## 10. Choosing a strategy: the adaptive ladder (strategies/adaptive.py)
+
+```
+retrieve()                           AdaptiveRetrievalStrategy
+└─ decide_tier()                     the first rule that is true, whose strategy the store can run
+   ├─ fits_full_context()            rule 3: does the whole scope fit the Tier 0 gate? (asks scope_stats)
+   └─ the rules in order             override, no_retrieval, full_context, find_then_read (lists),
+                                     hierarchical (overview), keyword_first (exact terms), hybrid_rrf,
+                                     dense_vector, keyword_only
+```
+
+`plan()` on the engine calls `decide_tier()` alone, so the decision can be inspected without searching. The chosen strategy's `retrieve()` then runs; most of them end in `ranked_store_call()`:
+
+```
+ranked_store_call()                  every vector, keyword and hybrid search goes through here (shared.py)
+├─ query_token_groups()              the question as analyzer tokens, for stores that search tokens
+├─ resolve_group()                   split text rules into a narrow set and a wider "any of these names" set
+└─ _checked_call()                   one store call: the store applies the rules it declares, the engine checks the rest
+   └─ satisfies()                    the engine-side check of the text rules (text/rules.py)
+```
+
+---
+
+## 11. Building the prompt (context/assembler.py)
+
+```
+assemble_prompt()
+├─ _effective_grounding()            strict, or labelled fallback (a guard such as the spoiler guard forces strict)
+├─ _fence_for()                      the fence id, rotated if any content contains it
+│  └─ ensure_collision_free_id()     (context/fence.py)
+├─ allocate()                        budgeter: split the token window into history, summaries, window, passages
+├─ select_history()                  budgeter: recent turns always, older turns by relevance
+├─ fit()                             once per zone: render nodes until the zone's budget is spent
+├─ _render_node_xml()                one passage inside the data fence, text sanitized
+│  └─ sanitize_content()             neutralize anything that looks like one of our own tags
+└─ stable / volatile split           stable text first, so the provider can cache that prefix
+```
+
+---
+
+## 12. Guards (guards.py)
+
+```
+scoped_filters()                     retrieval_pipeline.py, before any store call
+└─ turn_guards()
+   └─ build_turn_guards()            one guard per filter that is set, plus app guards
+      ├─ SequentialBoundaryGuard     the reader's position (spoiler prevention)
+      ├─ TemporalGuard               the caller's hard date range
+      ├─ TenantGuard                 one tenant's data
+      └─ ScopeGuard                  documents, domain, categories
+
+apply_guards()                       after every step that adds text, never once at the end
+└─ verify()                          per guard, per node: keep, drop, or return a shortened copy
+```
+
+Each guard also offers `to_filter()` (ask the store for the allowed rows), `verify_citation()` and `prompt_rules()`.

@@ -7,6 +7,12 @@ Resolves calendar expressions in questions relative to an injected Clock:
   - "this month", "last month"
   - Year/Quarter/Month patterns ("2026-Q1", "October 2026", "2026")
   - Range repair if range_start_utc > range_end_utc
+
+The clock is injected, never read directly, so "last week" means the same thing in a test and in a replay of an
+old request. Everything is UTC: a user's own time zone is the app's concern, not the engine's.
+
+Dummy example: the clock says Wednesday 18 Nov 2026. "last week" is the calendar week before this one, Monday
+9 Nov to Sunday 15 Nov. "this week" is Monday 16 Nov up to now. "past 3 days" is 15 Nov 12:00 up to now.
 """
 from __future__ import annotations
 
@@ -18,13 +24,28 @@ from ..runtime import Clock, SystemClock
 
 
 class TemporalResolver:
-    """Extracts and resolves temporal expressions against an injected Clock."""
+    """Extracts and resolves temporal expressions against an injected Clock.
+
+    Two jobs: `extract(text)` finds a date expression in the question's words; `resolve(intent)` turns whatever
+    the intent already says (a window in days, or a reversed range) into a concrete range.
+    """
 
     def __init__(self, clock: Clock | None = None):
         self.clock = clock or SystemClock()
 
     def extract(self, query: str) -> dict[str, Any]:
         """Extract temporal bounds and return dict with resolved fields.
+
+        The first matching rule wins, tried from the most specific phrase down to a bare year.
+
+        >>> from datetime import datetime
+        >>> from cody_ai_shared_lib.rag.runtime import FrozenClock
+        >>> resolver = TemporalResolver(FrozenClock(datetime(2026, 11, 18, 12, 0)))     # a Wednesday
+        >>> found = resolver.extract("what happened last week")
+        >>> found["range_start_utc"].date().isoformat(), found["range_end_utc"].date().isoformat()
+        ('2026-11-09', '2026-11-15')
+        >>> resolver.extract("who is Li Wei")["has_time_expression"]
+        False
 
         Returns:
             dict containing:

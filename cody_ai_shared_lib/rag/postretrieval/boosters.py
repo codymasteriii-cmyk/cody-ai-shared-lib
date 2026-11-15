@@ -3,6 +3,10 @@
 Implements:
   - RecencyBooster: time-decayed multiplier based on age relative to an injected clock.
   - ScoreFusionStage: min-max normalized weighted fusion of semantic, keyword, recency, and app features.
+
+Dummy example (recency, half-life 7 days, weight 0.3): a passage from today has its score multiplied by
+1 + 0.3 = 1.3; one from a week ago by 1 + 0.3 * 0.5 = 1.15; one from a month ago by about 1.02. The boost fades
+smoothly, so recent news edges ahead of equally relevant old news without burying a far better old match.
 """
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ class RecencyBooster(Generic[MetaT]):
     accepts_score_kinds: ClassVar[frozenset[str] | None] = None
 
     def process(self, nodes: list[RAGNode[MetaT]], ctx: Any) -> list[RAGNode[MetaT]]:
+        """Stage entry point: boost the ranked nodes only."""
         # Ordered layers and Tier 0 text are never rescored or reordered (§3.3)
         return apply_to_ranked(nodes, lambda ranked: self.boost(ranked, renderer=ctx.renderer))
 
@@ -40,7 +45,11 @@ class RecencyBooster(Generic[MetaT]):
         nodes: Sequence[RAGNode[MetaT]],
         renderer: NodeRenderer[MetaT] | None = None,
     ) -> list[RAGNode[MetaT]]:
-        """Apply recency boost deterministically under the injected clock."""
+        """Apply recency boost deterministically under the injected clock.
+
+        A node with no timestamp keeps its score. The result is re-sorted by score, ties by node id, so the same
+        input always gives the same order.
+        """
         now = self.clock.now_utc()
         view = renderer or DefaultRenderer()
         result: list[RAGNode[MetaT]] = []
@@ -67,6 +76,7 @@ class ScoreFusionStage(Generic[MetaT]):
     accepts_score_kinds: ClassVar[frozenset[str] | None] = None
 
     def process(self, nodes: list[RAGNode[MetaT]], ctx: Any) -> list[RAGNode[MetaT]]:
+        """Stage entry point: fuse the ranked nodes only."""
         # Normalization and fusion see only ranked nodes; ordered layers keep score and place (§3.3)
         return apply_to_ranked(nodes, lambda ranked: self.fuse(ranked, renderer=ctx.renderer, clock=ctx.deadline.clock))
 
@@ -80,6 +90,15 @@ class ScoreFusionStage(Generic[MetaT]):
         })
 
     def _min_max_normalize(self, values: list[float]) -> list[float]:
+        """Rescale values to 0..1 so signals on different scales (cosine, BM25, age) can be added.
+
+        When all values are equal there is nothing to tell apart, so every node gets 1.0.
+
+        >>> ScoreFusionStage()._min_max_normalize([1.0, 3.0, 5.0])
+        [0.0, 0.5, 1.0]
+        >>> ScoreFusionStage()._min_max_normalize([2.0, 2.0])
+        [1.0, 1.0]
+        """
         if not values:
             return []
         min_v = min(values)
@@ -94,7 +113,12 @@ class ScoreFusionStage(Generic[MetaT]):
         renderer: NodeRenderer[MetaT] | None = None,
         clock: Clock | None = None,
     ) -> list[RAGNode[MetaT]]:
-        """Combine signals into a fused score."""
+        """Combine signals into a fused score.
+
+        Four signals, each rescaled to 0..1 over this candidate set, then weighted (default 0.5 semantic, 0.2 keyword,
+        0.1 recency, 0.2 app features): fused = sum(weight * signal) / sum(weights). A missing signal counts as a
+        neutral value (0.5 for recency and features, 0 for keyword) so it neither helps nor hurts a node.
+        """
         if not nodes:
             return []
 

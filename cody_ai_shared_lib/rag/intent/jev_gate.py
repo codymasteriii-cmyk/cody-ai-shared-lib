@@ -2,6 +2,11 @@
 
 Optionally enabled to fast-path high-confidence local lookup and overview queries
 without an LLM call. Emits DG-03 degradation on error or timeout and falls back to LLM.
+
+Jev answers a few yes/no and multiple-choice questions about the query, each with a confidence. The fast path
+is taken only when Jev is sure the question is a plain lookup or overview (scope confidence >= 0.85) AND sure it
+needs no rewriting (< 30%) AND has no time expression (< 30%). Anything less sure returns None, and the caller
+goes on to the intent model: the gate may skip the model, but it must never guess in its place.
 """
 from __future__ import annotations
 
@@ -21,7 +26,11 @@ logger = logging.getLogger("shared-rag.router")
 
 
 class JevGateRouter:
-    """Fast pre-router via TypeSafe AI Jev System One."""
+    """Fast pre-router via TypeSafe AI Jev System One.
+
+    Optional and off by default (`router.enable_jev`). It only ever returns an intent when it is confident, and
+    a failure is a degradation (DG-03), never an error, unless the profile says `fallbacks["jev"] = "raise"`.
+    """
 
     def __init__(
         self,
@@ -47,7 +56,10 @@ class JevGateRouter:
         budget_guard: BudgetGuard | None = None,
         fallbacks: dict[str, str] | None = None,
     ) -> QueryIntent | None:
-        """Attempt fast path via Jev. Returns QueryIntent if fast path taken, else None."""
+        """Attempt fast path via Jev. Returns QueryIntent if fast path taken, else None.
+
+        Order: check the budget guard -> ask Jev -> record the spend -> test the confidence thresholds.
+        """
         if not self.gateway.jev_client:
             return None
 
@@ -64,6 +76,7 @@ class JevGateRouter:
                 )
                 return None
 
+        # `recorded` tells the error path whether the spend was already booked, so it is never booked twice or lost
         recorded = False
         started = time.perf_counter()
         try:
@@ -98,7 +111,7 @@ class JevGateRouter:
             )
             recorded = True
 
-            # Evaluate fast path criteria (AC-RAG-14)
+            # Evaluate fast path criteria (AC-RAG-14). A missing answer counts as "not sure", so it fails the test.
             scope_ans = jev_res.answers.get("scope")
             rewrite_ans = jev_res.answers.get("needs_query_rewrite")
             time_ans = jev_res.answers.get("has_time_expression")

@@ -1,4 +1,17 @@
-"""Tier ladder AdaptiveRetrievalStrategy driven by ordered (predicate, strategy) rules (§8.9, §8.12)."""
+"""Tier ladder AdaptiveRetrievalStrategy driven by ordered (predicate, strategy) rules (§8.9, §8.12).
+
+How the choice is made: `DEFAULT_ADAPTIVE_RULES` is an ordered list of (predicate, strategy) pairs. The first
+predicate that is true, whose strategy the store can run, decides. A profile may replace the list.
+
+Dummy example: a 12-page document in a store with vectors and keywords, the question "list every mention of tea".
+    rule 1 has_strategy_override   no override on the request               -> next
+    rule 2 route_no_retrieval      the router chose to retrieve             -> next
+    rule 3 fits_full_context       scope_stats says 9,000 tokens, the gate is 4,000   -> next
+    rule 4 wants_list_chunked      `list_strategy` is off in this profile   -> next
+    ...
+    rule 7 hybrid_available        vectors and keyword search both exist    -> hybrid_rrf
+`plan()` returns this decision without searching, with a reason string naming the rule that fired.
+"""
 from __future__ import annotations
 
 import logging
@@ -65,6 +78,11 @@ def _hint_exceeds_gate(rc: RuleContext, gate: int) -> bool:
 
 
 def fits_full_context(rc: RuleContext) -> bool:
+    """Tier 0 test: does the whole visible scope fit the gate? It asks the store only when the hint cannot rule it out.
+
+    The caller's `doc_total_chars` hint is used only to say "too big" without a store call; "it fits" is always
+    decided from the store's own `scope_stats`, which stays the source of truth (§8.2).
+    """
     gate = rc.profile.retrieval.full_context_max_tokens
     if gate <= 0 or not rc.caps.supports_full_scope_fetch or _hint_exceeds_gate(rc, gate):
         return False
@@ -81,6 +99,8 @@ def fits_full_context(rc: RuleContext) -> bool:
     return 0 < stats.total_tokens <= gate
 
 
+# The named conditions a rule can use. Each takes a RuleContext and returns True or False; they are looked up by
+# name in the component registry, so an app can add its own predicate and name it in `adaptive_rules`.
 BUILTIN_PREDICATES = {
     "has_strategy_override": lambda rc: bool(rc.request.strategy_override)
     and rc.request.strategy_override != AdaptiveRetrievalStrategy.name,
@@ -100,7 +120,11 @@ BUILTIN_PREDICATES = {
 
 
 class AdaptiveRetrievalStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
-    """Runs the first rule that is true and whose strategy the store can serve (§8.9)."""
+    """Runs the first rule that is true and whose strategy the store can serve (§8.9).
+
+    It holds no state of its own: `decide_tier` is a pure function of the request, the filters, the store's
+    declared capabilities and the profile, which is why `plan()` can call it without searching.
+    """
     name: ClassVar[str] = "adaptive"
     version: ClassVar[str] = "1.0.0"
 
@@ -122,12 +146,14 @@ class AdaptiveRetrievalStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
         for number, (predicate, configured) in enumerate(rules, start=1):
             if not components.get("predicate", predicate)(rc):
                 continue
+            # The rule fired. A strategy the store cannot run is skipped, so the ladder falls through to the next rule
             is_override = configured == OVERRIDE_STRATEGY
             strategy = request.strategy_override if is_override else configured
             cls = components.get("strategy", strategy)
             if strategy != NO_STRATEGY and not is_override and not cls.is_runnable(caps):
                 continue
 
+            # The reason string is for humans reading a trace: which rule, and the numbers it was decided on
             measured = (
                 f"scope {rc.stats.total_tokens} tokens, Tier 0 gate {profile.retrieval.full_context_max_tokens}"
                 if rc.stats is not None
@@ -148,6 +174,7 @@ class AdaptiveRetrievalStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
         raise StoreCapabilityError("No adaptive rule matched a strategy this store can run", stage="retrieval")
 
     def retrieve(self, ctx: RetrievalContext[MetaT]) -> list[RAGNode[MetaT]]:
+        """Decide the tier, record the decision on the context for the trace, then delegate to the chosen strategy."""
         registry = ctx.registry or create_default_registry()
         plan = self.decide_tier(ctx.request, ctx.intent, ctx.filters, ctx.store, ctx.profile, registry)
         ctx.last_strategy_used = plan.strategy

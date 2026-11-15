@@ -32,6 +32,10 @@ def select_summary_layer(summaries: list[RAGNode[MetaT]]) -> list[RAGNode[MetaT]
 
 
 class HierarchicalSummaryStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
+    """Tier 3, for overview questions: summaries first, then the text at the reader's position, then best passages.
+
+    Layers are merged in that order and de-duplicated by node id, so a summary is never repeated as a passage.
+    """
     name: ClassVar[str] = "hierarchical"
     version: ClassVar[str] = "1.0.0"
     requires: ClassVar[frozenset[str]] = frozenset(["supports_parent_summaries"])
@@ -42,9 +46,11 @@ class HierarchicalSummaryStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
             raise StoreCapabilityError("HierarchicalSummaryStrategy requires store capability 'supports_parent_summaries'")
 
         summaries = select_summary_layer(ctx.store.fetch_parent_summaries(ctx.filters))
+        # The window sits at the reader's position; with none, at the edge of what the guard lets them see
         cursor =ctx.request.cursor_offset if ctx.request.cursor_offset is not None else ctx.filters.max_char_offset
         window = fetch_window(ctx, cursor)
 
+        # The detail layer uses the best search the store offers; with none, summaries and the window stand alone
         if HybridRRFStrategy.is_runnable(caps):
             passages = HybridRRFStrategy().retrieve(ctx)
         elif DenseVectorStrategy.is_runnable(caps):

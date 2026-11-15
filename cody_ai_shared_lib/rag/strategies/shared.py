@@ -1,4 +1,14 @@
-"""Query steps shared by the retrieval strategies (§8.3–§8.6)."""
+"""Query steps shared by the retrieval strategies (§8.3–§8.6).
+
+The one that matters most is `ranked_store_call`: every ranked search (vector, keyword, hybrid) goes through it,
+so text rules (§7.9) are applied the same way whichever strategy ran.
+
+    ranked_store_call()
+    ├─ query_token_groups()     the question as analyzer tokens, for stores that search tokens (§6.1)
+    ├─ resolve_group()          split the rules into a narrow set and a wider "any of these names" fallback
+    └─ _checked_call()          one store call: the store applies the rules it declares, the engine checks the rest
+       └─ _rule_sets()          decide which side each rule goes to
+"""
 from __future__ import annotations
 
 from typing import Callable
@@ -12,6 +22,7 @@ from .context import RetrievalContext
 
 
 def query_text(ctx: RetrievalContext[MetaT]) -> str:
+    """The text to search with: the router's rewritten query, else the user's own words."""
     return ctx.intent.search_query or ctx.request.question
 
 
@@ -55,6 +66,7 @@ def _checked_call(
     filters = ctx.filters.model_copy(update={"text_rules": in_store})
     if not by_engine:
         return call(filters, groups, top_k)
+    # The engine drops rows after the call, so ask for extra rows to still have `top_k` left afterwards
     rows = call(filters, groups, min(max(top_k, top_k * OVERFETCH), caps.max_top_k))
     kept = [
         node for node in rows
@@ -79,6 +91,7 @@ def ranked_store_call(
     first and widened ones are appended without duplicates. Only `filter` rules reach the store; `prefer` rules
     never do. A token store also gets the names as token groups (§6.1).
     """
+    # Pass 1: require the names the question mentions. Pass 2 (only if pass 1 is short): accept any one of them.
     groups = query_token_groups(ctx)
     narrow, wide = resolve_group([r for r in ctx.rules if r.strength == "filter"], query_text(ctx))
     wide_groups = widen_name_groups(groups) if groups else None
@@ -91,7 +104,11 @@ def ranked_store_call(
 
 
 def embed_query(ctx: RetrievalContext[MetaT]) -> list[float]:
-    """Return the query vector, or an empty list when embedding failed."""
+    """Return the query vector, or an empty list when embedding failed.
+
+    An empty list is the signal for the strategy to fall back to keyword search (DG-07); the failure itself is
+    already recorded by the gateway as a degradation, so nothing is swallowed silently.
+    """
     ctx.deadline.raise_if_cancelled("retrieval_embedding")
     try:
         result = ctx.gateway.embed(
@@ -147,7 +164,10 @@ def fetch_window(ctx: RetrievalContext[MetaT], cursor: int | None) -> list[RAGNo
 
 
 def with_local_window(ctx: RetrievalContext[MetaT], results: list[RAGNode[MetaT]]) -> list[RAGNode[MetaT]]:
-    """Put the window around the request's cursor ahead of the ranked results (§8.4)."""
+    """Put the window around the request's cursor ahead of the ranked results (§8.4).
+
+    The reader's own position is the most relevant text for a question asked while reading, so it comes first.
+    """
     window = fetch_window(ctx, ctx.request.cursor_offset)
     seen = {n.node_id for n in window}
     return window + [n for n in results if n.node_id not in seen]

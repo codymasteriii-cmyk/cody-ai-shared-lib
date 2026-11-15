@@ -1,6 +1,13 @@
 """Score threshold filter (§9.1, AC-RAG-31, AC-RAG-60).
 
 Drops candidate nodes whose raw similarity score is strictly below min_similarity.
+
+Which score counts depends on `kind`: "cosine" reads the vector similarity (never the fused score), "rerank" the
+reranker's score, "bm25" the keyword score, "score" whatever `score` holds. A node with no value of that kind is
+kept, not dropped: absence of a signal is not evidence of irrelevance.
+
+Dummy example: min_similarity 0.6, kind "cosine". A passage with vector score 0.72 stays; one with 0.41 is dropped;
+a summary (an ordered layer, not ranked by similarity) stays whatever its score.
 """
 from __future__ import annotations
 
@@ -27,6 +34,7 @@ class ThresholdFilter(Generic[MetaT]):
         self.kind = kind
 
     def process(self, nodes: list[RAGNode[MetaT]], ctx: Any) -> list[RAGNode[MetaT]]:
+        """Stage entry point."""
         return self.filter(nodes)
 
     def filter(self, nodes: list[RAGNode[MetaT]]) -> list[RAGNode[MetaT]]:

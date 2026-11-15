@@ -2,6 +2,25 @@
 
 Guards translate into filter patches store-side, and verify/truncate nodes and citations
 in-memory for defense in depth (D-04, D-05, D-24, AC-RAG-23, AC-RAG-24, AC-RAG-73).
+
+A guard is a promise about what a reader may see. Each one does up to four jobs, and having all four is the point:
+
+    to_filter()         ask the store for only the allowed rows (efficient, but the store might ignore it)
+    verify(node)        check every node that comes back and drop or shorten the ones that break the rule
+    verify_citation()   reject a citation that points at something the reader may not see
+    prompt_rules()      tell the model the rule too, so it does not volunteer what it was never shown
+
+`to_filter` alone would trust the store; `verify` is the net underneath it. The retrieval pipeline applies the
+guards after every step that adds text, so no later step can reintroduce a hidden passage.
+
+The four built-in guards, and where `build_turn_guards()` creates each one from the turn's filters:
+
+    sequential_boundary   a reader's position: nothing past it, to prevent spoilers          (§5.2)
+    temporal              the caller's hard date range                                       (§5.1)
+    tenant                one tenant's data only                                             (§5.1)
+    scope                 the named documents, domain, categories and custom keys            (§5.1)
+
+An app may add its own guards; they can only add restrictions, never remove a built-in one (§5.3).
 """
 from __future__ import annotations
 
@@ -23,7 +42,15 @@ from .text.analyzer import CjkAwareAnalyzer, TextAnalyzer
 
 
 class SequentialBoundaryGuard:
-    """Enforces spoiler prevention by cutting or dropping text beyond reading boundary B (§5.2)."""
+    """Enforces spoiler prevention by cutting or dropping text beyond reading boundary B (§5.2).
+
+    B is a character offset: how far the reader has got. Dummy example, B = 1000:
+        a passage at 1000-1200       starts at or after B          -> dropped
+        a passage at 900-1100        straddles B                   -> cut at the last sentence end before B
+        a passage at 400-700         ends before B                 -> kept as is
+        a section summary 0-1500     is not offset-addressable and ends after B -> dropped (it would reveal the rest)
+    While active it also forces strict grounding, so the model cannot fill gaps from its memory of the book.
+    """
     name: str = "sequential_boundary"
     hard: bool = True
 
@@ -41,20 +68,30 @@ class SequentialBoundaryGuard:
 
     @property
     def is_active(self) -> bool:
+        """True when any boundary is set; an inactive guard (profile asks for it, request sets none) filters nothing."""
         return self.max_char_offset is not None or bool(self.max_char_offset_by_doc)
 
     @property
     def forces_strict_grounding(self) -> bool:
+        """An active spoiler guard overrides a profile's labelled-fallback grounding (D-05): no outside knowledge."""
         return self.is_active
 
     def get_boundary_for_doc(self, doc_id: str) -> int | None:
-        """Resolve the effective boundary B for a specific document."""
+        """Resolve the effective boundary B for a specific document.
+
+        A per-document boundary wins, but is never allowed to exceed the global one.
+
+        >>> guard = SequentialBoundaryGuard(max_char_offset=500, max_char_offset_by_doc={"a": 300, "c": 900})
+        >>> guard.get_boundary_for_doc("a"), guard.get_boundary_for_doc("b"), guard.get_boundary_for_doc("c")
+        (300, 500, 500)
+        """
         bound = self.max_char_offset_by_doc.get(doc_id)
         if bound is not None:
             return min(bound, self.max_char_offset) if self.max_char_offset is not None else bound
         return self.max_char_offset
 
     def to_filter(self) -> FilterPatch:
+        """The same boundary as a store filter, so a store that supports it never returns hidden text at all."""
         fields: dict[str, Any] = {}
         if self.max_char_offset is not None:
             fields["max_char_offset"] = self.max_char_offset
@@ -68,6 +105,7 @@ class SequentialBoundaryGuard:
         if b is None:
             return node
 
+        # The three rules below are numbered as in §5.2 (rule 3 is tested before rule 2 only for readability)
         # Rule 1: A node starting at or after B is dropped
         if node.span.char_start >= b:
             return None
@@ -81,10 +119,12 @@ class SequentialBoundaryGuard:
 
         # Rule 2: Offset-addressable node with char_end >= B is cut at sentence end
         if node.span.char_end >= b:
-            limit = b - node.span.char_start
+            limit = b - node.span.char_start                 # how many characters of this node are before B
             prefix = node.text[:limit]
             last_end = self.analyzer.last_sentence_end(prefix)
 
+            # Prefer ending at a sentence, but never snap back further than max_snap_back_chars: a very long
+            # sentence is cut at B itself rather than losing most of the passage
             if last_end is None or (limit - last_end) > self.max_snap_back_chars:
                 cut = limit  # Hard cut at B
             else:
@@ -96,6 +136,7 @@ class SequentialBoundaryGuard:
             if cut == len(node.text):
                 return node
 
+            # Work on a copy: the stored node must stay whole for a reader who has read further
             new_node = copy.deepcopy(node)
             new_node.text = prefix[:cut]
             new_node.span.char_end = new_node.span.char_start + cut
@@ -113,6 +154,7 @@ class SequentialBoundaryGuard:
         return citation.span.char_end <= b
 
     def prompt_rules(self) -> list[str]:
+        """The instruction telling the model not to reveal, imply or deduce anything after the reader's position."""
         if not self.is_active:
             return []
         if self.max_char_offset is not None:
@@ -128,7 +170,10 @@ class SequentialBoundaryGuard:
 
 
 class TemporalGuard:
-    """Enforces strict caller-specified date bounds (§5.1)."""
+    """Enforces strict caller-specified date bounds (§5.1).
+
+    Only the caller's hard range: the soft window the router guesses from "last week" is relaxable and is not a guard (D-04).
+    """
     name: str = "temporal"
     hard: bool = True
     forces_strict_grounding: bool = False
@@ -155,6 +200,7 @@ class TemporalGuard:
         return FilterPatch(fields=fields)
 
     def verify(self, node: RAGNode[Any]) -> RAGNode[Any] | None:
+        """Keep a node dated inside the range. An undated node is kept only if the store already applied the filter."""
         if self.date_range_utc is None:
             return node
         dt_start, dt_end = self.date_range_utc
@@ -215,7 +261,11 @@ class TenantGuard:
 
 
 class ScopeGuard:
-    """Enforces caller scope constraints (doc_ids, domain, categories, custom)."""
+    """Enforces caller scope constraints (doc_ids, domain, categories, custom).
+
+    A node that lacks a metadata field is kept (the store has already filtered on it); a node that has the field
+    with a different value is dropped, including falsy values such as False, 0 or "".
+    """
     name: str = "scope"
     hard: bool = True
     forces_strict_grounding: bool = False
@@ -280,7 +330,12 @@ def build_turn_guards(
     renderer: Any = None,
     store_date_fields: frozenset[str] = frozenset(),
 ) -> list[Any]:
-    """Build the turn's guards from the effective filters, plus app guards, which only ever add (§5.3)."""
+    """Build the turn's guards from the effective filters, plus app guards, which only ever add (§5.3).
+
+    A guard exists only when its filter is set, so a request with no boundary and no tenant gets no such guards.
+    The one exception is the spoiler guard: a profile that lists it fails closed (raises) when the request states
+    no boundary, rather than quietly running without protection (§5.2).
+    """
     eff_analyzer = analyzer or CjkAwareAnalyzer()
     active: list[Any] = []
 
@@ -337,7 +392,7 @@ def build_turn_guards(
     return active
 
 
-# Names built from the turn's filters; any other profile guard name comes from the registry.
+# Names built from the turn's filters by build_turn_guards; any other profile guard name comes from the registry.
 BUILTIN_GUARDS: dict[str, Any] = {
     SequentialBoundaryGuard.name: SequentialBoundaryGuard,
     TemporalGuard.name: TemporalGuard,

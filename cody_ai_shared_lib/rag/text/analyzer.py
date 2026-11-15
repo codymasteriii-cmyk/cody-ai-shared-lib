@@ -5,6 +5,13 @@ Provides:
   - CjkAwareAnalyzer default implementation (bigrams for CJK, lower-cased words for Latin)
   - estimate_tokens: 1.0 token/CJK char, 0.25 token/other char, +10% (from cody_ai_shared_lib.tokens)
   - TokenGroup & build_tsquery for PostgreSQL full-text search query construction
+
+Why an analyzer exists: keyword search, quote checks and sentence cutting all need to agree on what a "word" is. English
+splits on spaces; Chinese has no spaces, so the default analyzer turns each run of Chinese characters into overlapping
+two-character pieces (bigrams) that can be matched without a dictionary. An app with a better segmenter (e.g. jieba)
+supplies its own analyzer through the profile; everything else in the library goes through this protocol.
+
+Dummy example: "Li Wei 去了北京" tokenizes to ["li", "wei", "去了", "了北", "北京"].
 """
 from __future__ import annotations
 
@@ -17,13 +24,21 @@ from ...tokens import estimate_tokens, is_cjk_char  # estimate_tokens is public 
 
 
 def node_tokens(nodes: Iterable[Any]) -> int:
-    """Token size of some nodes: each node's own estimate when it has one, else an estimate of its text."""
+    """Token size of some nodes: each node's own estimate when it has one, else an estimate of its text.
+
+    The budgeting code (prompt assembly, document reading, list batching) uses this one measure, so they agree on
+    how big a node is.
+    """
     return sum(node.token_estimate if node.token_estimate else estimate_tokens(node.text) for node in nodes)
 
 
 @runtime_checkable
 class TextAnalyzer(Protocol):
-    """Protocol for text tokenization, normalization and sentence boundary detection."""
+    """Protocol for text tokenization, normalization and sentence boundary detection.
+
+    To plug in your own: implement these four methods plus `name` and `version`, and name it in the profile's
+    `analyzer`. `version` matters: a store that keeps analyzer tokens records it, and a change marks the data stale.
+    """
     name: str
     version: str
 
@@ -53,7 +68,11 @@ _LATIN_TERMINATORS = (".", "!", "?")
 
 
 class CjkAwareAnalyzer:
-    """Default text analyzer supporting Latin words, CJK bigrams, and sentence detection."""
+    """Default text analyzer supporting Latin words, CJK bigrams, and sentence detection.
+
+    No dictionary and no external dependency, so it works on a small host. It is deliberately simple; the cost is
+    some noise in Chinese keyword search (bigrams that straddle a word boundary), which fusion with vector search absorbs.
+    """
     name: str = "cjk_aware"
     version: str = "1.0.0"
 
@@ -69,6 +88,11 @@ class CjkAwareAnalyzer:
         CJK runs become overlapping character bigrams (or single char if length 1).
         Latin runs become lower-cased words.
         Punctuation and whitespace are omitted.
+
+        >>> CjkAwareAnalyzer().tokenize("Hello World 你好世界")
+        ['hello', 'world', '你好', '好世', '世界']
+        >>> CjkAwareAnalyzer().tokenize("GPT-4o, v2.0!")          # punctuation splits words
+        ['gpt', '4o', 'v2', '0']
         """
         if not text:
             return []
@@ -104,7 +128,14 @@ class CjkAwareAnalyzer:
         return tokens
 
     def sentences(self, text: str) -> list[tuple[int, int]]:
-        """Return half-open char offset intervals (start, end) for sentences."""
+        """Return half-open char offset intervals (start, end) for sentences.
+
+        A sentence ends at ". ! ?" followed by a space or the end (so 3.14 and example.com are not split), at a
+        Chinese terminator wherever it appears, or at a blank line.
+
+        >>> CjkAwareAnalyzer().sentences("Hi there. Pi is 3.14! Ok")
+        [(0, 9), (10, 21), (22, 24)]
+        """
         if not text:
             return []
 
@@ -197,7 +228,16 @@ class CjkAwareAnalyzer:
         return ranges
 
     def last_sentence_end(self, text: str) -> int | None:
-        """Return offset just past the last complete sentence in text, or None if no complete sentence."""
+        """Return offset just past the last complete sentence in text, or None if no complete sentence.
+
+        This is what the spoiler guard uses to cut a passage cleanly at the reader's boundary: an unfinished
+        trailing sentence is not counted, so the cut never ends mid-sentence.
+
+        >>> CjkAwareAnalyzer().last_sentence_end("It ended. Then it")
+        9
+        >>> CjkAwareAnalyzer().last_sentence_end("no full sentence yet") is None
+        True
+        """
         sents = self.sentences(text)
         if not sents:
             return None
@@ -237,6 +277,9 @@ class TokenGroup(BaseModel):
     `any`: at least one token. `phrase`: all tokens adjacent and in order. `any_of` (§7.9): at least one of
     `alternatives`, each of which is itself a phrase; `tokens` then holds all their tokens, flattened, so a
     store can still score with them.
+
+    `origin` says where the group came from (the question's own words, an exact term the user quoted, or a name),
+    which stores may weigh differently.
     """
     tokens: list[str]
     mode: Literal["any", "phrase", "any_of"]
@@ -245,6 +288,7 @@ class TokenGroup(BaseModel):
 
 
 def _contains_run(tokens: list[str], run: list[str]) -> bool:
+    """True when `run` appears in `tokens` as consecutive items, in order (a phrase match on token lists)."""
     size = len(run)
     return any(tokens[i:i + size] == run for i in range(len(tokens) - size + 1))
 
@@ -263,6 +307,10 @@ def tokenize_query_groups(
     - With entity_mode='require' and one name, it becomes an 'entity' group with mode='phrase'.
     - With several names, the search requires the names that occur in its own text (one phrase group each);
       when none occurs, one 'any_of' group of all the names.
+
+    >>> groups = tokenize_query_groups(CjkAwareAnalyzer(), "Li Wei trip", exact_terms=["Model X7"])
+    >>> [(g.origin, g.mode, g.tokens) for g in groups]
+    [('free_text', 'any', ['li', 'wei', 'trip']), ('exact_term', 'phrase', ['model', 'x7'])]
     """
     groups: list[TokenGroup] = []
     query_tokens: list[str] = []
@@ -292,6 +340,7 @@ def tokenize_query_groups(
 
 
 def _any_of(names: list[list[str]]) -> TokenGroup:
+    """One group meaning "at least one of these names", each name still a phrase."""
     return TokenGroup(
         tokens=[token for toks in names for token in toks], mode="any_of", origin="entity", alternatives=names
     )
@@ -316,6 +365,13 @@ def build_tsquery(groups: list[TokenGroup]) -> str:
     Guarantees no unescaped tsquery operators or quotes from token text.
     'phrase' groups use '<->' adjacency; 'any' groups use '|'; 'any_of' groups use '|' between
     parenthesised phrases (no other operator); groups are joined with '&'.
+
+    The tokens are cleaned first (only letters, digits and CJK survive), because a user's text must never be able to
+    inject a search operator into the database query.
+
+    >>> groups = tokenize_query_groups(CjkAwareAnalyzer(), "Li Wei trip", exact_terms=["Model X7"])
+    >>> build_tsquery(groups)
+    '(li | wei | trip) & (model <-> x7)'
     """
     clean_parts: list[str] = []
     # Strip any dangerous tsquery characters from tokens: only keep letters, digits, and CJK
