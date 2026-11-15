@@ -109,6 +109,7 @@ def create_default_registry() -> ComponentRegistry:
     from .render import DefaultRenderer
     from .strategies.adaptive import BUILTIN_PREDICATES, AdaptiveRetrievalStrategy
     from .strategies.dense_vector import DenseVectorStrategy
+    from .strategies.find_then_read import FindThenReadStrategy
     from .strategies.full_context import FullContextStrategy
     from .strategies.hierarchical import HierarchicalSummaryStrategy
     from .strategies.hybrid_rrf import HybridRRFStrategy
@@ -127,6 +128,7 @@ def create_default_registry() -> ComponentRegistry:
         AdaptiveRetrievalStrategy,
         DenseVectorStrategy,
         FullContextStrategy,
+        FindThenReadStrategy,
         HierarchicalSummaryStrategy,
         HybridRRFStrategy,
         KeywordFirstStrategy,

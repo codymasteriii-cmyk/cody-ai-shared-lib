@@ -74,6 +74,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             supports_delete=True,
             supports_revisions=True,
             supports_embedding_return=True,
+            supports_offset_range_scope=True,
             text_rule_kinds=frozenset({"must_mention", "exact", "must_not"}),
             required_filter_keys=frozenset(),
             supported_custom_filters={"favorites_only": bool, "active": bool, "language": str},

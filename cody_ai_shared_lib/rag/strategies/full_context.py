@@ -30,4 +30,5 @@ class FullContextStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
                 node.granularity = GRANULARITY_FULL_DOC
             if FLAG_FULL_SCOPE not in node.flags:
                 node.flags.append(FLAG_FULL_SCOPE)
+        ctx.scope_complete = True
         return nodes

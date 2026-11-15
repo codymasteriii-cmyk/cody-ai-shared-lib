@@ -61,6 +61,10 @@ class RetrievalConfig(BaseModel):
     rrf_k: int = 60
     min_similarity: float | None = None
     min_results_before_relax: int = 3
+    # Lists (OI-4): "find_then_read" reads the text around each hit instead of the few best passages, for a `wants_list` question
+    list_strategy: Literal["none", "find_then_read"] = "none"
+    list_max_documents: int = Field(default=10, ge=1)     # documents find-then-read reads at most
+    list_read_radius_chars: int = 6000            # window around a hit when the store cannot read a section by range
     rerank_candidates: int | None = None  # how many candidates a rerank stage receives; default top_k x 3
     relaxation: list[str] = Field(default_factory=list)
     adaptive_rules: list[tuple[str, str]] | None = None
@@ -101,6 +105,11 @@ class GenerationConfig(BaseModel):
     # §10.10: "silent" reports degradations only in the response; "note" also tells the model, so the
     # answer can mention them briefly. Overridable per request.
     degradation_disclosure: Literal["silent", "note"] = "silent"
+    # query_batched (OI-4): a hard cap on documents and on batches. One question costs at most
+    # `list_max_batches` map calls plus one merge call (plus the router and embedding calls).
+    list_max_documents: int = Field(default=40, ge=1)
+    list_max_batches: int = Field(default=4, ge=1)
+    list_on_batch_failure: Literal["raise", "degrade"] = "raise"    # "degrade": a DG-15 record and a partial answer
 
 
 class CitationConfig(BaseModel):

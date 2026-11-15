@@ -107,6 +107,13 @@ AGREED_DEGRADATIONS: dict[str, dict[str, Any]] = {
         "log_level": logging.ERROR,
         "fallback": "continue",
     },
+    "DG-15": {
+        "stage": "list",
+        "description": "A batch or the merge of a list answer failed",
+        "default": "opt-in",
+        "log_level": logging.ERROR,
+        "fallback": "continue_without_batch",
+    },
     "DG-14": {
         "stage": "summarizer",
         "description": "Summarizer fails at ingestion",

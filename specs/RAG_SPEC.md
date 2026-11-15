@@ -2,7 +2,7 @@
 
 | | |
 | :--- | :--- |
-| **Document Version** | 1.2.11-draft |
+| **Document Version** | 1.2.12-draft |
 | **Status** | Draft, design agreed. Sibling feedback (AUD-01..26, NF-01..40, KB-01..23) was consolidated into C-01..C-39 and folded in; owner decisions Q-01..Q-08, the failure model and the pushbacks (Appendix C) are settled, and all three app agents (AudioReading, NewsIntelligence, KnowledgeBase) agreed through 1.1.8. Version 1.1.14 changes parts of that agreed contract after the Phase 1–3 review (Appendix B). Version 1.2.0 adds the changes agreed with AudioReading after its first integration (INT-01..INT-09); they are additive. This file records the outcome and its reasoning; the exchange itself was removed after agreement and remains in git history (commit `37d76fd`). This file is the only record of the design and its reasoning; the round's working files were removed on 2026-11-08. |
 | **Package Namespace** | `cody_ai_shared_lib.rag` (`cody-ai-shared-lib >= 0.8.0`) |
 | **Target Runtime** | Python 3.13+ (1.2.0: the owner's floor for all projects; the models use PEP 696 `TypeVar` defaults), synchronous core (matching the rest of `cody_ai_shared_lib`) with a bounded thread pool for independent calls |
@@ -584,6 +584,8 @@ class RAGResponse(BaseModel, Generic[MetaT]):
     grounded: bool                        # §10.5
     answer_found: Literal["yes", "no", "partial"] | None   # parsed from model flag; None if absent or invalid (§10.5)
     abstained: bool
+    completeness: Literal["whole_scope", "partial"] | None   # 1.2.12 (§7.9): only for a `wants_list` question, else None
+    batches: BatchReport | None = None   # 1.2.12: set by `query_batched` only (§14.4)
     degraded: bool = False                # True when any agreed degradation fired (see degradations)
     citation_coverage: CitationCoverage | None = None
     state: "ConversationState"            # pass back on the next turn (§7.7)
@@ -647,6 +649,7 @@ class StoreCapabilities(BaseModel):
     supports_links: bool = False               # [seam] link expansion
     supports_graph_traversal: bool = False     # [seam] Tier 4
     supports_embedding_return: bool = False    # [seam] MMR, eval
+    supports_offset_range_scope: bool = False  # 1.2.12 (§8.13): fetch_full_scope applies min_char_offset and max_char_offset together
     required_filter_keys: frozenset[str] = frozenset()   # fail-closed scope (§5.6)
     supported_custom_filters: dict[str, type] = {}       # §3.6
     supported_date_fields: frozenset[str] = frozenset()
@@ -864,6 +867,7 @@ The kit writes the way the engine does: through `upsert_section` with a `Section
 28. **`must_not` rule (1.2.11).** A `filter` rule drops passages that mention the phrase and keeps the others.
 29. **`prefer` is never a filter (1.2.11).** A store given a `prefer` rule excludes nothing for it.
 30. **Ranked searches only (1.2.11).** `fetch_full_scope` and `fetch_parent_summaries` ignore text rules.
+31. **Offset range scope (1.2.12).** For a store declaring `supports_offset_range_scope`: `fetch_full_scope` with `min_char_offset` and `max_char_offset` returns only the nodes in the range, the guard boundary still applies inside it, and `scope_stats` describes the same range.
 
 Checks 17 and 18 seed engine-shaped data: the splitter's overlapping passages (1.2.0).
 
@@ -1284,6 +1288,7 @@ class QueryIntent(BaseModel, Generic[ExtT]):
     entity_mode: Literal["require", "ignore"] = "ignore"
     exact_terms: list[str] = Field(default_factory=list)        # quoted strings, identifiers
     negation: bool = False
+    wants_list: bool = False                # 1.2.12 (§7.9): the answer is an enumeration whose items the question does not name
     rules: list[TextRule] = []              # 1.2.11 (§7.9): from an app router or the LLM router (`must_not`)
 
     suggested_top_k: int | None = None      # clamped [1, 30] for query(); ignored by retrieve()
@@ -1540,8 +1545,8 @@ class TransformContext:
 
 **Agreed boundaries from the same round (recorded, not built).**
 - **Counting and ranking questions** ("how many articles about X") stay app-owned. The engine does not learn about counting. (NewsIntelligence has no analytics service today; such questions take its normal chat path, and any number is an estimate.)
-- **Lists:** "complete" means complete within the visible scope (spoiler guard, access limits). A per-subject question ("A, B and C: what does each do?") is covered by the rule for several names, not a list. A "complete list" mark and find-then-read-whole for chunked documents wait until an app needs them (OI-4). Lists across many documents use the existing parts (`route`, `retrieve` with filters, `generate_from_nodes`); a batch-then-merge mode is later (§10).
-- **Question shapes stay open.** A timeline and a "what changed over time" shape want date order rather than relevance; recorded as candidates (OI-4).
+- **Lists (built 1.2.12, §8.13):** "complete" means complete within the visible scope (spoiler guard, access limits), and only reading the whole scope proves it. A per-subject question ("A, B and C: what does each do?") is covered by the rule for several names, not a list. The "complete list" mark is `completeness`; find-then-read is `FindThenReadStrategy`; batch-then-merge across documents is `query_batched` (all in §8.13).
+- **Question shapes stay open.** A timeline and a "what changed over time" shape want date order rather than relevance; recorded as candidates (OI-4, not built).
 - **Flags are information.** The app may show, log, act on or ignore any flag; only typed errors must be handled. Flags also arrive on the stream's `done` event (§10.8).
 - **Clarification** (OI-5): if built, the engine marks an unclear question and suggests options, the app decides whether to ask, and options come only from passages inside the visible scope.
 - **Plug-in points deferred:** a single "intent to filters" hook and an app text-check function. The two-call pattern (`engine.route`, then `engine.query(request, intent=...)`) is workable for all three apps.
@@ -1676,11 +1681,14 @@ default_registry = ComponentRegistry()   # built-ins pre-registered
 | 1 | `has_strategy_override` | the override |
 | 2 | `route_no_retrieval` | `none` (empty retrieval, generation without data) |
 | 3 | `fits_full_context` | `full_context` |
-| 4 | `wants_overview` (`scope=document_overview` or `always_include_summaries`) | `hierarchical` |
-| 5 | `exact_terms_only` (intent has `exact_terms` and the profile enables keyword-first) | `keyword_first` |
-| 6 | `hybrid_available` | `hybrid_rrf` |
-| 7 | `vector_available` | `dense_vector` |
-| 8 | `keyword_available` | `keyword_only` |
+| 4 | `wants_list_chunked` (1.2.12: `intent.wants_list`, `retrieval.list_strategy="find_then_read"`, and the store reads scopes) | `find_then_read` |
+| 5 | `wants_overview` (`scope=document_overview` or `always_include_summaries`) | `hierarchical` |
+| 6 | `exact_terms_only` (intent has `exact_terms` and the profile enables keyword-first) | `keyword_first` |
+| 7 | `hybrid_available` | `hybrid_rrf` |
+| 8 | `vector_available` | `dense_vector` |
+| 9 | `keyword_available` | `keyword_only` |
+
+**Rule numbers changed in 1.2.12.** The new rule 4 moves the rules after it down by one. Full numbering of the default list: 1 `has_strategy_override` (unchanged), 2 `route_no_retrieval` (unchanged), 3 `fits_full_context` (unchanged), 4 `wants_list_chunked` (new), 5 `wants_overview` (was 4), 6 `exact_terms_only` (was 5), 7 `hybrid_available` (was 6), 8 `vector_available` (was 7), 9 `keyword_available` (was 8). `RAGTrace.rule`, the log line's `rule=<n>` and `tier_decision_reason` ("rule N predicate") name the new numbers; a request on a rule before 4 is unaffected. An app that reads or pins a rule number must update it. The default list is otherwise unchanged, and the new rule never matches unless the profile opts in (`retrieval.list_strategy`). Presets that name rules by number (§12.2) are updated; presets in code use the default list, so no code changed.
 
 - Apps may register predicates and reorder rules per profile.
 - The reason recorded in `tier_decision_reason` names the rule number, the predicate and the measured values.
@@ -1722,6 +1730,32 @@ engine.plan(request, intent=None) -> QueryPlan
 > **Rationale:** AudioReading must decide before calling the engine whether to answer, start an embed job, or return `409 embedding_required` (Audio response N-2). Under the spoiler guard that depends on position and guards, so repeating the decision in the app would duplicate engine logic. KnowledgeBase can use the same call for its tier switch (Appendix C, R-09).
 
 ---
+
+### 8.13 `FindThenReadStrategy` and lists across documents **[built 1.2.12, OI-4]**
+
+A list question ("list every Seedance model mentioned this year") needs the text around each hit, not the few best passages.
+
+**`wants_list`.** `QueryIntent.wants_list` is true when the answer is an enumeration whose items the question does not name. "Each", "all of A, B and C" and per-subject questions are **not** lists: "A, B and C: what does each do?" is covered by the rule for several names (§7.9). The heuristic router uses a short phrase list ("list/enumerate all|every|the...", "列出", "有哪些"); the LLM router prompt carries the definition; the `none` router never sets it.
+
+**Completeness (one field, no extra flag).** `RAGRetrievalResult.completeness` and `RAGResponse.completeness` (and the stream `done` event) are `"whole_scope"` or `"partial"`, and `None` unless `wants_list`. **Only reading the whole visible scope is `"whole_scope"`** (Tier 0, with nothing dropped by the prompt budget; or `query_batched` over documents the app named, all read in full). A ranked search never is: nearest neighbours always return, and a match can sit under the similarity floor, so "fewer than `top_k` came back" proves nothing. When `wants_list` and the result is `partial`, a model `answer_found="yes"` becomes `"partial"` (`"no"` and `None` are never changed; `abstained` stays false) and the prompt gets a note that the list may be incomplete. This `completeness` field supersedes the earlier agreement that no new flag would be added: `query_batched` needs a place to say how much was read.
+
+**`FindThenReadStrategy`.** Selected by adaptive rule 4 only when `intent.wants_list`, `retrieval.list_strategy="find_then_read"` (default `"none"`) and the store has `supports_full_scope_fetch`. Steps:
+1. *Find:* the ordinary search (hybrid, else dense, else keyword), sized like `retrieve()` and under the text rules (§7.9). Hits are grouped by document in rank order; at most `retrieval.list_max_documents` (default 10) documents are read.
+2. *Read each document as cheaply as the store allows, within the Tier 0 budget (`full_context_max_tokens`):* the whole document when it fits; otherwise the section holding each hit, by character range (section bounds come from the section summaries; needs `supports_offset_range_scope`; the range is applied together with the sequential-guard boundary, which only ever tightens); otherwise a window of `retrieval.list_read_radius_chars` (default 6000) around the hit (`fetch_local_window`); otherwise the hit passage as found. A read that does not fit the budget that is left is replaced by the next cheaper one; when none fits, reading stops and the result is `truncated`.
+3. The text comes back Tier 0 style (`full_doc` granularity, `FLAG_FULL_SCOPE`), so budgets and guards behave as for Tier 0. The strategy never reports a complete scope.
+
+**`supports_offset_range_scope`** (store capability): the store applies `min_char_offset` and `max_char_offset` together on `fetch_full_scope`, returns exactly the nodes that overlap that range and nothing outside it, and never goes past the guard boundary; `scope_stats` describes the same range. Without it the engine uses a window or the hit passage. Kit check 31.
+
+**`engine.query_batched(request, intent=None, *, doc_ids=None, cancel=None) -> RAGResponse`** (§14.4). One explicit call that makes several model calls; `query()` and `stream_query()` are unchanged, and it does not stream. It returns the same `RAGResponse`, with `RAGResponse.batches: BatchReport` (`documents_found`, `documents_read`, `batches_planned`, `batches_read`, `batches_failed`, `capped_by` = `None | "documents" | "batches" | "time"`, `items_dropped_unverified`).
+1. *Gather:* `retrieve()`-style, with the text rules (`must_mention: Seedance`), so the search is sized to `retrieve_max_results`, not `top_k`; or the app's own `doc_ids` (no search). Grouped by document; `documents_found` is that count.
+2. *Read:* as above, at most `generation.list_max_documents` (default 40) documents, within `list_max_batches` times the Tier 0 budget. A document the app named is read whole, or section by section.
+3. *Batches:* the read text is packed in order into at most `generation.list_max_batches` (default 4) batches that each fit the Tier 0 budget.
+4. *Map:* one model call per batch, **in parallel on the engine's pool**, each asked for bullet items ending in citation markers.
+5. *Carry citations (the model never re-cites):* every marker is resolved by the ordinary citation extractor to a verified node id; an item with no verified source is dropped and counted in `items_dropped_unverified`. The merge call sees only item texts (`I<n>: text`) and answers with groups of item numbers (`ids | text`); it writes and sees no markers. The engine builds the final text, assigns the final `[n]` numbers by first appearance of each node, and builds `citations` and `sources` from the carried, verified citations. An item the merge forgets is kept. With one batch (or one item) there is no merge call.
+6. *Hard caps and partial answers:* a document cap, the batch cap, or the deadline stopping the merge sets `capped_by`, `answer_found="partial"`, `completeness="partial"`, and appends "Note: this list may be incomplete." to the answer. Not all documents read means partial.
+7. *Budget guard, cancel, deadline:* every map call and the merge call go through `BudgetGuard.before_call` (stages `list_map`, `list_merge`; a budget stop is the usual typed error); the `CancelToken` is checked before dispatch and before the merge; a deadline already expired before dispatch raises `DeadlineExceeded`, and one that expires before the merge skips the merge (DG-10) and the engine combines the items itself (`capped_by="time"`). Budget, deadline and cancel errors are never absorbed.
+8. *A failed batch is never silently dropped:* `generation.list_on_batch_failure` is `"raise"` (default; the typed error propagates) or `"degrade"` (a DG-15 record, the batch number in `batches_failed`, the answer `partial`). A failed or unparseable merge falls back to the engine's own combination with a DG-15 record.
+9. **Worst case:** `list_max_batches` map calls plus one merge call, **5 model calls with the defaults**, plus the router call (LLM router) and embedding calls. The formula is `list_max_batches + 1`.
 
 ## 9. Post-Retrieval Stages
 
@@ -2117,7 +2151,7 @@ class EngineProfile(BaseModel):
 
 | Setting | `long_form_reader()` (Audio) | `news_intelligence()` (News) | `knowledge_base()` (KB) |
 | :--- | :--- | :--- | :--- |
-| Adaptive rules | default (Tier 0 → Tier 3 → Tier 2) | rules 1, 2, 6, 7 | default, keyword-first enabled |
+| Adaptive rules | default (Tier 0 → Tier 3 → Tier 2) | rules 1, 2, 7, 8 (default numbering of §8.9; were 1, 2, 6, 7 before 1.2.12) | default, keyword-first enabled |
 | `full_context_max_tokens` | 120,000 (AudioReading plans to lower it, see below) | 0 (disabled) | 100,000 (corpus scope, KB ADR-003) |
 | Splitter | sentence 1,200 / 150 | pass-through (articles) | Markdown structural 1,000 / 150, pass-through for entries |
 | Summaries | on | off (uses `agent_summary`) | provided section descriptions |
@@ -2316,6 +2350,7 @@ class RAGTrace(BaseModel):
 | **DG-12** | Cache read or write error | Continue without the cache | on | ERROR | n/a |
 | **DG-13** | Observer raises | Continue | on (`observer_errors="log"`) | ERROR with traceback | `observer_errors="raise"`: propagate |
 | **DG-14** | Summarizer fails at ingestion (after DG-01, DG-02) | Continue without a summary, `summary_status="failed"` | **opt-in** | ERROR | Raise `RAGStageError("summarizer")` (also the default without opt-in) |
+| **DG-15** | A batch or the merge of a `query_batched` answer fails (1.2.12) | Continue without that batch (or without model de-duplication); the answer is `partial` and `RAGResponse.batches` names it | **opt-in** (`generation.list_on_batch_failure="degrade"`; the default `"raise"` propagates the typed error) | ERROR | none |
 
 - `profile.fallbacks` turns opt-in rows on (`{"query_embedding": "keyword", "summarizer": "skip"}`) and can turn any default-on row off (`{"rerank": "raise"}`). Keys are `rerank`, `jev`, `summarizer`, `query_embedding`, `cache`, and `deadline` (DG-10); unknown keys fail `validate()`. Model lists and `observer_errors` control the generation and observer rows.
 - **Not failures, so not in the table:** empty retrieval (a normal `answer_found="no"` result, RAG-RES-4), citations that fail verification (removed or flagged per §11.2), fence-id rotation on collision (§10.4), and an opt-in relaxation step (§7.6, reported in `relaxations`).
@@ -2478,6 +2513,7 @@ engine.retrieve(request, intent=None) -> RAGRetrievalResult            # retriev
 engine.generate_from_nodes(request, nodes, intent=None) -> RAGResponse # generation over given nodes;
                                                                        # guards still applied (§5.3 #6)
 engine.verify_answer(answer_text, response_or_turn) -> list[RAGCitation]  # post-generation chain only
+engine.query_batched(request, intent=None, doc_ids=None) -> RAGResponse   # list across many documents, several model calls (§8.13)
 engine.prepare_node(node) -> PreparedNode                               # one unit, or raises (§6.4.1)
 engine.prepare_nodes(nodes) -> PreparedBatch                            # good nodes plus failed ones, no write (§6.4.1)
 ```
@@ -2717,6 +2753,10 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-120** | Text rules: several names, any store | §7.9 | For a store without analyzer tokens, `group=auto` names that never share a passage do not return nothing: the narrow call is checked, counted after the check, then widened to "any of those names", narrow rows first. |
 | **AC-RAG-121** | Text rules: relaxation and router | §7.6, §7.9 | `drop_required_entities` drops only `droppable` rules and has nothing to do otherwise. The LLM router's `must_not` is kept only if its text is in the question, defaults to `prefer`, and `clamp_intent` keeps app-set rules. |
 | **AC-RAG-122** | Text check | §7.9 | CJK forms match by substring; alphabetic forms as whole words ("AI" is not in "said", "GPT-6" is not in "GPT-60", "GPT-4o" is one unit); `alternatives` satisfy a rule. Kit checks 26 to 30 pass for the reference store and fail a store that ignores a declared kind, applies `prefer`, or filters full scope. |
+| **AC-RAG-123** | Lists: `wants_list` and completeness | §8.13 | The heuristic router sets `wants_list` for "list every X" and not for "A, B and C: what does each do?"; `clamp_intent` keeps it. A whole-scope Tier 0 read gives `completeness="whole_scope"`; any ranked search gives `"partial"`, a model `"yes"` becomes `"partial"`, a `"no"` stays; a non-list question gives `None`. The prompt tells the model a partial list may be incomplete. |
+| **AC-RAG-124** | Find-then-read | §8.13 | With the profile opted in, the strategy reads the section of each hit (not the whole document) within the budget, keeps the sequential boundary, merges hits in one section, falls back to a window, then to the hit passage, stops at `list_max_documents` and at the budget with `truncated` and `completeness="partial"`, and is not chosen otherwise. Kit check 31 passes for the reference store and fails one that ignores the range start. |
+| **AC-RAG-125** | `query_batched` | §8.13, §14.4 | Returns a `RAGResponse` with `batches` (documents found and read, batches planned and read, `capped_by`). A citation carried from a batch item appears in the merged answer, verified, with the right node. One batch makes no merge call; the worst case is `list_max_batches + 1` calls. A document or batch cap gives `answer_found="partial"`, `capped_by` and the incomplete note. App-supplied `doc_ids` all read whole give `completeness="whole_scope"`. |
+| **AC-RAG-126** | `query_batched` failure, budget, cancel, time | §8.13, §13 | A failed batch raises by default; with `"degrade"` it adds DG-15, lists the batch and makes the answer partial. A merge that is malformed or forgets items keeps every item (DG-15 for the malformed one). Every call goes through the budget guard; a cancelled request makes no model call; an expired deadline before the merge skips it (`capped_by="time"`). |
 
 ### 16.2 Delivery phases (Q-04)
 Delivery follows production need: first what both production apps share, then AudioReading (which has no RAG today), then the NewsIntelligence migration, then KnowledgeBase (still in development, so the easiest to adapt) and everything else. Each step ends with every existing `cody-ai-shared-lib` test and every new `tests/rag/` test passing.
@@ -2874,7 +2914,7 @@ Each entry: the decision, the alternative rejected, and why. Sections refer here
 | **OI-1** | Per-engine granularity registry | §3.3 | **Recorded, not prioritized (owner, 2026-11-11):** granularities live in one process-wide table; per-engine tables when one process needs different traits for the same name |
 | **OI-2** | Text rules (rule record, delivery to every store, several names, script-aware check) | §7.9, §5.5, §6.1, §7.6 | **Built:** several names on the token path 1.2.8; the rest 1.2.11 (record, `filter` and `prefer`, engine check with over-fetch, A1 for every store, `droppable` relaxation, router `must_not`, kit checks 26-30). Not built: a result cache key, OI-4, OI-5 |
 | **OI-3** | Relaxation counts summaries and windows | §7.6 | **Built 1.2.9:** counts ranked passages only |
-| **OI-4** | Lists and new question shapes | §7.9 | **Later:** a "complete list" mark with find-then-read-whole for chunked documents; batch-then-merge across documents; timeline and "what changed" shapes. Waits for an app that needs them |
+| **OI-4** | Lists and new question shapes | §7.9, §8.13 | **Built 1.2.12:** the completeness mark (`wants_list`, `completeness`), find-then-read widened to the section (with `supports_offset_range_scope`), and batch-then-merge (`query_batched`). **Not built:** timeline and "what changed" shapes (date order). Each app is asked for one real list question for its eval; the defaults (`list_max_documents`, `list_max_batches`) are untuned |
 | **OI-5** | Asking the user to clarify | §7.9 | **Later:** engine notices and suggests, app decides and asks; options only from the visible scope. All apps would use "answer anyway" |
 | **OI-6** | Three surface changes agreed with all apps (2026-11-14) | §10.8, §3.8, §12.1, §11.6 | **Built 1.2.10:** (1) add `citation_coverage_detail` to the `citations` event, keeping the number; (2) `RAGCitation.quote` is `None` unless the answer quoted something (no app reads it today); (3) sort and de-duplicate set-like profile fields before fingerprinting. None blocks an app; cheaper before KB's P4 |
 | **Pushbacks** | Requests kept in the apps | Appendix C | **Decided by the owner:** all upheld; sent to the app agents for agreement |
@@ -2957,6 +2997,7 @@ Each entry: the decision, the alternative rejected, and why. Sections refer here
 | **1.2.9-draft** | 2026-11-14 | cody-ai-shared-lib agent | **Built: OI-3.** The relaxation trigger (`min_results_before_relax`) counts ranked passages only, not summaries or local windows. **The accept test changed too, beyond what OI-3 named:** a relaxed run replaces the first only when it has more ranked passages (before, more nodes of any kind). AC-RAG-116. Behaviour change: an app that sets a relaxation ladder and shows a window or summaries will now see relaxation fire where it did not before (§7.6). |
 | **1.2.10-draft** | 2026-11-14 | cody-ai-shared-lib agent | **Built: OI-6, three surface changes.** (1) `citations` stream event gains `citation_coverage_detail`; `citation_coverage` stays. (2) `RAGCitation.quote` is `None` unless the answer quoted something (was the first 200 chars of the node). (3) `profile.fingerprint()` sorts and de-duplicates `allowed_link_hosts`, also inside `variants`. No field AudioReading reads was renamed or removed (§10.8). AC-RAG-117. **Behaviour changes:** a stored `profile_fingerprint` changes once for a profile whose hosts were unsorted or repeated (it is stored, not read, §7.7); a UI that showed `quote` as an excerpt now gets `None`. |
 | **1.2.11-draft** | 2026-11-14 | cody-ai-shared-lib agent | **Built: the rest of §7.9 (OI-2).** `TextRule`, `QueryIntent.rules`, `RAGFilterSpec.text_rules`, `profile.text_rules`, `StoreCapabilities.text_rule_kinds` and `word_matching`, `RAGTrace.text_rules_checked`. The engine derives rules from names and exact terms with the agreed defaults, sends a store only `filter` rules on ranked searches, checks (and over-fetches for) kinds a store does not apply, resolves several names per search and widens after the check (AudioReading's A1 for every store), boosts `prefer` passages with an engine-owned stage, drops only `droppable` rules in relaxation, and takes `must_not` from the LLM router (default `prefer`, kept only if in the question). Kit checks 26 to 30; AC-RAG-118 to 122. **Behaviour changes:** a question with `exact_terms` runs the engine check for a store without `text_rule_kinds` (AudioReading: over-fetch 4x; its questions rarely have codes); default name rules now fetch about 3 times the candidates and nudge matching passages up (`prefer_boost` 2.0, untuned; 1.0 restores the old pool and order). Not built: a result cache key (no cache exists), OI-4, OI-5. |
+| **1.2.12-draft** | 2026-11-14 | cody-ai-shared-lib agent | **Built: OI-4, lists across documents (§8.13).** `QueryIntent.wants_list` (an enumeration whose items the question does not name; "each" is not a cue); `completeness` (`whole_scope` | `partial`) on the result, response and `done` event, and a model `"yes"` becomes `"partial"` for a partial list. This `completeness` field supersedes the earlier "no new flag" agreement (`query_batched` needs it). `FindThenReadStrategy` (opt-in `retrieval.list_strategy`), reading the section of each hit; new store capability `supports_offset_range_scope` with kit check 31; `engine.query_batched` returning a `RAGResponse` with `batches`, hard caps `generation.list_max_documents` / `list_max_batches` (worst case `list_max_batches + 1` model calls), citations carried by the engine and never re-cited by the merge, `generation.list_on_batch_failure`, DG-15. AC-RAG-123 to 126. **Behaviour changes:** (1) the default adaptive rule list gains rule 4 (`wants_list_chunked`), so **rule numbers 4 to 8 become 5 to 9** in `RAGTrace.rule`, the log line and `tier_decision_reason`. Full default numbering now: 1 `has_strategy_override` (unchanged), 2 `route_no_retrieval` (unchanged), 3 `fits_full_context` (unchanged), 4 `wants_list_chunked` (new), 5 `wants_overview` (was 4), 6 `exact_terms_only` (was 5), 7 `hybrid_available` (was 6), 8 `vector_available` (was 7), 9 `keyword_available` (was 8); (2) a `wants_list` question with a partial result returns `answer_found="partial"` instead of `"yes"`; (3) the heuristic router now sets `wants_list` and returns an intent for such questions. Not built: timeline and "what changed" shapes. The list defaults are untuned. |
 
 ## Appendix C. Requests kept in the apps (pushbacks)
 

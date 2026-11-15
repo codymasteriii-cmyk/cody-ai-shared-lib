@@ -648,3 +648,22 @@ class RAGStoreContractTests:
             base = self.make_filters("tr_sum")
             kept = store.fetch_parent_summaries(base.model_copy(update={"text_rules": [rule]}))
             assert len(kept) == len(store.fetch_parent_summaries(base)), "fetch_parent_summaries ignores text rules"
+
+    # ── Check 31: a scope can be read by character range (OI-4, 1.2.12) ────────
+    def test_check_31_offset_range_scope(self):
+        store = self.make_store()
+        caps = store.capabilities()
+        if not (caps.supports_offset_range_scope and caps.supports_full_scope_fetch):
+            return
+        texts = ["First section text.", "Second section text.", "Third section text."]
+        starts = [0, 100, 200]
+        for seq, (text, start) in enumerate(zip(texts, starts)):
+            self.write(store, "rg_doc", [_node(f"rg_{seq}", text, "rg_doc", start, seq)], [[0.1] * DIM], section_seq=seq)
+
+        base = self.make_filters("rg_doc")
+        middle = base.model_copy(update={"min_char_offset": 100, "max_char_offset": 200})
+        assert [n.node_id for n in store.fetch_full_scope(middle)] == ["rg_1"], "a range read returns only the nodes in the range"
+        capped = base.model_copy(update={"min_char_offset": 100, "max_char_offset": 150})
+        assert [n.node_id for n in store.fetch_full_scope(capped)] == ["rg_1"], "the guard boundary still applies inside a range"
+        stats = store.scope_stats(middle)
+        assert stats.char_count == len(texts[1]), "scope_stats describes the same range"

@@ -76,6 +76,9 @@ class StoreCapabilities(BaseModel):
     max_top_k: int = 200
     # Text rules (§7.9): the kinds this store applies itself on ranked searches, and how it matches words.
     # Empty: the engine checks the rows (and over-fetches). A store never applies a `prefer` rule.
+    # Reading part of a document (§7.9 lists, OI-4): the store applies `min_char_offset` and `max_char_offset` together on
+    # `fetch_full_scope`, returning exactly the nodes that overlap [min, max) and nothing outside it, never past the guard boundary.
+    supports_offset_range_scope: bool = False
     text_rule_kinds: frozenset[str] = frozenset()
     word_matching: Literal["exact", "stemmed"] = "exact"
 

@@ -372,6 +372,9 @@ class QueryIntent(BaseModel, Generic[ExtT]):
     negation: bool = False
     # Rules from an app router or the LLM router (§7.9); names and exact terms above are turned into rules too
     rules: list[TextRule] = Field(default_factory=list)
+    # The answer is an enumeration whose items the question does not name ("list every X mentioned"). A per-subject
+    # question ("A, B and C: what does each do?") is not a list (§7.9, OI-4).
+    wants_list: bool = False
 
     suggested_top_k: int | None = None
     beyond_boundary_risk: float = 0.0
@@ -417,9 +420,22 @@ class RAGRetrievalResult(BaseModel, Generic[MetaT]):
     relaxations: list[str] = Field(default_factory=list)
     reranked: bool = False
     truncated: bool = False
+    # Only for a `wants_list` question: "whole_scope" when the whole visible scope was read, else "partial" (OI-4)
+    completeness: Literal["whole_scope", "partial"] | None = None
     degradations: list[Degradation] = Field(default_factory=list)
     usage: list[StageUsage] = Field(default_factory=list)
     trace: Any | None = None
+
+
+class BatchReport(BaseModel):
+    """What `query_batched` read, and what stopped it (OI-4)."""
+    documents_found: int = 0
+    documents_read: int = 0
+    batches_planned: int = 0
+    batches_read: int = 0
+    batches_failed: list[int] = Field(default_factory=list)          # 0-based batch numbers
+    capped_by: Literal["documents", "batches", "time"] | None = None
+    items_dropped_unverified: int = 0
 
 
 class RAGResponse(BaseModel, Generic[MetaT]):
@@ -433,8 +449,10 @@ class RAGResponse(BaseModel, Generic[MetaT]):
     grounded: bool = True
     answer_found: Literal["yes", "no", "partial"] | None = None
     abstained: bool = False
+    completeness: Literal["whole_scope", "partial"] | None = None   # see RAGRetrievalResult.completeness
     degraded: bool = False
     citation_coverage: CitationCoverage | None = None
+    batches: BatchReport | None = None             # set by query_batched only (OI-4)
     state: ConversationState = Field(default_factory=ConversationState)
     usage: list[StageUsage] = Field(default_factory=list)
     usage_total: UsageTotal = Field(default_factory=lambda: UsageTotal(stage="total"))

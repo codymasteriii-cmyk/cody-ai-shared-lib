@@ -198,10 +198,18 @@ class RetrievalPipeline(Generic[MetaT]):
             relaxations=relaxations,
             reranked=ctx.reranked,
             truncated=ctx.truncated,
+            completeness=self._completeness(intent, ctx),
             degradations=run.degradations.degradations,
             usage=run.usage.stage_usages,
         )
         return result, guards
+
+    @staticmethod
+    def _completeness(intent: QueryIntent, ctx: RetrievalContext[MetaT]) -> Literal["whole_scope", "partial"] | None:
+        """Only reading the whole visible scope proves a list complete; a ranked search never can (OI-4)."""
+        if not intent.wants_list:
+            return None
+        return "whole_scope" if ctx.scope_complete and not ctx.truncated else "partial"
 
     def _empty_scope_result(
         self,

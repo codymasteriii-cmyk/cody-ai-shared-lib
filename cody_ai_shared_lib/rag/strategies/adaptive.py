@@ -24,6 +24,7 @@ DEFAULT_ADAPTIVE_RULES: tuple[tuple[str, str], ...] = (
     ("has_strategy_override", OVERRIDE_STRATEGY),
     ("route_no_retrieval", NO_STRATEGY),
     ("fits_full_context", "full_context"),
+    ("wants_list_chunked", "find_then_read"),
     ("wants_overview", "hierarchical"),
     ("exact_terms_only", "keyword_first"),
     ("hybrid_available", "hybrid_rrf"),
@@ -85,6 +86,9 @@ BUILTIN_PREDICATES = {
     and rc.request.strategy_override != AdaptiveRetrievalStrategy.name,
     "route_no_retrieval": lambda rc: rc.intent.route == "no_retrieval",
     "fits_full_context": fits_full_context,
+    "wants_list_chunked": lambda rc: rc.intent.wants_list
+    and rc.profile.retrieval.list_strategy == "find_then_read"
+    and rc.caps.supports_full_scope_fetch,
     "wants_overview": lambda rc: rc.intent.scope == "document_overview"
     or rc.profile.retrieval.always_include_summaries,
     "exact_terms_only": lambda rc: bool(rc.intent.exact_terms) and rc.profile.retrieval.enable_keyword_first,

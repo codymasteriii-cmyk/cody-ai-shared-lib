@@ -42,6 +42,7 @@ class RetrievalContext(BaseModel, Generic[MetaT]):
     truncated: bool = False
     scope_revision: str | None = None
     rules: list[TextRule] = Field(default_factory=list)      # text rules for this request (§7.9); never in `filters`
+    scope_complete: bool = False                              # a strategy read the whole visible scope (OI-4)
     rule_checks: list[str] = Field(default_factory=list)     # rules the engine checked itself
 
     def target_limit(self) -> int:

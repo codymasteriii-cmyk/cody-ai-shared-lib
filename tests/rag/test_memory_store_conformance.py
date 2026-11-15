@@ -176,3 +176,20 @@ def test_kit_catches_a_store_that_declares_a_kind_but_ignores_it(check: str):
     kit = type("K", (RAGStoreContractTests,), {"make_store": lambda self: _IgnoresRulesStore()})()
     with pytest.raises(AssertionError, match="filter rule"):
         getattr(kit, check)()
+
+
+def test_the_reference_store_declares_offset_range_scope():
+    assert InMemoryRAGStore().capabilities().supports_offset_range_scope is True
+
+
+class _IgnoresMinOffsetStore(InMemoryRAGStore):
+    """Defect: declares offset-range scopes but returns everything from the start of the document."""
+
+    def fetch_full_scope(self, filters):
+        return super().fetch_full_scope(filters.model_copy(update={"min_char_offset": None}))
+
+
+def test_kit_catches_a_store_that_ignores_the_range_start():
+    kit = type("K", (RAGStoreContractTests,), {"make_store": lambda self: _IgnoresMinOffsetStore()})()
+    with pytest.raises(AssertionError, match="range"):
+        kit.test_check_31_offset_range_scope()

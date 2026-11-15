@@ -80,6 +80,9 @@ class AnswerFinalizer(Generic[MetaT]):
         no_retrieval = retrieval.intent is not None and retrieval.intent.route == "no_retrieval"
         no_data = not retrieval.nodes
         answer_found = None if no_retrieval else ("no" if no_data else flag)
+        completeness = self._list_completeness(retrieval, prompt)
+        if completeness == "partial" and answer_found == "yes":
+            answer_found = "partial"          # a list that may be missing items is not a plain "yes" (OI-4)
         if no_data:
             citations = []
         sources = self._deduplicated_sources(citations)
@@ -110,6 +113,7 @@ class AnswerFinalizer(Generic[MetaT]):
             grounded=self._is_grounded(prompt, final_answer),
             answer_found=answer_found,
             abstained=answer_found == "no" and prompt.grounding_mode == "strict",
+            completeness=completeness,
             degraded=bool(degradations),
             citation_coverage=coverage,
             state=state,
@@ -122,6 +126,16 @@ class AnswerFinalizer(Generic[MetaT]):
         run.trace.dispatcher.notify_complete(trace, response)
         self._log_summary(run, response)
         return response
+
+    @staticmethod
+    def _list_completeness(retrieval: RAGRetrievalResult[MetaT], prompt: AssembledPrompt[MetaT]) -> Literal["whole_scope", "partial"] | None:
+        """The retrieval's mark, downgraded when the prompt budget left part of the read text out (OI-4)."""
+        if retrieval.completeness != "whole_scope":
+            return retrieval.completeness
+        included = {node.node_id for node in prompt.included_nodes}
+        dropped = any(node.node_id not in included for node in retrieval.nodes)
+        cut = any("truncated_by_budget" in node.flags for node in prompt.included_nodes)
+        return "partial" if dropped or cut else "whole_scope"
 
     def _current_revisions(self, nodes: Sequence[Any]) -> dict[str, str] | None:
         """One batched staleness lookup for nodes that carry a revision (§11.2)."""

@@ -30,6 +30,14 @@ GREETING_PATTERNS = [
     r"^(你好|您好|早上好|晚上好|谢谢|多谢|十分感谢|非常感谢|再见|拜拜)[!.,? ？！。]*$",
 ]
 
+# An enumeration whose items the question does not name. "each" alone is not a cue: "A, B and C: what does each
+# do?" is a per-subject question, which the several-names rule (§7.9) covers.
+LIST_PATTERNS = [
+    r"\b(list|enumerate)\s+(all|every|each|the|any)\b",
+    r"\b(list|enumerate)\s+(?:out\s+)?(?:\w+\s+){0,3}(?:mentioned|named|appearing)\b",
+    r"(列出|列举|罗列|有哪些|都有哪些|所有.{0,6}(?:角色|人物|名字|型号))",
+]
+
 COMPARISON_PATTERNS = [
     r"\b(compare\b.*\b(to|with|and)\b|difference between\b.*\band\b|\bvs\.?\b|\bversus\b)",
     r"(对比|区别|比较|相比)",
@@ -84,13 +92,16 @@ class HeuristicRouter:
                 is_comp = True
                 break
 
-        if is_overview or is_followup or is_comp or exact_terms:
+        wants_list = any(re.search(pat, lower, re.IGNORECASE) for pat in LIST_PATTERNS)
+
+        if is_overview or is_followup or is_comp or exact_terms or wants_list:
             return QueryIntent(
                 route="rag",
                 scope="document_overview" if is_overview else "local_lookup",
                 search_query=text,
                 is_comparison=is_comp,
                 is_followup=is_followup,
+                wants_list=wants_list,
                 exact_terms=exact_terms[:8],
                 router_source="heuristic",
             )

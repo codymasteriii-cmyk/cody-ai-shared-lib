@@ -86,6 +86,7 @@ from .postgen.quotes import QuoteValidator
 from .postgen.sanitizer import OutputSanitizer
 from .profile import EngineProfile, ValidationReport
 from .registry import ComponentDeps, ComponentRegistry, create_default_registry
+from .batching import BatchedListAnswerer
 from .retrieval_pipeline import RetrievalPipeline, apply_guards
 from .runtime import CancelToken, Clock, Deadline, RequestRun, Rng, SystemClock, SystemRng, make_bounded_pool
 from .strategies.adaptive import AdaptiveRetrievalStrategy
@@ -134,6 +135,9 @@ class RAGStream(Generic[MetaT]):
         """Total spend and tokens. Final only once the stream has ended or been closed: before that it
         does not yet include the call in progress (AC-RAG-70, RAG-OPS-2)."""
         return self._usage_tracker.total()
+
+
+LIST_PARTIAL_NOTE = "This list may be incomplete: only part of the available text was read. Say so in the answer."
 
 
 class RAGEngine(Generic[MetaT]):
@@ -533,6 +537,8 @@ class RAGEngine(Generic[MetaT]):
             list(dict.fromkeys(d.impact for d in run.degradations.degradations if d.impact))
             if disclosure == "note" else None
         )
+        if retrieval.completeness == "partial":
+            notes = [*(notes or []), LIST_PARTIAL_NOTE]
         prompt = self.assembler.assemble_prompt(request, retrieval.nodes, state_fence, guards, service_notes=notes)
         return prompt, retrieval, guards, "generation"
 
@@ -682,6 +688,25 @@ class RAGEngine(Generic[MetaT]):
             citations, _ = self.quote_validator.verify(citations, nodes, answer_text=clean_text)
         return citations
 
+    def query_batched(
+        self,
+        request: RAGQueryRequest,
+        intent: QueryIntent | None = None,
+        *,
+        doc_ids: list[str] | None = None,
+        cancel: CancelToken | None = None,
+    ) -> RAGResponse[MetaT]:
+        """A list question across many documents: gather, read, answer in batches, merge (OI-4, §14).
+
+        Returns the same `RAGResponse` as `query()`, with `batches` saying how much was read. Several model calls:
+        at most `generation.list_max_batches` plus one merge. `doc_ids` names the documents when the app knows them.
+        """
+        if request.variant:
+            return self._variant_engine(request.variant).query_batched(
+                request.model_copy(update={"variant": None}), intent, doc_ids=doc_ids, cancel=cancel
+            )
+        return BatchedListAnswerer(self).run(request, intent, doc_ids, cancel)
+
     def stream_query(
         self, request: RAGQueryRequest, intent: QueryIntent | None = None, *, cancel: CancelToken | None = None
     ) -> RAGStream[MetaT]:
@@ -810,6 +835,7 @@ class RAGEngine(Generic[MetaT]):
                     "grounded": response.grounded,
                     "answer_found": response.answer_found,
                     "abstained": response.abstained,
+                    "completeness": response.completeness,
                     "request_id": run.request_id,
                     "message_id": request.metadata.get("message_id"),
                 },
