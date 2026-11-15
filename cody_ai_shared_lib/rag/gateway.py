@@ -7,6 +7,27 @@ Handles:
   - DG-11 BudgetGuard pre-call limits and skip handling
   - DG-12 Query embedding cache read/write fault tolerance (§13.5)
   - Full usage and spend tracking on success and failure paths (RAG-OPS-1, AC-RAG-70)
+
+The gateway is the only place the engine talks to a model provider. Everything else (router, generator, summarizer,
+embedder, reranker) calls it, so budgets, fallbacks and accounting are done once, the same way, for all of them.
+
+The shape of `generate()` (the other calls follow the same pattern):
+
+    generate(models=[a, b])
+    └─ for each model, in order
+       ├─ BudgetGuard.before_call()     "skip" -> an optional stage returns empty (DG-11); a refusal raises
+       ├─ llm_client.generate_with_usage()
+       │  ├─ success                    record usage; return the text
+       │  ├─ finish "safety"            GenerationError(blocked): never retried on another model
+       │  ├─ finish "length"            DG-09: retry once with double the output allowance, else GenerationError
+       │  └─ a provider error           record the (possibly unbilled) attempt, then try the next model
+       └─ next model                    DG-02 is recorded; after the last model: GenerationError(all_models_failed)
+
+Dummy example: models ["fast", "backup"]. "fast" is rate-limited: the failed attempt is recorded as an unknown-billing
+error, DG-02 notes the switch, and "backup" answers. The request succeeds, `degraded=True`, and the trace shows both calls.
+
+Accounting rule: a call that fails is still recorded, because a provider may bill it (RAG-OPS-1). When the real usage is
+unknown, an estimate is recorded and marked `estimated=True, billing="unknown"`, so spend is never silently lost.
 """
 from __future__ import annotations
 
@@ -30,6 +51,7 @@ from .usage import BudgetGuard, UsageTracker, invoke_budget_guard
 
 logger = logging.getLogger("shared-rag.generation")
 
+# Stages a BudgetGuard may skip without failing the request: losing a summary is acceptable, losing the answer is not
 _OPTIONAL_STAGES = frozenset({"summarizer", "summarizer_unit"})
 
 # finish_reason of the empty result returned when a BudgetGuard skips an optional stage
@@ -37,7 +59,11 @@ FINISH_SKIPPED = "skipped"
 
 
 class ModelGateway:
-    """Gateway orchestrating all LLM, embedding, Jev, and reranking calls."""
+    """Gateway orchestrating all LLM, embedding, Jev, and reranking calls.
+
+    Holds the provider clients and, optionally, a cache. Apps usually build it with no arguments (the clients read their
+    keys from the environment); tests pass fake clients. It keeps no per-request state: the trackers arrive on each call.
+    """
 
     def __init__(
         self,
@@ -72,13 +98,18 @@ class ModelGateway:
         cache_breakpoints: bool | list[int] | None = None,
         user_blocks: list[tuple[str, bool]] | None = None,
     ) -> LLMResult:
-        """Execute text generation through ordered model fallback list (DG-02, AC-RAG-44)."""
+        """Execute text generation through ordered model fallback list (DG-02, AC-RAG-44).
+
+        `stage` names the purpose ("generation", "intent_llm", "summarizer"...) and appears on every usage record.
+        `optional` says whether a BudgetGuard may skip the call; by default only the summarizer stages are optional.
+        Returns the provider's `LLMResult`, or an empty result with `finish_reason="skipped"` when the guard skipped it.
+        """
         last_exc: Exception | None = None
         is_opt = optional if optional is not None else stage in _OPTIONAL_STAGES
         est_in = estimate_tokens(system_prompt) + estimate_tokens(user_message) or 1000
 
         for model_idx, model in enumerate(models):
-            # Pre-call budget check (DG-11)
+            # Pre-call budget check (DG-11): estimate the cost first, so the guard can decide before money is spent
             if budget_guard is not None:
                 est_cost = estimate_cost(model, est_input_tokens=est_in, est_output_tokens=max_tokens or 500)
                 ctx = usage_tracker.call_context(stage, model, is_opt, est_in, est_cost)
@@ -111,6 +142,7 @@ class ModelGateway:
                 )
                 lat_ms = (time.perf_counter() - t0) * 1000.0
 
+                # The call returned: record what it really cost before looking at the content
                 stage_u = StageUsage(
                     stage=stage,
                     model=model,
@@ -127,7 +159,8 @@ class ModelGateway:
                 )
                 usage_tracker.record(stage_u)
 
-                # Check safety block
+                # A safety block is the provider refusing this content: another model would be asked the same thing,
+                # so it is raised, not retried (the `except RAGEngineError: raise` below lets it through)
                 if result.finish_reason == "safety":
                     raise GenerationError(
                         f"Generation blocked by safety filters on model '{model}'",
@@ -135,7 +168,8 @@ class ModelGateway:
                         stage=stage,
                     )
 
-                # Check truncation (DG-09)
+                # The answer hit the output limit (DG-09): retry once on the same model with double the allowance.
+                # The retry is checked against the budget as a REQUIRED call, because the first call's money is already spent
                 if result.finish_reason == "length":
                     degradation_tracker.record(
                         dg_id="DG-09",
@@ -212,8 +246,9 @@ class ModelGateway:
                 return result
 
             except RAGEngineError:
-                raise
+                raise                                    # typed engine errors (blocked, truncated) are final
             except ModelCallError as mce:
+                # The provider failed but may still report what it used: book it, then fall through to the next model
                 lat_ms = (time.perf_counter() - t0) * 1000.0
                 if mce.usage:
                     usage_tracker.record(
@@ -233,6 +268,7 @@ class ModelGateway:
                     )
                 last_exc = mce
             except Exception as exc:
+                # An unknown failure: whether it was billed is unknown, so record an estimate marked as such
                 lat_ms = (time.perf_counter() - t0) * 1000.0
                 usage_tracker.record(
                     StageUsage(
@@ -285,13 +321,19 @@ class ModelGateway:
         """Generate embeddings with optional query-embedding cache and budget check (§13.1, §13.5).
 
         `vectors` is always a list of vectors, one per input, including for a single string.
+
+        Order: cache lookup (a question asked before costs nothing) -> BudgetGuard -> the provider call -> record usage ->
+        write the cache. Only single, non-empty QUERY embeddings are cached, and an all-zero vector is never cached
+        (it signals a failed embedding). A cache failure is a degradation (DG-12), never an error, unless the profile
+        says `fallbacks["cache"] = "raise"`.
         """
         is_batch = isinstance(texts, list)
         text_list = texts if is_batch else [texts]
         est_in = sum(estimate_tokens(t) for t in text_list if t)
         active_cache = cache if cache is not None else self.cache
 
-        # Query embedding cache check for single query (§13.5)
+        # Query embedding cache check for single query (§13.5). The key uses the normalized text, so "Hello" and
+        # "hello" share an entry
         cache_key: str | None = None
         if (
             use_cache
@@ -436,7 +478,11 @@ class ModelGateway:
         budget_guard: BudgetGuard | None = None,
         fallbacks: dict[str, str] | None = None,
     ) -> RerankResult | None:
-        """Call reranker with DG-06 degradation on error or timeout (unless fallbacks['rerank'] == 'raise')."""
+        """Call reranker with DG-06 degradation on error or timeout (unless fallbacks['rerank'] == 'raise').
+
+        Returns None for "not reranked" in every non-raising case (not configured, skipped by the budget guard, or failed),
+        and the caller keeps the original order. The reason has already been recorded as a degradation.
+        """
         if not self.rerank_client:
             if (fallbacks or {}).get("rerank") == "raise":
                 raise RAGStageError(stage=stage, message="Reranker is not configured")
@@ -520,7 +566,13 @@ class ModelGateway:
         optional: bool | None = None,
         user_blocks: list[tuple[str, bool]] | None = None,
     ) -> Any:
-        """Stream generation through ordered model fallback list (§10.8, AC-RAG-44, AC-RAG-70)."""
+        """Stream generation through ordered model fallback list (§10.8, AC-RAG-44, AC-RAG-70).
+
+        A generator of chunks. Fallback to the next model is possible only BEFORE the first text was sent: once the caller
+        has seen words, switching models would splice two different answers together, so a break after that raises
+        (`Stream ... broke after it started`). Truncation cannot be retried either, for the same reason (§13.3).
+        If the consumer closes the stream early, the cut-off call is recorded as cancelled and billed (RAG-OPS-2).
+        """
         last_exc: Exception | None = None
         is_opt = optional if optional is not None else stage in _OPTIONAL_STAGES
         est_in = estimate_tokens(system_prompt) + estimate_tokens(user_message) or 1000
@@ -544,6 +596,7 @@ class ModelGateway:
             usage_recorded = False
 
             def record_unfinished(outcome: str, billing: str) -> None:
+                """Book a stream that ended without a final usage report: cancelled (billed) or failed (unknown)."""
                 # Provider usage only arrives on the last chunk, so estimate from what was received
                 output = estimate_tokens("".join(received))
                 usage_tracker.record(
@@ -609,6 +662,7 @@ class ModelGateway:
                         )
                 return
             except GeneratorExit:
+                # The consumer stopped reading: a cancelled call is still billed for what the provider produced
                 if not usage_recorded:
                     record_unfinished("cancelled", "billed")
                 raise
@@ -644,5 +698,9 @@ class ModelGateway:
 
 
 def _blocks(user_blocks: list[tuple[str, bool]] | None) -> dict[str, Any]:
-    """Pass user_blocks to the LLM client only when there are some, so older clients keep working."""
+    """Pass user_blocks to the LLM client only when there are some, so older clients keep working.
+
+    `user_blocks` splits the user message into cacheable and volatile parts (see `ContextAssembler`); a client that
+    does not know the argument is never sent it.
+    """
     return {"user_blocks": user_blocks} if user_blocks else {}

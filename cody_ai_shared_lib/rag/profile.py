@@ -1,4 +1,28 @@
-"""EngineProfile, ModelBindings, validation, and domain presets (§12, AC-RAG-49, AC-RAG-62)."""
+"""EngineProfile, ModelBindings, validation, and domain presets (§12, AC-RAG-49, AC-RAG-62).
+
+A profile is the whole configuration of an engine as data: which models, which retrieval strategy, how the prompt is
+budgeted, what the guards are. It is immutable and fingerprinted, so a trace can say exactly which configuration
+produced an answer. An app builds one (usually from a preset below, with overrides) and hands it to `RAGEngine`.
+
+How the profile is organized, one section per concern:
+
+    models          which model for generation, intent, summaries, embedding, reranking (the app must choose; no defaults)
+    router          how the question is read: "none", "heuristic", "llm" or "auto"                       -> intent/router.py
+    retrieval       strategy, top_k, the Tier 0 size gate, relaxation, list reading                      -> strategies/
+    post_stages     the ordered steps after the search: threshold, dedup, rerank, recency, top_k          -> postretrieval/
+    context         how the model's window is split into zones                                           -> context/budgeter.py
+    generation      persona, grounding mode, streaming, list-answer limits                               -> generation/
+    citations       how citations are formatted and verified                                             -> postgen/
+    guards          boundaries the engine enforces (e.g. the spoiler guard)                              -> guards.py
+    text_rules, clarification   the §7.9 and §7.10 features, both conservative by default
+    runtime, cache, fallbacks   deadlines and pool size; the query-embedding cache; what to do when a part fails
+
+Dummy example: AudioReading starts from `long_form_reader(models)` (spoiler guard on, Tier 0 enabled, strict grounding)
+and overrides only what differs, e.g. `long_form_reader(models, clarification=ClarificationConfig(mode="ask"))`.
+
+Reading a field: the defaults are the values the spec calls for. Where a default is "untuned" (a comment says so), an
+app should tune it on its own real questions before relying on it.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -14,6 +38,9 @@ class ModelBindings(BaseModel):
     """Model identifiers bound to engine stages (§12.1).
 
     Must be explicitly provided by the app (no default models in library, D-12).
+
+    `generation`, `intent` and `summary` are lists: the first is tried first, the rest are fallbacks (DG-02). `embedding`
+    is one model, because stored vectors only match the model that made them. `reranker` and `judge` are optional.
     """
     model_config = {"frozen": True, "extra": "forbid"}
     generation: list[str]
@@ -25,7 +52,11 @@ class ModelBindings(BaseModel):
 
 
 class TextRulesConfig(BaseModel):
-    """Defaults for the text rules the engine derives (§7.9)."""
+    """Defaults for the text rules the engine derives (§7.9).
+
+    "prefer" ranks a matching passage higher; "filter" removes the others. The defaults are cautious: a name the router
+    guessed is only a preference, because a wrong guess must not make the answer disappear.
+    """
     model_config = {"frozen": True, "extra": "forbid"}
     names: Literal["prefer", "filter"] = "prefer"       # names the router guessed
     names_droppable: bool | None = None                  # None: droppable exactly when `names` is "prefer"
@@ -47,6 +78,7 @@ class ClarificationConfig(BaseModel):
 
 
 class RouterConfig(BaseModel):
+    """Which router reads the question, and which optional layers it may use (§7)."""
     model_config = {"frozen": True, "extra": "forbid"}
     name: str = "auto"
     enable_jev: bool = False
@@ -54,6 +86,8 @@ class RouterConfig(BaseModel):
     jev_timeout: float = 2.5
 
 
+# (vector weight, keyword weight) by the first facet the question has (§8.5): quoted terms and negation lean on keywords,
+# a plain question weighs both the same
 DEFAULT_FUSION_WEIGHTS: dict[str, tuple[float, float]] = {
     "exact_terms": (0.7, 1.3),
     "negation": (0.7, 1.3),
@@ -63,11 +97,16 @@ DEFAULT_FUSION_WEIGHTS: dict[str, tuple[float, float]] = {
 
 
 class RetrievalConfig(BaseModel):
+    """How candidates are found (§8): the strategy, the size of the result, and when to loosen a too-narrow search.
+
+    `default_strategy="adaptive"` lets the engine pick the tier per question; naming one fixes it. The preset profiles
+    set this; the bare default is the simplest strategy.
+    """
     model_config = {"frozen": True, "extra": "forbid"}
     default_strategy: str = "dense_vector"
     top_k: int = 8
     retrieve_max_results: int = 100
-    full_context_max_tokens: int = 120_000
+    full_context_max_tokens: int = 120_000   # Tier 0 gate: a scope this small is sent whole, with no search (0 turns Tier 0 off)
     keyword_first_min_hits: int = 3      # keyword_first falls back to hybrid below this many hits (§8.3)
     local_window_radius_chars: int = 6000
     always_include_summaries: bool = False
@@ -88,6 +127,11 @@ class RetrievalConfig(BaseModel):
 
 
 class ContextConfig(BaseModel):
+    """The model's token window and how it is divided into zones (§10.1), plus the limits on conversation state.
+
+    `check()` verifies that the Tier 0 gate and the reserved zones fit inside `max_context_tokens`, because a profile
+    where they do not would overflow the window on the first big document.
+    """
     model_config = {"frozen": True, "extra": "forbid"}
     max_context_tokens: int = 160_000
     reserved_instruction_tokens: int = 4000  # minimum for the instructions zone; the measured prompt is used when larger (§10.1)
@@ -108,6 +152,11 @@ class ContextConfig(BaseModel):
 
 
 class GenerationConfig(BaseModel):
+    """How the answer is written (§10): persona, grounding, streaming, and the limits of list answers.
+
+    `grounding_mode`: "strict" answers only from the passages; "labelled_fallback" may add general knowledge in a
+    clearly labelled paragraph. A spoiler guard overrides this to strict.
+    """
     model_config = {"frozen": True, "extra": "forbid"}
     strategy: str = "stuff"
     system_preamble: str = ""  # persona; {variables} come from request.system_prompt_variables
@@ -126,6 +175,11 @@ class GenerationConfig(BaseModel):
 
 
 class CitationConfig(BaseModel):
+    """How citations look and how strictly they are checked (§11).
+
+    `policy` and `on_unverified` are two spellings of one setting: the validator below keeps them in step, so an older
+    profile that sets either one still works.
+    """
     model_config = {"frozen": True, "extra": "forbid"}
     formatter: str = "ref"
     verify_quotes: bool = False
@@ -145,6 +199,7 @@ class CitationConfig(BaseModel):
 
 
 class SummariesConfig(BaseModel):
+    """Optional section and unit summaries made at ingestion (§6.3); they feed overview questions."""
     model_config = {"frozen": True, "extra": "forbid"}
     enabled: bool = False
     min_chars_for_summary: int = 1500
@@ -155,6 +210,7 @@ class SummariesConfig(BaseModel):
 
 
 class IngestionConfig(BaseModel):
+    """How documents are cut into passages at ingestion (§6): the splitter, target size, overlap and kind."""
     model_config = {"frozen": True, "extra": "forbid"}
     splitter: str = "sentence"
     granularity: str = "passage"         # what ingested chunks are: "article"/"entry" are atomic (§3.3)
@@ -164,6 +220,11 @@ class IngestionConfig(BaseModel):
 
 
 class RuntimeConfig(BaseModel):
+    """Time and concurrency limits (§13.4): the request deadline, the worker pool, and the time optional stages need.
+
+    `stage_budgets` is what an optional stage (rerank, secondary queries, relaxation) is expected to take; when less than
+    that remains, the stage is skipped with a DG-10 degradation instead of risking the deadline.
+    """
     model_config = {"frozen": True, "extra": "forbid"}
     deadline_seconds: float = 30.0
     pool_size: int = 4
@@ -173,6 +234,7 @@ class RuntimeConfig(BaseModel):
 
 
 class CacheConfig(BaseModel):
+    """The in-memory cache (§13.5). Today it caches query embeddings: asking the same question again costs no embedding."""
     model_config = {"frozen": True, "extra": "forbid"}
     enabled: bool = True
     max_bytes: int = 32 * 1024 * 1024
@@ -190,6 +252,9 @@ class ValidationReport(BaseModel):
     unknown: list[str] = Field(default_factory=list)
 
 
+# `profile.fallbacks` chooses what happens when a part fails. Each key is a row of the agreed-degradations table (§13.3);
+# a value of "raise" turns that degradation into an error, which is the right choice where a silent fallback would be
+# wrong (KnowledgeBase raises on every one).
 VALID_FALLBACK_KEYS = {"rerank", "jev", "summarizer", "query_embedding", "cache", "deadline"}
 # §13.3: opt-in rows take their enabling value; any row can be set to "raise"
 VALID_FALLBACK_VALUES: dict[str, set[str]] = {
@@ -209,13 +274,29 @@ _SET_LIKE_FIELDS = ("allowed_link_hosts",)
 
 
 def _canonical_sets(data: dict[str, Any]) -> None:
+    """Sort and de-duplicate the fields where order means nothing, so two spellings fingerprint the same."""
     for name in _SET_LIKE_FIELDS:
         if isinstance(data.get(name), list):
             data[name] = sorted(set(data[name]))
 
 
 class EngineProfile(BaseModel):
-    """Complete, immutable, fingerprinted engine profile configuration."""
+    """Complete, immutable, fingerprinted engine profile configuration.
+
+    Immutable (`frozen`) and strict (`extra="forbid"`): a misspelt setting is an error at construction, not a setting
+    silently ignored. Change a profile by creating another with `with_overrides` or `variant`.
+
+    >>> models = ModelBindings(generation=["gen-model"], embedding="embed-model")
+    >>> profile = EngineProfile(name="demo", models=models)
+    >>> profile.fingerprint() == EngineProfile(name="demo", models=models).fingerprint()
+    True
+    >>> profile.with_overrides(retrieval={"top_k": 3}).retrieval.top_k
+    3
+    >>> profile.check().valid
+    True
+    >>> EngineProfile(name="x", models=models, post_stages=["rerank"]).check().problems
+    ["Stage 'rerank' requires models.reranker to be configured"]
+    """
     model_config = {"frozen": True, "extra": "forbid"}
 
     name: str
@@ -244,7 +325,11 @@ class EngineProfile(BaseModel):
     variants: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     def fingerprint(self) -> str:
-        """Stable sha256 fingerprint of resolved configuration, independent of dict insertion order."""
+        """Stable sha256 fingerprint of resolved configuration, independent of dict insertion order.
+
+        Recorded in every trace and conversation state. A state whose fingerprint differs from the engine's was made
+        under another configuration, which is how a changed profile is noticed.
+        """
         data = self.model_dump(mode="json")
         _canonical_sets(data)
         for override in data.get("variants", {}).values():
@@ -253,7 +338,11 @@ class EngineProfile(BaseModel):
         return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
 
     def with_overrides(self, **changes: Any) -> "EngineProfile":
-        """Return a new profile with deep-merged changes (§12.1)."""
+        """Return a new profile with deep-merged changes (§12.1).
+
+        A dict value is merged into the existing section one level deep (`retrieval={"top_k": 3}` keeps the other
+        retrieval settings); any other value replaces the field.
+        """
         data = self.model_dump()
         for k, v in changes.items():
             if isinstance(v, dict) and isinstance(data.get(k), dict):
@@ -263,7 +352,12 @@ class EngineProfile(BaseModel):
         return EngineProfile(**data)
 
     def variant(self, name: str, **overrides: Any) -> "EngineProfile":
-        """Return named variant of this profile (§12.1)."""
+        """Return named variant of this profile (§12.1).
+
+        A variant is a named set of overrides stored in the profile itself (`variants`), e.g. News's "news_search"
+        with a larger result size. Requests select one by name (`request.variant`), and the result is named
+        "<profile>_<variant>" so traces tell them apart.
+        """
         var_data = dict(self.variants.get(name, {}))
         var_data.update(overrides)
         profile = self.with_overrides(**var_data)
@@ -296,12 +390,18 @@ class EngineProfile(BaseModel):
         return problems
 
     def check(self, registry: ComponentRegistry | None = None) -> ValidationReport:
-        """Return every configuration problem without raising."""
+        """Return every configuration problem without raising.
+
+        Checks, in order: required model bindings; the token budget fits the window; zone ratios; thresholds that could
+        never apply; fallback keys and values; unimplemented citation settings; names unknown to the registry; and each
+        variant. `validate()` is the same check that raises; the engine runs it at startup so a bad profile never serves.
+        """
         problems: list[str] = []
         missing: list[str] = []
         unknown: list[str] = []
 
         def require_binding(present: Any, binding: str, reason: str) -> None:
+            """Record a problem when a feature is on but the model it needs is not bound."""
             if not present:
                 missing.append(binding)
                 problems.append(f"{reason} requires {binding} to be configured")
@@ -418,7 +518,12 @@ def _rerank_if_bound(models: ModelBindings) -> list[str]:
 # ── Preset Profiles (§12.2) ────────────────────────────────────────────────────
 
 def long_form_reader(models: ModelBindings, **overrides: Any) -> EngineProfile:
-    """Preset profile for AudioReading (long-form fiction, spoiler guard, Tier 0 enabled)."""
+    """Preset profile for AudioReading (long-form fiction, spoiler guard, Tier 0 enabled).
+
+    A whole book often fits the Tier 0 gate, so the adaptive strategy sends it whole; the spoiler guard cuts everything
+    past the reader's position, and strict grounding stops the model from using what it remembers of the book.
+    Any keyword argument replaces the preset's value for that section.
+    """
     cfg: dict[str, Any] = {
         "name": "long_form_reader",
         "models": models,
@@ -442,7 +547,11 @@ def long_form_reader(models: ModelBindings, **overrides: Any) -> EngineProfile:
 
 
 def news_intelligence(models: ModelBindings, **overrides: Any) -> EngineProfile:
-    """Preset profile for NewsIntelligence (dated news corpus, hybrid search, recency)."""
+    """Preset profile for NewsIntelligence (dated news corpus, hybrid search, recency).
+
+    No Tier 0 (a news corpus never fits), hybrid search with a similarity floor, recency boosting, one article per
+    passage, and general knowledge allowed in a labelled paragraph. Carries two variants, `news_chat` and `news_search`.
+    """
     cfg: dict[str, Any] = {
         "name": "news_intelligence",
         "models": models,
@@ -492,7 +601,11 @@ def news_search(models: ModelBindings, **overrides: Any) -> EngineProfile:
 
 
 def knowledge_base(models: ModelBindings, **overrides: Any) -> EngineProfile:
-    """Preset profile for KnowledgeBase (fail-loud ADRs, wiki entries, markdown structural)."""
+    """Preset profile for KnowledgeBase (fail-loud ADRs, wiki entries, markdown structural).
+
+    Strict grounding, quotes verified, and every fallback set to "raise": a knowledge base must say "no answer" or
+    fail, never quietly return something worse.
+    """
     cfg: dict[str, Any] = {
         "name": "knowledge_base",
         "models": models,
@@ -521,7 +634,11 @@ def knowledge_base(models: ModelBindings, **overrides: Any) -> EngineProfile:
 
 
 def split_stage_name(name: str) -> tuple[str, str | None]:
-    """'threshold(rerank)' -> ('threshold', 'rerank'); 'top_k' -> ('top_k', None)."""
+    """'threshold(rerank)' -> ('threshold', 'rerank'); 'top_k' -> ('top_k', None).
+
+    >>> split_stage_name("threshold(rerank)"), split_stage_name("top_k")
+    (('threshold', 'rerank'), ('top_k', None))
+    """
     if name.endswith(")") and "(" in name:
         base, argument = name[:-1].split("(", 1)
         return base.strip(), argument.strip() or None

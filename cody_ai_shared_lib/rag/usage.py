@@ -1,4 +1,17 @@
-"""Usage accounting, CallContext, BudgetGuard, and UsageTracker (§13.1, §15.4, RAG-OPS-1)."""
+"""Usage accounting, CallContext, BudgetGuard, and UsageTracker (§13.1, §15.4, RAG-OPS-1).
+
+Every paid model call is accounted for, including calls that fail:
+
+    before a call   gateway -> UsageTracker.call_context() -> BudgetGuard.before_call()   "allow", "skip" or raise
+    after a call    gateway -> UsageTracker.record(StageUsage)                              tokens, cost, latency
+    any time        UsageTracker.total()                                                   the request's running total
+
+The app supplies the `BudgetGuard` (e.g. "no tenant may spend more than $5 a day"); the library only asks it before
+each call and obeys. `skip` is allowed only for optional stages (a reranker may be skipped, the answer may not).
+
+Dummy example: a guard that refuses optional work once a request has spent 2 cents. The reranker (optional) is skipped
+with a DG-11 degradation and the answer is still generated; the generation call (required) is never skipped.
+"""
 from __future__ import annotations
 
 import copy
@@ -12,7 +25,11 @@ from ..pricing import PRICE_TABLE_VERSION
 
 
 class CallContext(BaseModel):
-    """Context passed to BudgetGuard before each paid model call (§13.1)."""
+    """Context passed to BudgetGuard before each paid model call (§13.1).
+
+    Everything a guard needs to decide without calling back into the engine: which stage and model, how big the call
+    will be, what this request has already spent, and who is paying (tenant, scope, documents).
+    """
     request_id: str | None = ""
     stage: str
     model: str = ""
@@ -29,7 +46,11 @@ class CallContext(BaseModel):
 
 @runtime_checkable
 class BudgetGuard(Protocol):
-    """App-supplied budget enforcement hook consulted before each paid call (§13.1)."""
+    """App-supplied budget enforcement hook consulted before each paid call (§13.1).
+
+    `enforces_cost=True` tells the engine at startup to check that every model in the profile has a known price,
+    because a guard that limits cost cannot work on a model it cannot price.
+    """
     enforces_cost: bool = False
 
     def before_call(
@@ -45,7 +66,18 @@ class BudgetGuard(Protocol):
 
 
 def invoke_budget_guard(guard: BudgetGuard, ctx: CallContext) -> Literal["allow", "skip"]:
-    """Consult the guard before a paid call (§13.1)."""
+    """Consult the guard before a paid call (§13.1).
+
+    A guard may raise `BudgetExceeded` itself to stop the request. Returning "skip" for a required stage is a
+    programming error in the guard, so it raises `ProfileConfigError` instead of quietly dropping a required step.
+
+    >>> class StingyGuard:
+    ...     enforces_cost = False
+    ...     def before_call(self, stage, model, est_input_tokens, optional, ctx):
+    ...         return "skip"
+    >>> invoke_budget_guard(StingyGuard(), CallContext(stage="rerank", optional=True))
+    'skip'
+    """
     raw = guard.before_call(ctx.stage, ctx.model, ctx.est_input_tokens, ctx.optional, ctx)
 
     if raw == "skip":
@@ -60,7 +92,18 @@ def invoke_budget_guard(guard: BudgetGuard, ctx: CallContext) -> Literal["allow"
 
 
 class UsageTracker:
-    """Thread-safe collector of per-stage usage records during a RAG request."""
+    """Thread-safe collector of per-stage usage records during a RAG request.
+
+    Thread-safe because a request's model calls can run in parallel (the map step of a list answer, the two legs of a
+    hybrid search). `total()` is computed from the records every time, so it is always consistent with them.
+
+    >>> tracker = UsageTracker("req-1")
+    >>> tracker.record(StageUsage(stage="router", model="m1", input_tokens=100, output_tokens=20, calls=1, cost_usd=0.001))
+    >>> tracker.record(StageUsage(stage="generation", model="m2", input_tokens=900, output_tokens=150, calls=1, cost_usd=0.002))
+    >>> total = tracker.total()
+    >>> total.input_tokens, total.calls, total.cost_usd, total.cost_complete
+    (1000, 2, 0.003, True)
+    """
 
     def __init__(
         self,
@@ -83,7 +126,11 @@ class UsageTracker:
         self._lock = threading.Lock()
 
     def record(self, usage: StageUsage) -> None:
-        """Add a stage usage record."""
+        """Add a stage usage record.
+
+        The record is copied, so the caller cannot change it afterwards; the `on_record` callback (the observers'
+        `on_usage`) runs after the lock is released, so a slow observer cannot block other threads' accounting.
+        """
         with self._lock:
             self._records.append(copy.deepcopy(usage))
         if self.on_record is not None:
@@ -115,11 +162,17 @@ class UsageTracker:
 
     @property
     def stage_usages(self) -> list[StageUsage]:
+        """A copy of the records so far, in the order they were recorded."""
         with self._lock:
             return list(self._records)
 
     def total(self) -> UsageTotal:
-        """Aggregate total tokens and cost across all recorded stages."""
+        """Aggregate total tokens and cost across all recorded stages.
+
+        `cost_complete` is False when some call had no known price; `unpriced_models` names them. The total then
+        counts only what is known, and says so, rather than presenting a partial sum as the whole. A failed call whose
+        billing is unknown does not make the total incomplete: it is recorded, but its cost is not guessed.
+        """
         records = self.stage_usages
         in_tok = sum(u.input_tokens for u in records)
         out_tok = sum(u.output_tokens for u in records)

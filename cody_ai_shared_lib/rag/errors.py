@@ -2,6 +2,30 @@
 
 Every error carries stage, request_id, degradations, and usage (including failed attempts)
 per §13.3, §13.7, RAG-OPS-1.
+
+The family, grouped by what an app should do about it:
+
+    RAGEngineError
+    ├─ Set-up problems, found at startup or before any model call: fix the configuration or the store
+    │  ├─ ProfileConfigError           the profile is invalid, or a component or key is missing
+    │  ├─ StoreCapabilityError         the store cannot do what the profile needs
+    │  ├─ MissingRequiredScopeError    a required scope key (e.g. tenant) was not stated
+    │  ├─ ScopeViolationError          a request named a scope other than the store's own (answer 403)
+    │  └─ UnsupportedFilterError       a filter key or value the store does not understand
+    ├─ Provider and pipeline failures: usually transient; the request may be retried
+    │  ├─ EmbeddingProviderError       embedding failed or returned a zero vector
+    │  ├─ EmbeddingSignatureMismatch   the store's vectors came from another embedding model
+    │  ├─ IntentParseError             the intent model never produced valid JSON
+    │  ├─ RetrievalError               the store failed while searching
+    │  ├─ GenerationError              the answer failed (carries `.retrieval`, so sources are not lost)
+    │  └─ RAGStageError                a named stage failed
+    └─ Stopped on purpose
+       ├─ BudgetExceeded               the app's BudgetGuard said stop
+       ├─ DeadlineExceeded             no time left for a required stage
+       └─ RequestCancelled             the caller set the CancelToken
+
+Every error carries `.stage`, `.request_id`, and what the request had spent (`.usage`, `.usage_total`), so a failed
+request is still accountable (RAG-OPS-1). Messages are bounded (`safe_message`) because provider errors can echo prompts.
 """
 from __future__ import annotations
 
@@ -16,6 +40,11 @@ def safe_message(value: object, limit: int = MAX_MESSAGE_CHARS) -> str:
 
     Exceptions become `Type: message`, cut to 200 characters. Provider errors can echo prompt text,
     and these messages reach traces, logs and browsers, so they are never copied in full.
+
+    >>> safe_message(ValueError("bad\\n   value"))
+    'ValueError: bad value'
+    >>> len(safe_message("x" * 500)), safe_message("x" * 500).endswith("…")
+    (200, True)
     """
     text = f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
     text = " ".join(text.split())
@@ -23,7 +52,12 @@ def safe_message(value: object, limit: int = MAX_MESSAGE_CHARS) -> str:
 
 
 class RAGEngineError(Exception):
-    """Base error for all RAG engine failures."""
+    """Base error for all RAG engine failures.
+
+    Catch this to handle every engine failure in one place; catch a subclass to react to one kind. The accounting
+    fields are filled in by the engine as the error leaves it (`RAGEngine._attach_failure_context`), not by the code
+    that raises, so a raise site only needs a message and a stage.
+    """
 
     def __init__(
         self,
@@ -175,7 +209,10 @@ class RequestCancelled(RAGEngineError):
     pass
 
 
-# Errors that no agreed degradation may absorb (§13.3): configuration, scope, budget, deadline and cancel
+# Errors that no agreed degradation may absorb (§13.3): configuration, scope, budget, deadline and cancel.
+# A fallback such as "try the next model" catches ordinary failures; code that does so re-raises these first
+# (`except NEVER_DEGRADABLE: raise`), because falling back on a budget stop or a scope violation would hide the very
+# thing the caller needs to know.
 NEVER_DEGRADABLE: tuple[type[RAGEngineError], ...] = (
     BudgetExceeded,
     DeadlineExceeded,

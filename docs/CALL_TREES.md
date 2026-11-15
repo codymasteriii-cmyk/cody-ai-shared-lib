@@ -260,3 +260,41 @@ apply_guards()                       after every step that adds text, never once
 ```
 
 Each guard also offers `to_filter()` (ask the store for the allowed rows), `verify_citation()` and `prompt_rules()`.
+
+---
+
+## 13. Every model call: the gateway (gateway.py)
+
+```
+generate()                           the same shape for the router, the answer and the summarizer
+└─ for each model, in order
+   ├─ before_call()                  the app's BudgetGuard: allow, skip (optional stages only) or raise
+   ├─ generate_with_usage()          the provider call
+   │  ├─ success                     record() the usage, return the text
+   │  ├─ finish "safety"             GenerationError (blocked); never retried on another model
+   │  ├─ finish "length"             DG-09: one retry with double the output allowance
+   │  └─ a provider error            record() the attempt (maybe billed), go on to the next model
+   └─ a next model exists            DG-02 recorded; after the last: GenerationError (all_models_failed)
+
+embed()                              cache lookup -> before_call() -> provider -> record() -> cache write
+rerank()                             returns None on any failure; the caller keeps its order (DG-06)
+stream()                             like generate(); a fallback is possible only before the first text was sent
+```
+
+Usage is recorded on every path, including failures: `total()` on the `UsageTracker` always matches what was spent.
+
+---
+
+## 14. Starting an engine: configuration checks (engine.py, profile.py)
+
+```
+RAGEngine.__init__()
+└─ _raise_on_startup_problems()
+   ├─ check()                        EngineProfile: bindings, token budget, zone ratios, thresholds, fallbacks, names
+   │  └─ has()                       every name the profile uses must exist in the ComponentRegistry
+   └─ _engine_problems()             store and model checks: embedding space, renderer, strategy capabilities, keys
+
+validate()                           the same checks, returned as a ValidationReport instead of raised
+```
+
+A bad profile or an incapable store raises `ProfileConfigError` or `StoreCapabilityError` here, before any request is served.

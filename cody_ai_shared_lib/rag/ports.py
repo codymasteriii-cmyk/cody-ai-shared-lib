@@ -2,6 +2,32 @@
 
 The engine reaches persistent storage only through RAGStore[MetaT].
 The library contains no SQL, table name, or database client (D-01).
+
+This file is the contract between the library and an app's database. Three things live here:
+
+  1. `RAGStore`: the methods a store implements. Only `capabilities`, `embedding_space` and `vector_search` are
+     required; every other method is optional and has a default that raises NotImplementedError.
+  2. `StoreCapabilities`: the store's own statement of which optional methods it implements and what it can do. The
+     engine reads this, never guesses: it picks a strategy only if the store declares what that strategy needs.
+  3. Supporting types and checks: filters, owner scope, fingerprints, and the fail-closed scope validators.
+
+Which flag unlocks which strategy (the engine checks these at startup and when choosing a tier):
+
+    flag                                  unlocks                                       store methods used
+    ────────────────────────────────────  ────────────────────────────────────────────  ─────────────────────────────
+    supports_vector_search (default)      dense_vector                                  vector_search
+    supports_keyword_fts                  keyword_only, keyword_first, hybrid_rrf       keyword_search
+    supports_native_hybrid_rpc            hybrid_rrf in one store call                  hybrid_search
+    supports_full_scope_fetch             Tier 0 (full_context), find_then_read         scope_stats, fetch_full_scope
+    supports_parent_summaries             hierarchical (overview questions)             fetch_parent_summaries
+    supports_local_window                 a window around the reader's position         fetch_local_window
+    supports_fetch_nodes                  follow-up reuse of last turn's passages       fetch_nodes
+    supports_offset_range_scope           reading one section of a document             fetch_full_scope with a range
+    supports_fingerprints / supports_delete   sync_document and needs_reindex            get_fingerprints, delete_*
+
+Dummy example: a small store with vectors and keyword search implements `vector_search` and `keyword_search`, and
+declares `supports_keyword_fts=True`. The engine then offers hybrid search. Without `fetch_full_scope` it never picks
+Tier 0, however small the document is, because the store did not say it can serve it.
 """
 from __future__ import annotations
 
@@ -26,7 +52,12 @@ T = TypeVar("T")
 # ── Storage Capabilities & Signatures (§4.1, §4.4) ─────────────────────────────
 
 class EmbeddingSpace(BaseModel):
-    """Configuration signature of the vector embedding space."""
+    """Configuration signature of the vector embedding space.
+
+    The store states which embedding model made its vectors and how many dimensions they have. The engine refuses to
+    search a store whose space differs from the profile's model, because comparing vectors from different models gives
+    meaningless scores (`EmbeddingSignatureMismatch`).
+    """
     model: str
     dims: int
     task_type_documents: str = "RETRIEVAL_DOCUMENT"
@@ -34,7 +65,15 @@ class EmbeddingSpace(BaseModel):
 
 
 class ScopeStats(BaseModel):
-    """Aggregate statistics for documents and nodes matching a filter specification."""
+    """Aggregate statistics for documents and nodes matching a filter specification.
+
+    `revision` changes whenever the content in scope changes, so it works as a cache key and a staleness check.
+
+    >>> ScopeStats(doc_count=1, node_count=2, char_count=400, revision="r1").total_tokens
+    400
+    >>> ScopeStats(doc_count=1, node_count=2, char_count=400, est_tokens=100, revision="r1").total_tokens
+    100
+    """
     doc_count: int
     node_count: int
     char_count: int
@@ -44,11 +83,20 @@ class ScopeStats(BaseModel):
 
     @property
     def total_tokens(self) -> int:
+        """The store's token estimate, or the character count when it gives none (an over-estimate, so Tier 0 errs safe)."""
         return self.est_tokens if self.est_tokens is not None else self.char_count
 
 
 class StoreCapabilities(BaseModel):
-    """Declared capabilities and query features supported by a RAGStore adapter."""
+    """Declared capabilities and query features supported by a RAGStore adapter.
+
+    Groups of fields:
+      * `supports_*`  which optional store methods exist (see the table at the top of this file);
+      * `returns_*`, `uses_analyzer_tokens`  how results come back: raw scores, snippets, or token-based keyword search;
+      * `required_filter_keys`  the scope every call must state, e.g. {"tenant_id"}; the engine fails closed without it;
+      * `supported_custom_filters`, `supported_date_fields`, `max_top_k`  what the store can filter on, and its row limit;
+      * `text_rule_kinds`, `word_matching`  which text rules (§7.9) the store applies itself, and how it matches words.
+    """
     supports_vector_search: bool = True
     supports_keyword_fts: bool = False
     supports_native_hybrid_rpc: bool = False
@@ -145,11 +193,18 @@ class SectionWrite(BaseModel, Generic[MetaT]):
     section_summary: SummaryWrite[MetaT] | None = None
 
 
+# A store may name its required keys the way its own schema does ("tenant_id"); the engine's filters use one name each
 _FILTER_KEY_ALIASES = {"tenant_id": "tenant_or_user_id", "document_ids": "doc_ids", "doc_id": "doc_ids"}
 
 
 def filter_value(filters: RAGFilterSpec, key: str) -> Any:
-    """The value a store's required filter key has in these filters, or None."""
+    """The value a store's required filter key has in these filters, or None.
+
+    Looks at the named field first (through the aliases above), then at `filters.custom`.
+
+    >>> filter_value(RAGFilterSpec(tenant_or_user_id="u1"), "tenant_id")
+    'u1'
+    """
     value = getattr(filters, _FILTER_KEY_ALIASES.get(key, key), None)
     return value if value is not None else filters.custom.get(key)
 
@@ -164,6 +219,14 @@ def validate_owner(owner: OwnerScope | None, capabilities: StoreCapabilities) ->
 
     "What you must state to read, you must state to write." `doc_ids` is satisfied by the
     document being written.
+
+    >>> caps = StoreCapabilities(required_filter_keys=frozenset({"tenant_id"}))
+    >>> validate_owner(OwnerScope(tenant_or_user_id="u1"), caps)           # states the tenant: fine
+    >>> try:
+    ...     validate_owner(OwnerScope(), caps)
+    ... except MissingRequiredScopeError as exc:
+    ...     print(exc.missing_keys)
+    ['tenant_id']
     """
     missing = []
     for key in capabilities.required_filter_keys:
@@ -181,7 +244,18 @@ def validate_owner(owner: OwnerScope | None, capabilities: StoreCapabilities) ->
 
 
 def call_store(operation: str, call: Callable[[], T]) -> T:
-    """Typed engine errors pass through; anything else from a store becomes RetrievalError (§13.3)."""
+    """Typed engine errors pass through; anything else from a store becomes RetrievalError (§13.3).
+
+    Every store call goes through this, so the app sees one error type for "the database failed" and the original
+    exception stays available as `.cause`. A typed engine error (e.g. a scope violation raised by a scoped store) is
+    left alone, so the app can still tell a 403 from a 500.
+
+    >>> try:
+    ...     call_store("fetch", lambda: 1 / 0)
+    ... except RetrievalError as exc:
+    ...     print(exc)
+    Store operation 'fetch' failed: ZeroDivisionError
+    """
     try:
         return call()
     except RAGEngineError:
@@ -195,7 +269,19 @@ def call_store(operation: str, call: Callable[[], T]) -> T:
 
 
 def validate_scope(filters: RAGFilterSpec, capabilities: StoreCapabilities) -> None:
-    """Fail closed on missing required keys and on unknown or wrongly typed custom filters (§3.6, §5.6)."""
+    """Fail closed on missing required keys and on unknown or wrongly typed custom filters (§3.6, §5.6).
+
+    "Fail closed" means: when the scope is not stated, the call is refused, never run unscoped. A request that forgot
+    the tenant must produce an error, not another tenant's data.
+
+    >>> caps = StoreCapabilities(required_filter_keys=frozenset({"tenant_id"}))
+    >>> validate_scope(RAGFilterSpec(tenant_or_user_id="u1"), caps)
+    >>> try:
+    ...     validate_scope(RAGFilterSpec(), caps)
+    ... except MissingRequiredScopeError as exc:
+    ...     print(exc.missing_keys)
+    ['tenant_id']
+    """
     missing = []
     for key in capabilities.required_filter_keys:
         value = filter_value(filters, key)
@@ -221,7 +307,20 @@ def validate_scope(filters: RAGFilterSpec, capabilities: StoreCapabilities) -> N
 
 class RAGStore(ABC, Generic[MetaT]):
     """Synchronous storage port. Retrieval methods return complete rows: everything guards, the
-    renderer and stages need. How a row is produced (one query or several) is the adapter's concern."""
+    renderer and stages need. How a row is produced (one query or several) is the adapter's concern.
+
+    Method groups:
+      required      `capabilities`, `embedding_space`, `vector_search`
+      search        `keyword_search`, `hybrid_search`
+      whole text    `scope_stats`, `fetch_full_scope`, `fetch_parent_summaries`, `fetch_local_window`, `fetch_nodes`
+      writing       `upsert_section` (the engine's call), `upsert_section_nodes` (the older shape it delegates to)
+      maintenance   `get_fingerprints`, `delete_nodes`, `delete_document`, `delete_sections`, `list_unindexed`,
+                    `current_revisions`
+      relations     `fetch_related`, `fetch_linked`
+
+    Every row a read returns must already respect the filters it was given: the engine applies guards again as a net,
+    but a store is the first line of defence. To test an adapter against these rules, use `rag/testing/contract.py`.
+    """
 
     @abstractmethod
     def capabilities(self) -> StoreCapabilities:
@@ -419,6 +518,9 @@ class Guard(Protocol):
     Guards are evaluated in two phases:
       1. to_filter(): translates guard into FilterPatch for store-side filtering.
       2. verify(): verifies, truncates (with flag 'truncated_by_guard') or drops node in-memory.
+
+    The built-in guards are in `guards.py`. An app adds its own by passing them to `RAGEngine(guards=[...])`; a custom
+    guard may only add restrictions, so `to_filter` must never widen what the other guards allow.
     """
     name: str
     hard: bool = True

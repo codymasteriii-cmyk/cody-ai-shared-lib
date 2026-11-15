@@ -1,4 +1,24 @@
-"""ComponentRegistry: named strategies, routers, stages and other pluggable parts (§8.8, D-18, R-12)."""
+"""ComponentRegistry: named strategies, routers, stages and other pluggable parts (§8.8, D-18, R-12).
+
+Why a registry: a profile is data ("router": "auto", "post_stages": ["threshold", "rerank", "top_k"]). Something has
+to turn those names into objects. The registry is that lookup table, grouped by category:
+
+    category         what a name resolves to              examples
+    ───────────────  ───────────────────────────────────  ──────────────────────────────────────
+    strategy         a RetrievalStrategy class            "hybrid_rrf", "find_then_read"
+    predicate        a function of a RuleContext          "fits_full_context"
+    router           a factory(deps) -> IntentRouter      "none", "heuristic", "llm", "auto"
+    stage            a factory(deps) -> post stage        "threshold", "rerank", "top_k"
+    transform        a query transform factory            "secondary_query_fanout"
+    reranker, generator, guard, relaxation, formatter, splitter, analyzer, renderer
+
+An app extends the library by registering its own under a new name (or replace=True to override a built-in), then
+naming it in the profile. `create_default_registry()` builds the table of built-ins; each engine can take its own
+copy, so tests and apps never share mutable global state (D-18).
+
+Dummy example: an app writes `MyBoost`, a post stage. It calls `registry.register_stage("my_boost", lambda deps: MyBoost())`
+and adds "my_boost" to `post_stages`. The pipeline finds it by name and builds it once, like a built-in.
+"""
 from __future__ import annotations
 
 import re
@@ -9,14 +29,24 @@ from .errors import ProfileConfigError
 
 
 def split_component_name(configured: str) -> tuple[str, str | None]:
-    """Split a configured name such as `identity_dedup(url)` into its name and argument."""
+    """Split a configured name such as `identity_dedup(url)` into its name and argument.
+
+    >>> split_component_name("identity_dedup(url)")
+    ('identity_dedup', 'url')
+    >>> split_component_name("top_k")
+    ('top_k', None)
+    """
     match = re.fullmatch(r"([A-Za-z_]+)(?:\(([^)]*)\))?", configured.strip())
     return (match.group(1), match.group(2)) if match else (configured, None)
 
 
 @dataclass
 class ComponentDeps:
-    """What a registered factory may use to build its component."""
+    """What a registered factory may use to build its component.
+
+    A factory is `deps -> component`. Passing one bundle keeps factories uniform, and keeps components from reaching
+    into the engine: they get only what is listed here.
+    """
     profile: Any
     gateway: Any
     renderer: Any
@@ -27,7 +57,17 @@ class ComponentDeps:
 
 
 class ComponentRegistry:
-    """Maps component names to implementations. Instances keep tests and engines isolated (D-18)."""
+    """Maps component names to implementations. Instances keep tests and engines isolated (D-18).
+
+    The typed `register_*` methods below are thin, readable wrappers over `register(category, name, ...)`.
+
+    >>> registry = ComponentRegistry()
+    >>> registry.register("stage", "mine", object)
+    >>> registry.has("stage", "mine"), registry.list_components("stage")
+    (True, ['mine'])
+    >>> registry.get("stage", "absent") is None
+    True
+    """
 
     def __init__(self) -> None:
         self._categories: dict[str, dict[str, Any]] = {}
@@ -70,6 +110,7 @@ class ComponentRegistry:
         self.register("guard", name, factory, replace)
 
     def register_granularity(self, name: str, traits: frozenset[str]) -> None:
+        """Register a node kind and its traits. Unlike the others, granularities are one table for the whole process (OI-1)."""
         from .granularity import register_granularity
 
         register_granularity(name, set(traits))
@@ -85,14 +126,19 @@ class ComponentRegistry:
         return self._categories.get(category, {}).get(name)
 
     def has(self, category: str, name: str) -> bool:
+        """True when a component is registered under this name."""
         return name in self._categories.get(category, {})
 
     def list_components(self, category: str) -> list[str]:
+        """The names registered in one category, sorted; used in error messages and by validation."""
         return sorted(self._categories.get(category, {}))
 
 
 def create_default_registry() -> ComponentRegistry:
-    """Return a new registry holding every built-in component."""
+    """Return a new registry holding every built-in component.
+
+    Each call builds a fresh registry, so an app may add or replace entries without affecting another engine.
+    """
     # Imported here because these modules depend on the profile, which depends on this module.
     from .generation.stuff import StuffStrategy
     from .guards import BUILTIN_GUARDS

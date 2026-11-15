@@ -1,4 +1,17 @@
-"""Runtime determinism controls, Clock, Rng, and Deadlines (§13.4, RAG-EVAL-4)."""
+"""Runtime determinism controls, Clock, Rng, and Deadlines (§13.4, RAG-EVAL-4).
+
+Everything in the engine that depends on the outside world goes through one of these small objects, so a test or a
+replay can control it:
+
+    Clock        what time is it?            SystemClock (real)      FrozenClock (fixed; advance() moves it)
+    Rng          give me random bytes        SystemRng (secure)      DeterministicRng (seeded: same output every run)
+    Deadline     how long may this request take, and has the caller cancelled?
+    CancelToken  the caller's "stop now" flag, set from any thread
+    RequestRun   the bundle of per-request state, so the engine itself stays stateless (D-03)
+
+Nothing in the library calls `datetime.now()` or `random` directly for logic that affects results; that is what
+makes "last week" and fence ids reproducible in an evaluation.
+"""
 from __future__ import annotations
 
 import random
@@ -17,7 +30,11 @@ T = TypeVar("T")
 
 @runtime_checkable
 class Clock(Protocol):
-    """Time source protocol allowing injected fixed clocks for deterministic evaluation."""
+    """Time source protocol allowing injected fixed clocks for deterministic evaluation.
+
+    `now_utc` is calendar time (for date questions); `monotonic` is a steadily increasing counter (for measuring
+    durations, unaffected by the system clock being adjusted).
+    """
 
     def now_utc(self) -> datetime:
         ...
@@ -37,7 +54,17 @@ class SystemClock:
 
 
 class FrozenClock:
-    """Fixed clock for tests and evaluation replays (AC-RAG-17, AC-RAG-35, AC-RAG-52)."""
+    """Fixed clock for tests and evaluation replays (AC-RAG-17, AC-RAG-35, AC-RAG-52).
+
+    Time stands still until `advance()` is called, which moves both the calendar time and the monotonic counter.
+
+    >>> clock = FrozenClock(datetime(2026, 1, 1, 12, 0))
+    >>> clock.now_utc().isoformat()
+    '2026-01-01T12:00:00+00:00'
+    >>> clock.advance(90)
+    >>> clock.now_utc().isoformat(), clock.monotonic()
+    ('2026-01-01T12:01:30+00:00', 90.0)
+    """
 
     def __init__(self, fixed_dt: datetime, fixed_monotonic: float = 0.0):
         if fixed_dt.tzinfo is None:
@@ -52,6 +79,7 @@ class FrozenClock:
         return self._mono
 
     def advance(self, seconds: float) -> None:
+        """Move time forward, e.g. to test that a deadline expires."""
         from datetime import timedelta
         self._dt += timedelta(seconds=seconds)
         self._mono += seconds
@@ -59,7 +87,11 @@ class FrozenClock:
 
 @runtime_checkable
 class Rng(Protocol):
-    """Random source protocol for fence ids and sampling."""
+    """Random source protocol for fence ids and sampling.
+
+    Used mainly for the unpredictable fence ids of the prompt (§10.4): `SystemRng` must be used in production, because a
+    predictable id would let a document guess its own closing tag.
+    """
 
     def hex(self, nbytes: int) -> str:
         ...
@@ -79,7 +111,13 @@ class SystemRng:
 
 
 class DeterministicRng:
-    """Seeded pseudorandom generator for deterministic evaluation."""
+    """Seeded pseudorandom generator for deterministic evaluation.
+
+    Not secure: for tests and replays only, never for production fence ids.
+
+    >>> DeterministicRng(7).hex(4) == DeterministicRng(7).hex(4)
+    True
+    """
 
     def __init__(self, seed: int = 42):
         self._rng = random.Random(seed)
@@ -100,6 +138,13 @@ class CancelToken:
     post-stage, between relaxation steps, before generation and between streamed chunks. It cannot
     interrupt a provider call that is already in flight, so a request stops at the next boundary.
     One token covers one request; do not reuse it.
+
+    >>> token = CancelToken()
+    >>> token.is_cancelled
+    False
+    >>> token.cancel("user left")
+    >>> token.is_cancelled, token.reason
+    (True, 'user left')
     """
 
     def __init__(self) -> None:
@@ -118,7 +163,23 @@ class CancelToken:
 
 
 class Deadline:
-    """Tracks remaining execution time budget (§13.4) and carries the request's CancelToken."""
+    """Tracks remaining execution time budget (§13.4) and carries the request's CancelToken.
+
+    Two different questions are asked of it. `check(stage)` is for a REQUIRED stage: no time left is an error
+    (`DeadlineExceeded`). `fits(seconds)` is for an OPTIONAL stage: no time left means skip it and record a
+    degradation (DG-10). Both honour a cancel.
+
+    >>> clock = FrozenClock(datetime(2026, 1, 1))
+    >>> deadline = Deadline(10.0, clock=clock)
+    >>> clock.advance(4)
+    >>> deadline.remaining_seconds()
+    6.0
+    >>> deadline.fits(5.0), deadline.fits(7.0)
+    (True, False)
+    >>> clock.advance(7)
+    >>> deadline.is_expired()
+    True
+    """
 
     def __init__(self, deadline_seconds: float, clock: Clock | None = None, cancel: CancelToken | None = None):
         self.deadline_seconds = deadline_seconds
@@ -133,13 +194,16 @@ class Deadline:
             raise RequestCancelled(f"Request cancelled before stage '{stage}'{reason}", stage=stage)
 
     def elapsed_seconds(self) -> float:
+        """Seconds since the request began, by the monotonic clock."""
         return self.clock.monotonic() - self.start_mono
 
     def remaining_seconds(self) -> float:
+        """Seconds left in the budget, never negative."""
         rem = self.deadline_seconds - self.elapsed_seconds()
         return max(0.0, rem)
 
     def is_expired(self) -> bool:
+        """True when the budget is used up."""
         return self.remaining_seconds() <= 0.0
 
     def fits(self, stage_budget_seconds: float) -> bool:
@@ -157,13 +221,21 @@ class Deadline:
 
 
 def make_bounded_pool(max_workers: int = 4) -> ThreadPoolExecutor:
-    """Create a bounded thread pool for independent concurrent operations."""
+    """Create a bounded thread pool for independent concurrent operations.
+
+    Used for the parallel legs of a search and the map step of a list answer. It is bounded so a burst of requests
+    cannot start unlimited threads; code that already runs on a pool worker must not wait on the same pool (deadlock).
+    """
     return ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="rag-pool")
 
 
 @dataclass
 class RequestRun:
-    """Everything scoped to one request; the engine itself holds no per-request state (D-03)."""
+    """Everything scoped to one request; the engine itself holds no per-request state (D-03).
+
+    Created by `RAGEngine._begin()`; each field collects what happens during the request (spend, degradations, the
+    deadline, the trace). Because it is a local object, two requests running at once cannot see each other's data.
+    """
     request_id: str
     usage: Any
     degradations: Any

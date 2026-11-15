@@ -2,6 +2,24 @@
 
 All data exchanged between the caller, the engine, and the store MUST use these
 Pydantic v2 models per §3.
+
+The models follow the life of one question. Read them in this order:
+
+    RAGQueryRequest      what the app sends: the question, filters, history, state, per-request overrides
+      -> QueryIntent       what the router decided the question means (search words, names, flags)
+      -> RAGFilterSpec     the filters the search runs under (request + guards + intent), combined by narrowing only
+      -> RAGNode           one retrievable passage, with where it came from (SourceSpan) and its scores
+      -> RAGRetrievalResult  the passages that were found, how, and how complete (Completeness, Clarification)
+      -> RAGResponse       the answer, its citations (RAGCitation), the new ConversationState, and what it cost
+
+and for storing documents: RAGDocumentInput -> RAGSectionInput -> RAGNode (see ingestion/).
+
+Accounting models (`StageUsage`, `UsageTotal`, `Degradation`) and the trace summary ride along on every result.
+
+Two conventions to know:
+  * `MetaT` is the app's own metadata type on a node (a news article's source and date, a book's chapter). The library
+    never looks inside it except through the renderer, so apps keep their own schema.
+  * Filters only ever narrow (`RAGFilterSpec.patch`): no component can widen what the request or a guard allowed.
 """
 from __future__ import annotations
 
@@ -23,7 +41,10 @@ class NoIntentExt(BaseModel):
 
 
 class FilterPatch(BaseModel):
-    """A partial RAGFilterSpec. Patches combine by narrowing only (§5.5)."""
+    """A partial RAGFilterSpec. Patches combine by narrowing only (§5.5).
+
+    Guards and filter inferencers return these; the engine applies each with `RAGFilterSpec.patch`.
+    """
     fields: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -32,16 +53,25 @@ ExtT = TypeVar("ExtT", bound=BaseModel, default=NoIntentExt)
 
 
 def as_utc(value: datetime) -> datetime:
-    """Treat a naive datetime as UTC, so naive and aware values can be compared (§5.1)."""
+    """Treat a naive datetime as UTC, so naive and aware values can be compared (§5.1).
+
+    >>> as_utc(datetime(2026, 1, 1)).isoformat()
+    '2026-01-01T00:00:00+00:00'
+    """
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
+# What a node's `score` means, since scores from different searches are not comparable with each other
 ScoreKind = Literal["cosine", "bm25", "rrf", "rerank", "fused", "none"]
 
 
 # ── Source Coordinates & Granularity (§3.2, §3.3) ──────────────────────────────
 
 class SourceSpan(BaseModel):
-    """Coordinates identifying a slice of a source document."""
+    """Coordinates identifying a slice of a source document.
+
+    Offsets are characters in the document's own text: `char_start` inclusive, `char_end` exclusive. They are what the
+    spoiler guard compares with the reader's position and what a citation points back to.
+    """
     doc_id: str = ""
     corpus: str | None = None
     section_id: str | None = None
@@ -53,7 +83,15 @@ class SourceSpan(BaseModel):
 
 
 class RAGNode(BaseModel, Generic[MetaT]):
-    """A retrievable, traceable unit of content with provenance and scores."""
+    """A retrievable, traceable unit of content with provenance and scores.
+
+    A node is whatever the store returns as one piece: a passage, a window, a summary, or an atomic item such as a news
+    article. `granularity` says which (and thereby its traits: can it be ranked, cut by offset, reranked?). `flags` carry
+    notes added along the way, e.g. "truncated_by_guard" or "truncated_by_budget".
+
+    >>> RAGNode(node_id="n1", text="t", granularity="parent_summary").is_summary
+    True
+    """
     node_id: str
     text: str
     span: SourceSpan = Field(default_factory=SourceSpan)
@@ -108,6 +146,9 @@ class TextRule(BaseModel):
 
     `filter` rules constrain every returned ranked passage; `prefer` rules only rank matching passages higher
     and never remove one. A store is only ever sent `filter` rules, and only on ranked searches.
+
+    Dummy examples: "must mention Li Wei" (a name the question requires); "exact: Model-X7" (a quoted code, matched as
+    written); "must not mention Zhang" (an exclusion read from "not about Zhang").
     """
     text: str
     kind: Literal["must_mention", "exact", "must_not"] = "must_mention"
@@ -119,11 +160,21 @@ class TextRule(BaseModel):
 
     @property
     def key(self) -> tuple[str, str]:
+        """Identity of a rule for merging: its kind and its text, case- and spacing-insensitive."""
         return (self.kind, " ".join(self.text.casefold().split()))
 
 
 def merge_text_rules(current: list[TextRule], incoming: list[TextRule]) -> list[TextRule]:
-    """Union by (kind, text). The same rule twice keeps the stricter strength; droppable only if both are."""
+    """Union by (kind, text). The same rule twice keeps the stricter strength; droppable only if both are.
+
+    So an app rule and a router rule about the same name become one rule, and the stricter wins.
+
+    >>> a = TextRule(text="Li Wei", strength="prefer", droppable=True)
+    >>> b = TextRule(text="li  wei", strength="filter")
+    >>> merged = merge_text_rules([a], [b])
+    >>> len(merged), merged[0].strength, merged[0].droppable
+    (1, 'filter', False)
+    """
     merged: dict[tuple[str, str], TextRule] = {rule.key: rule.model_copy(deep=True) for rule in current}
     for rule in incoming:
         have = merged.get(rule.key)
@@ -137,7 +188,19 @@ def merge_text_rules(current: list[TextRule], incoming: list[TextRule]) -> list[
 
 
 class RAGFilterSpec(BaseModel):
-    """Store-level query filter specifications built from query request, guards, and intent."""
+    """Store-level query filter specifications built from query request, guards, and intent.
+
+    Combine filters only with `patch()`, which narrows: lists intersect, offsets take the smaller maximum, date ranges
+    intersect. A conflict (no document left, a tenant that differs) marks the scope empty, and the engine then answers
+    "not found" without calling the store.
+
+    >>> spec = RAGFilterSpec(doc_ids=["a", "b"], max_char_offset=500)
+    >>> narrowed = spec.patch({"doc_ids": ["b", "c"], "max_char_offset": 300})
+    >>> narrowed.doc_ids, narrowed.max_char_offset
+    (['b'], 300)
+    >>> spec.patch({"doc_ids": ["x"]}).is_empty_scope
+    True
+    """
     model_config = {"extra": "forbid"}  # a misspelled filter must fail, not silently widen the search
 
     doc_ids: list[str] | None = None
@@ -168,7 +231,10 @@ class RAGFilterSpec(BaseModel):
         self.doc_ids = []               # stores that receive it anyway match nothing
 
     def patch(self, patch: Any) -> RAGFilterSpec:
-        """Combine a patch by narrowing only; a conflict yields an empty scope (§5.5)."""
+        """Combine a patch by narrowing only; a conflict yields an empty scope (§5.5).
+
+        Returns a new spec; the original is never changed. A value of None in the patch means "no opinion" and is ignored.
+        """
         fields = patch.fields if hasattr(patch, "fields") else patch
         if not isinstance(fields, dict):
             return self
@@ -179,6 +245,7 @@ class RAGFilterSpec(BaseModel):
         return copied
 
     def _narrow(self, key: str, value: Any) -> None:
+        """Apply one patch field by its own narrowing rule (see the class docstring)."""
         if key in ("tenant_or_user_id", "domain_id", "date_field"):
             current = getattr(self, key)
             if current is None:
@@ -259,7 +326,20 @@ class NodeRef(BaseModel):
 
 
 class ConversationState(BaseModel):
-    """Opaque, client-roundtripped conversation memory state."""
+    """Opaque, client-roundtripped conversation memory state.
+
+    The engine keeps no conversation. Every answer returns a new state; the app stores it and sends it back with the next
+    question. It holds ids and small hints, never the text of passages or answers:
+
+        fence_id          the prompt fence id, kept stable across the conversation
+        prior_nodes       ids of passages shown in recent turns (for follow-up reuse), tagged with their turn
+        recent_entities   names the user asked about that a shown passage confirmed
+        turn_count        how many turns so far
+        clarification_asked   the one-turn guard that stops the engine asking twice in a row
+
+    Because it may travel through a browser, the engine treats it as untrusted: it is capped, trimmed, and its names are
+    confirmed against passages before use.
+    """
     version: int = 1
     fence_id: str = ""
     prior_nodes: list[NodeRef] = Field(default_factory=list)
@@ -276,7 +356,15 @@ class ConversationState(BaseModel):
 # ── Citations (§3.8) ───────────────────────────────────────────────────────────
 
 class RAGCitation(BaseModel):
-    """Citation verified against retrieved sources."""
+    """Citation verified against retrieved sources.
+
+    `marker` is how it appears in the answer text ("[2]"); `index` and `label` are what the app shows. `verified` is
+    True only when the marker resolved to a passage the model was actually shown and the guards allow. `stale` means
+    the passage changed after retrieval.
+
+    >>> RAGCitation(node_id="n1", index=2).marker, RAGCitation(node_id="n1", index=2).label
+    ('[2]', 'Source 2')
+    """
     marker: str = ""
     label: str = ""
     index: int = 1
@@ -305,7 +393,11 @@ class RAGCitation(BaseModel):
 # ── Usage, Degradation, Trace Summaries (§3.9, §13) ───────────────────────────
 
 class StageUsage(BaseModel):
-    """Resource consumption and latency for a single stage or model call."""
+    """Resource consumption and latency for a single stage or model call.
+
+    `billing="unknown"` and `estimated=True` mark a failed call whose real cost the provider did not report: it is
+    recorded so spend is not lost, but its cost is not invented. `outcome` is "cancelled" for a stream the caller closed.
+    """
     stage: str
     model: str | None = None
     input_tokens: int = 0
@@ -329,7 +421,11 @@ class UsageTotal(StageUsage):
 
 
 class Degradation(BaseModel):
-    """Record of an agreed degradation that fired during execution (§13.3)."""
+    """Record of an agreed degradation that fired during execution (§13.3).
+
+    `id` is the row of the agreed-degradations table (e.g. "DG-06"). `fallback_used` says what the engine did instead and
+    `impact` says, in words, what the user may notice. A degraded request still succeeds; these tell the app it was not perfect.
+    """
     id: str
     stage: str
     reason: str
@@ -353,7 +449,14 @@ class CitationCoverage(BaseModel):
 # ── Query Intent (§7.1) ────────────────────────────────────────────────────────
 
 class QueryIntent(BaseModel, Generic[ExtT]):
-    """Structured query analysis and facet classification."""
+    """Structured query analysis and facet classification.
+
+    What a router produces and the rest of the engine reads. Dummy example, for "what did Li Wei do last week?":
+        route "rag", scope "local_lookup", search_query "Li Wei activities", entity_terms ["Li Wei"],
+        has_time_expression True with a range for the previous calendar week, is_followup False.
+    Every value is clamped to a legal range before use (DG-05), so a model's mistakes cannot reach the search.
+    `ext` carries an app's own typed extension, ignored by the engine.
+    """
     route: Literal["rag", "no_retrieval"] = "rag"
     scope: Literal["local_lookup", "document_overview"] = "local_lookup"
     search_query: str = ""
@@ -392,7 +495,17 @@ class QueryIntent(BaseModel, Generic[ExtT]):
 # ── Requests and Responses (§3.7, §3.10) ───────────────────────────────────────
 
 class RAGQueryRequest(BaseModel):
-    """Incoming user question and execution constraints."""
+    """Incoming user question and execution constraints.
+
+    Groups of fields:
+      the question     `question`, `history` (recent turns), `state` (the conversation memory to send back)
+      scope            `filters`, `tenant_id`, `document_id`, `cursor_offset` (the reader's position), `guards`
+      per-request overrides   `router_override`, `strategy_override`, `top_k_override`, `enable_reranker_override`,
+                       `variant`, `trace_level`, `degradation_disclosure`, `clarify`
+      prompt           `custom_instruction`, `system_prompt_variables`
+      bookkeeping      `request_id`, `metadata` (echoed back untouched; the engine never reads it)
+    Only `question` is required.
+    """
     question: str
     request_id: str | None = None
     filters: RAGFilterSpec = Field(default_factory=RAGFilterSpec)
@@ -433,14 +546,23 @@ class ClarificationOption(BaseModel):
 
 
 class Clarification(BaseModel):
-    """The engine's suggestion that a question is unclear, and what the user may have meant (§7.10, OI-5)."""
+    """The engine's suggestion that a question is unclear, and what the user may have meant (§7.10, OI-5).
+
+    Present on results in every mode, so an app that never lets the engine ask can still show a hint. `reason` is
+    "unresolved_referent" (a "he/she/it" with two candidates), "several_matches" (the app's hook found several referents)
+    or "too_broad" (a mark only: never asked).
+    """
     reason: Literal["several_matches", "unresolved_referent", "too_broad"]
     options: list[ClarificationOption] = Field(default_factory=list)
     asked: bool = False                  # True: the engine asked instead of answering
 
 
 class RAGRetrievalResult(BaseModel, Generic[MetaT]):
-    """Result of candidate retrieval, filtering, and scoring before generation."""
+    """Result of candidate retrieval, filtering, and scoring before generation.
+
+    What `retrieve()` returns, and what `query()` carries inside the response. `strategy_used` and `tier_decision_reason`
+    say how the nodes were found; `relaxations` lists any constraints that were loosened; `truncated` says the result was cut.
+    """
     nodes: list[RAGNode[MetaT]] = Field(default_factory=list)
     intent: QueryIntent | None = None
     strategy_used: str = ""
@@ -471,7 +593,12 @@ class BatchReport(BaseModel):
 
 
 class RAGResponse(BaseModel, Generic[MetaT]):
-    """Final grounded answer, verified citations, provenance, and spend accounting."""
+    """Final grounded answer, verified citations, provenance, and spend accounting.
+
+    `answer` is the model's raw text; `answer_final` is the cleaned text to show. `answer_found` is "yes", "partial" or
+    "no" (None when nothing was searched, or when the engine asked a question instead). `abstained` means the engine
+    refused to answer from outside its sources. `degraded` is True when any fallback fired, with details in `degradations`.
+    """
     answer_id: str
     answer: str
     answer_final: str
@@ -495,7 +622,10 @@ class RAGResponse(BaseModel, Generic[MetaT]):
 
 
 class RAGStreamEvent(BaseModel):
-    """Standardized event emitted during streaming execution (§3.11, §10.8)."""
+    """Standardized event emitted during streaming execution (§3.11, §10.8).
+
+    The order of events is in docs/CALL_TREES.md (section 4) and spec §10.8; `data` is a plain dict so it can be sent as JSON.
+    """
     event: Literal["intent", "status", "retrieval", "delta", "clarification", "citations", "degradation", "done", "error"]
     data: dict[str, Any]
 
@@ -503,7 +633,11 @@ class RAGStreamEvent(BaseModel):
 # ── Ingestion & Reindex Status (§6) ───────────────────────────────────────────
 
 class RAGSectionInput(BaseModel, Generic[MetaT]):
-    """Input representation of a document section for ingestion (§6.6)."""
+    """Input representation of a document section for ingestion (§6.6).
+
+    A section is the unit the engine summarizes and writes atomically (a chapter, an article). `char_start` is where the
+    section begins in the whole document, so passage offsets are document-wide.
+    """
     section_id: str | None = None
     section_seq: int = 0
     title: str | None = None
@@ -515,7 +649,10 @@ class RAGSectionInput(BaseModel, Generic[MetaT]):
 
 
 class RAGDocumentInput(BaseModel, Generic[MetaT]):
-    """Input representation of a full document with ordered sections (§6.6)."""
+    """Input representation of a full document with ordered sections (§6.6).
+
+    `revision` identifies this version of the text; passages and citations carry it so a later edit can mark them stale.
+    """
     doc_id: str
     title: str | None = None
     sections: list[RAGSectionInput[MetaT]]
@@ -565,7 +702,11 @@ class ReindexStatus(BaseModel):
 
 
 class QueryPlan(BaseModel):
-    """Evaluated execution plan without retrieval or generation (§8.12)."""
+    """Evaluated execution plan without retrieval or generation (§8.12).
+
+    What `RAGEngine.plan()` returns: which strategy would run, which rule chose it, whether it needs an index, and which
+    store methods it would read. Used by apps and tests to inspect a decision without paying for a search.
+    """
     strategy: str
     tier_decision_reason: str
     rule: int = 1
@@ -576,7 +717,7 @@ class QueryPlan(BaseModel):
 
 
 class RetrievalDiff(BaseModel):
-    """Comparison of two retrieval results (§14.2)."""
+    """Comparison of two retrieval results (§14.2): overlap and rank changes, used to check a change of profile or store."""
     k: int = 10
     overlap_at_k: float = 1.0
     rank_correlation: float = 1.0

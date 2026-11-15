@@ -2,6 +2,24 @@
 
 The light trace is always on and holds ids, counts, decisions and versions, never text.
 The verbose trace adds per-stage snapshots, zone tokens and model call records.
+
+Two audiences, two mechanisms:
+
+    RAGTrace          a record handed back on every result: what the request decided and spent, for debugging and evals
+    RAGObserver       callbacks the app registers to watch events live (metrics, logging): stage, usage, degrade, complete
+
+`TraceCollector` is the per-request builder both come from: each stage reports to it, it stores a `StageRecord`,
+tells the observers, and at the end `build()` assembles the `RAGTrace`. Observers must be fast, and a failing observer
+never fails the request (DG-13): the error is logged and recorded, and the request carries on, unless the profile sets
+`observer_errors="raise"`.
+
+Dummy example of a light trace for one answer (abridged):
+    router_decision   {"source": "llm", "route": "rag", "scope": "local_lookup"}
+    tier_decision_reason   "hybrid_rrf: rule 7 hybrid_available; scope 9000 tokens, Tier 0 gate 4000"
+    stages            router 310 ms -> hybrid_rrf 85 ms (20 out) -> rerank 140 ms (6 out) -> generation 1900 ms
+    guard_effects     {"sequential_boundary": {"dropped": 3, "truncated": 1}}
+    usage_total       3 model calls, 4,120 input tokens, 210 output tokens, cost
+It holds ids, counts and decisions only: never the question, the passages or the answer text.
 """
 from __future__ import annotations
 
@@ -30,6 +48,7 @@ class StageRecord(BaseModel):
 
 
 class NodeSnapshot(BaseModel):
+    """A node's identity and scores at one stage (verbose trace only): enough to see how a stage reordered things."""
     node_id: str
     granularity: str
     score: float
@@ -40,11 +59,13 @@ class NodeSnapshot(BaseModel):
 
 
 class StageSnapshot(BaseModel):
+    """The ranked nodes after one stage (verbose trace only)."""
     stage: str
     nodes: list[NodeSnapshot]
 
 
 class ModelCallRecord(BaseModel):
+    """One model call's size and outcome (verbose trace only); no prompt or answer text."""
     stage: str
     model: str | None
     input_tokens: int
@@ -53,7 +74,11 @@ class ModelCallRecord(BaseModel):
 
 
 class RAGTrace(BaseModel):
-    """Trace returned on every result (§13.2)."""
+    """Trace returned on every result (§13.2).
+
+    Fields set only at the verbose level (`snapshots`, `zone_tokens`, `model_calls`) are None on the light trace.
+    `profile_fingerprint` identifies the exact configuration, so two traces can be compared like for like.
+    """
     trace_schema_version: int = 1
     request_id: str | None = None
     answer_id: str | None = None
@@ -83,7 +108,10 @@ class RAGTrace(BaseModel):
 
 @runtime_checkable
 class RAGObserver(Protocol):
-    """Receives stage, usage, degradation and completion events; must be fast (§13.2)."""
+    """Receives stage, usage, degradation and completion events; must be fast (§13.2).
+
+    Called on the request's own thread, so a slow observer slows the request. Hand heavy work to a queue.
+    """
 
     def on_stage(self, record: StageRecord) -> None:
         ...
@@ -99,7 +127,11 @@ class RAGObserver(Protocol):
 
 
 class ObserverDispatcher:
-    """Sends lifecycle events to observers with DG-13 fault tolerance."""
+    """Sends lifecycle events to observers with DG-13 fault tolerance.
+
+    The engine holds one; `for_request()` makes a copy bound to one request's degradation tracker, so an observer
+    failure is recorded against the request it happened in.
+    """
 
     def __init__(
         self,
@@ -128,6 +160,7 @@ class ObserverDispatcher:
         self._notify("on_complete", trace, outcome)
 
     def _notify(self, method: str, *args: Any) -> None:
+        """Call `method` on every observer; one observer failing must not stop the others."""
         for observer in self._observers:
             try:
                 getattr(observer, method)(*args)
@@ -135,6 +168,7 @@ class ObserverDispatcher:
                 self._handle_error(method, exc)
 
     def _handle_error(self, method: str, exc: Exception) -> None:
+        """Log and record the failure (DG-13), or re-raise when the profile says observers must not fail silently."""
         if self.observer_errors == "raise":
             raise exc
         logger.error(f"[DG-13] Observer {method} failed: {exc}. Request continues.", exc_info=True)
@@ -149,7 +183,11 @@ class ObserverDispatcher:
 
 
 class TraceCollector:
-    """Builds the trace for one request and reports each stage to observers."""
+    """Builds the trace for one request and reports each stage to observers.
+
+    One per request, created by `RAGEngine._begin()`. Strategies and stages never see it directly: the pipeline
+    calls `record_stage` around each of them, which is why every component is timed and versioned the same way.
+    """
 
     def __init__(
         self,
@@ -180,6 +218,7 @@ class TraceCollector:
         self.text_rules_checked: list[str] = []
 
     def elapsed_ms(self) -> float:
+        """Milliseconds since the request began; a stage's `started_ms` and `duration_ms` are measured on this."""
         return (self.clock.monotonic() - self.started) * 1000.0
 
     def record_stage(
@@ -193,6 +232,7 @@ class TraceCollector:
         notes: dict[str, Any] | None = None,
         nodes: list[RAGNode[Any]] | None = None,
     ) -> None:
+        """Record one finished stage: store it, note its version, snapshot its nodes (verbose only), tell observers."""
         record = StageRecord(
             name=name,
             version=version,
@@ -210,6 +250,7 @@ class TraceCollector:
         self.dispatcher.notify_stage(record)
 
     def record_guard_effect(self, guard: str, dropped: int, truncated: int) -> None:
+        """Add up how many nodes a guard dropped or shortened this request (shown in `guard_effects`)."""
         effect = self.guard_effects.setdefault(guard, {"dropped": 0, "truncated": 0})
         effect["dropped"] += dropped
         effect["truncated"] += truncated
@@ -223,6 +264,7 @@ class TraceCollector:
         answer_id: str | None = None,
         state_size_bytes: int = 0,
     ) -> RAGTrace:
+        """Assemble the final trace. Safe to call more than once: it copies, so a later call sees a later state."""
         verbose = self.level == "verbose"
         return RAGTrace(
             request_id=self.request_id,
