@@ -297,7 +297,9 @@ def test_jev_cost_and_usage():
     client = JevClient(api_key="mock_key")
     mock_sdk = MagicMock()
     mock_resp = MagicMock()
-    mock_resp.answers = {"q1": MagicMock(noul=0.85)}
+    from typesafe_sdk import NoulAnswer as SdkNoulAnswer
+
+    mock_resp.answers = {"q1": SdkNoulAnswer(noul=0.85)}
     mock_usage = MagicMock()
     mock_usage.input_tokens = 500
     mock_usage.output_tokens = 50
@@ -306,7 +308,7 @@ def test_jev_cost_and_usage():
     mock_sdk.system_one.return_value = mock_resp
     client._client = mock_sdk
 
-    result = client.system_one("some state", {"q1": MagicMock()})
+    result = client.ask("some state", {"q1": MagicMock()})
     assert result.tokens_in == 500
     assert result.tokens_out == 50
     assert result.usage is not None

@@ -92,7 +92,7 @@ class JevGateRouter:
                 "beyond_boundary_probe": Noul(),
             }
 
-            jev_res = self.gateway.jev_client.system_one(
+            jev_res = self.gateway.jev_client.ask(
                 state=query,
                 questions=questions,
             )
@@ -117,11 +117,12 @@ class JevGateRouter:
             time_ans = jev_res.answers.get("has_time_expression")
             probe_ans = jev_res.answers.get("beyond_boundary_probe")
 
-            scope_conf = getattr(scope_ans, "confidence", 0.0) if scope_ans else 0.0
-            scope_val = getattr(scope_ans, "value", "local_lookup") if scope_ans else "local_lookup"
-            rewrite_prob = getattr(rewrite_ans, "probability", 1.0) if rewrite_ans else 1.0
-            time_prob = getattr(time_ans, "probability", 1.0) if time_ans else 1.0
-            probe_prob = getattr(probe_ans, "probability", 0.0) if probe_ans else 0.0
+            # Every answer is a JevAnswer (jev.py): a choice's `.probability` is Jev's confidence in `.value`; a noul's is P(yes)
+            scope_conf = scope_ans.probability if scope_ans else 0.0
+            scope_val = scope_ans.value if scope_ans else "local_lookup"
+            rewrite_prob = rewrite_ans.probability if rewrite_ans else 1.0
+            time_prob = time_ans.probability if time_ans else 1.0
+            probe_prob = probe_ans.probability if probe_ans else 0.0
 
             if scope_conf >= 0.85 and rewrite_prob < 0.30 and time_prob < 0.30:
                 return QueryIntent(

@@ -145,3 +145,93 @@ def test_openai_stream():
     assert final.usage.output_tokens == 60
     assert final.usage.cached_tokens == 20
     assert final.usage.cost_usd is not None
+
+
+# ── a retry after text was sent would show the user the start of the answer twice (1.2.17) ──────────
+
+def _claude_context(texts, error=None):
+    """A Claude stream context that yields `texts`, then raises `error` if given."""
+    ctx = MagicMock()
+    ctx.__enter__.return_value = ctx
+
+    def stream():
+        yield from texts
+        if error is not None:
+            raise error
+
+    ctx.text_stream = stream()
+    final = MagicMock()
+    final.stop_reason = "end_turn"
+    final.usage.input_tokens = 10
+    final.usage.cache_read_input_tokens = 0
+    final.usage.output_tokens = 5
+    ctx.get_final_message.return_value = final
+    return ctx
+
+
+def _flaky_gemini(texts, error=None):
+    for text in texts:
+        yield MockGeminiChunk(text)
+    if error is not None:
+        raise error
+
+
+def _flaky_openai(texts, error=None):
+    for text in texts:
+        yield MockOpenAIChunk(choices=[MockOpenAIChoice(text)])
+    if error is not None:
+        raise error
+
+
+def _stream_text(client, model):
+    return "".join(c.delta for c in client.stream(system_prompt="s", user_message="u", model=model))
+
+
+def _provider(provider):
+    """(client, the mock whose side_effect lists one stream per attempt, model name) for each provider."""
+    client = LLMClient(retry_base_wait_secs=0)
+    if provider == "claude":
+        mock = MagicMock()
+        client._anthropic_client = mock
+        return client, mock.messages.stream, "claude-sonnet-5-5"
+    if provider == "gemini":
+        mock = MagicMock()
+        client._gemini_client = mock
+        return client, mock.models.generate_content_stream, "gemini-3.8-flash"
+    mock = MagicMock()
+    client._openai_client = mock
+    return client, mock.chat.completions.create, "gpt-6.1-terra"
+
+
+def _attempt(provider, texts, error=None):
+    if provider == "claude":
+        return _claude_context(texts, error)
+    if provider == "gemini":
+        return _flaky_gemini(texts, error)
+    return _flaky_openai(texts, error)
+
+
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+def test_a_stream_is_not_retried_after_text_was_sent(provider):
+    client, call, model = _provider(provider)
+    call.side_effect = [
+        _attempt(provider, ["The festival began on "], error=Exception("503 service unavailable")),
+        _attempt(provider, ["The festival began on the first of May."]),
+    ]
+    received = []
+    with pytest.raises(Exception, match="503"):
+        for chunk in client.stream(system_prompt="s", user_message="u", model=model):
+            received.append(chunk.delta)
+    assert "".join(received) == "The festival began on ", "the caller must never see the start of the answer twice"
+    assert call.call_count == 1
+
+
+@pytest.mark.parametrize("provider", ["claude", "gemini", "openai"])
+def test_a_stream_is_still_retried_before_any_text(provider):
+    client, call, model = _provider(provider)
+    call.side_effect = [
+        _attempt(provider, [], error=Exception("429 rate limit")),
+        _attempt(provider, ["Hello ", "there."]),
+    ]
+    assert _stream_text(client, model) == "Hello there."
+    assert call.call_count == 2

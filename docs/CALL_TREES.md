@@ -200,6 +200,8 @@ route()                              HybridIntentRouter, the "auto" router; stop
 └─ extract()                         no model configured: add date words to the heuristic or raw-question intent
 ```
 
+The Jev gate asks `JevClient.ask()` (jev.py), which wraps every SDK answer, whatever the question kind, as a `JevAnswer(kind, value, probability, raw)`. The gate reads `.value` and `.probability` and nothing else.
+
 Other routers: `none` (PassthroughRouter) returns the question as written; `heuristic` stops after `classify()`; `llm` always uses the intent model.
 
 ---

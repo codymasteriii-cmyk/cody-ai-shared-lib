@@ -193,20 +193,15 @@ def test_jev_gate_fast_path_and_dg03_fallback(monkeypatch):
     tracker = UsageTracker("req-jev")
     degradations = DegradationTracker()
 
-    # Fast path answer setup
-    scope_mock = MagicMock(confidence=0.92, value="local_lookup")
-    rewrite_mock = MagicMock(probability=0.15)
-    time_mock = MagicMock(probability=0.10)
-    probe_mock = MagicMock(probability=0.05)
-
-    from cody_ai_shared_lib.jev import JevResult
-    mock_jev.system_one.return_value = JevResult(
+    # Fast path answers, in the one shape JevClient.ask returns for every kind of question
+    from cody_ai_shared_lib.jev import JevAnswer, JevResult
+    mock_jev.ask.return_value = JevResult(
         model="typesafe-ai/jev",
         answers={
-            "scope": scope_mock,
-            "needs_query_rewrite": rewrite_mock,
-            "has_time_expression": time_mock,
-            "beyond_boundary_probe": probe_mock,
+            "scope": JevAnswer("choice", "local_lookup", 0.92),
+            "needs_query_rewrite": JevAnswer("noul", False, 0.15),
+            "has_time_expression": JevAnswer("noul", False, 0.10),
+            "beyond_boundary_probe": JevAnswer("noul", False, 0.05),
         },
         tokens_in=50,
         tokens_out=10,
@@ -221,7 +216,7 @@ def test_jev_gate_fast_path_and_dg03_fallback(monkeypatch):
     assert len(tracker.stage_usages) == 1
 
     # Now test DG-03 fallback on Jev error
-    mock_jev.system_one.side_effect = RuntimeError("Jev timeout")
+    mock_jev.ask.side_effect = RuntimeError("Jev timeout")
     intent_fallback = router.route("query", tracker, degradations)
     assert intent_fallback is None
     assert any(d.id == "DG-03" for d in degradations.degradations)

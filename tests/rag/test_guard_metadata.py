@@ -104,7 +104,7 @@ def test_parse_timestamp_handles_each_shape():
 
 def test_a_failed_jev_call_is_recorded_as_unknown_billing():
     gateway = MagicMock()
-    gateway.jev_client.system_one.side_effect = RuntimeError("Jev timeout")
+    gateway.jev_client.ask.side_effect = RuntimeError("Jev timeout")
     tracker = UsageTracker("req")
     degradations = DegradationTracker()
     assert JevGateRouter(gateway=gateway, api_key="k").route("a question", tracker, degradations) is None

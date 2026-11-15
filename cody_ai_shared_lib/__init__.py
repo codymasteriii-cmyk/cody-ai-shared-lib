@@ -41,7 +41,7 @@ from .fetcher import (
     fetch_article,
     normalize_url,
 )
-from .jev import JevClient, JevResult, JevUsage, NoulAnswer
+from .jev import JevAnswer, JevClient, JevResult, JevUsage
 from .llm import LLMClient, LLMResult, LLMUsage, ModelCallError
 from .pricing import (
     PRICE_TABLE_VERSION,
@@ -85,9 +85,9 @@ __all__ = [
     "LLMUsage",
     "ModelCallError",
     "JevClient",
+    "JevAnswer",
     "JevResult",
     "JevUsage",
-    "NoulAnswer",
     "RerankClient",
     "RerankResult",
     "RerankUsage",

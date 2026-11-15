@@ -320,10 +320,9 @@ class LLMClient:
         Yields LLMStreamChunk(delta=...). The final chunk has delta="" and
         contains usage and finish_reason.
 
-        NOTE: a retryable error that happens AFTER some text was yielded makes the provider method start the request again, and
-        the text it yields next begins from the start. A consumer that has already shown the first part would see it twice. The
-        RAG gateway therefore treats any error it sees after the first chunk as final, but a retry that the client itself performs
-        mid-stream happens below that check.
+        Retry rule: a retryable error (429, 5xx, overloaded) is retried only while NO text has been yielded. Once the caller has
+        received a chunk, a retry would start the answer again from the beginning and the caller would see it twice, so the error
+        is raised instead, and the RAG gateway reports "the stream broke after it started" (RAG-OPS-1).
         """
         if model.startswith("gemini"):
             yield from self._gemini_stream(
@@ -762,6 +761,7 @@ class LLMClient:
 
         client = self._get_gemini_client()
         last_exc = None
+        sent = False                    # True once a chunk was yielded: from then on a retry would repeat text the caller has
 
         for attempt in range(self.retry_max):
             try:
@@ -773,6 +773,7 @@ class LLMClient:
                 last_chunk = None
                 for chunk in stream_iter:
                     if chunk.text:
+                        sent = True
                         yield LLMStreamChunk(delta=chunk.text)
                     last_chunk = chunk
 
@@ -810,7 +811,7 @@ class LLMClient:
 
             except Exception as exc:
                 last_exc = exc
-                if _is_retryable(exc) and attempt < self.retry_max - 1:
+                if _is_retryable(exc) and attempt < self.retry_max - 1 and not sent:
                     wait = self.retry_base_wait_secs * (2 ** attempt)
                     logger.warning(
                         f"[LLM] Gemini stream {model} retryable error "
@@ -853,10 +854,12 @@ class LLMClient:
             create_kwargs["stop_sequences"] = stop_sequences
 
         last_exc = None
+        sent = False                    # True once a chunk was yielded: from then on a retry would repeat text the caller has
         for attempt in range(self.retry_max):
             try:
                 with client.messages.stream(**create_kwargs) as s:
                     for text in s.text_stream:
+                        sent = True
                         yield LLMStreamChunk(delta=text)
                     final_msg = s.get_final_message()
 
@@ -887,7 +890,7 @@ class LLMClient:
 
             except Exception as exc:
                 last_exc = exc
-                if _is_retryable(exc) and attempt < self.retry_max - 1:
+                if _is_retryable(exc) and attempt < self.retry_max - 1 and not sent:
                     wait = self.retry_base_wait_secs * (2 ** attempt)
                     logger.warning(
                         f"[LLM] Claude stream {model} retryable error "
@@ -936,6 +939,7 @@ class LLMClient:
             create_kwargs["response_format"] = {"type": "json_object"}
 
         last_exc = None
+        sent = False                    # True once a chunk was yielded: from then on a retry would repeat text the caller has
         for attempt in range(self.retry_max):
             try:
                 response_stream = client.chat.completions.create(**create_kwargs)
@@ -947,6 +951,7 @@ class LLMClient:
                     if getattr(chunk, "choices", None) and len(chunk.choices) > 0:
                         c = chunk.choices[0]
                         if getattr(c, "delta", None) and getattr(c.delta, "content", None):
+                            sent = True
                             yield LLMStreamChunk(delta=c.delta.content)
                         if getattr(c, "finish_reason", None):
                             raw_reason = c.finish_reason
@@ -976,7 +981,7 @@ class LLMClient:
 
             except Exception as exc:
                 last_exc = exc
-                if _is_retryable(exc) and attempt < self.retry_max - 1:
+                if _is_retryable(exc) and attempt < self.retry_max - 1 and not sent:
                     wait = self.retry_base_wait_secs * (2 ** attempt)
                     logger.warning(
                         f"[LLM] OpenAI stream {model} retryable error "

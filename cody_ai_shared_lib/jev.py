@@ -14,15 +14,21 @@ What Jev is: a non-autoregressive model that returns typed, calibrated decisions
 instead of generated text. You send it `state` (the thing to be judged, e.g. an
 article's title and body) and a set of typed `questions`; it answers every question in
 one parallel pass, each answer governed by the question's spec:
-  - Noul   — a yes/no judgment, returned as `.noul`, the probability the answer is yes.
-  - Choice — one option from a fixed set you define, returned as `.choice`.
-  - Score  — a rating on an ordered scale you define, returned as `.score`.
-Every answer also carries `.confidence` (how sure Jev is — see the module docstring
-note on calibration below).
+  - Noul   — a yes/no judgment, the probability the answer is yes.
+  - Choice — one option from a fixed set you define.
+  - Score  — a rating on an ordered scale you define.
+The SDK returns a different object for each (a Noul answer has only `.noul`; a Choice or
+Score answer has `.choice` / `.score` and a `.confidence`). JevClient.ask() wraps every one
+in a `JevAnswer(kind, value, probability, raw)`, so callers read answers the same way
+whatever they asked and never guess attribute names (1.2.17):
 
-Noul/Choice/Score are typesafe_sdk's own classes, re-exported here rather than wrapped,
-since callers need to construct them to build a `questions` dict; JevClient supplies
-the retry/error-handling/usage-tracking value this library adds on top.
+    result = client.ask(state, {"scope": Choice(criteria={...}), "rewrite": Noul(instructions="...")})
+    result.answers["scope"].value, result.answers["scope"].probability      # the choice, Jev's confidence in it
+    result.answers["rewrite"].value, result.answers["rewrite"].probability  # a bool, and P(yes)
+
+Noul/Choice/Score (the QUESTION types) are typesafe_sdk's own classes, re-exported here,
+since callers need to construct them to build a `questions` dict; JevClient supplies the
+answer wrapping and the retry/error-handling/usage-tracking value this library adds on top.
 
 Calibration caveat (worth knowing before gating any decision on `.confidence`): Jev is
 trained with "Reinforcement Learning for Calibrated Decisions" (RLCD), so across a
@@ -50,13 +56,14 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
-from typesafe_sdk import Choice, Noul, Score, TypeSafeClient  # re-exported for callers
+from typesafe_sdk import Choice, ChoiceAnswer, Noul, Score, ScoreAnswer, TypeSafeClient  # questions re-exported for callers
+from typesafe_sdk import NoulAnswer as _SdkNoulAnswer
 
 from .pricing import PRICE_TABLE_VERSION, compute_cost
 
-__all__ = ["Choice", "Noul", "Score", "JevClient", "JevResult", "JevUsage", "NoulAnswer"]
+__all__ = ["Choice", "Noul", "Score", "JevClient", "JevAnswer", "JevResult", "JevUsage"]
 
 logger = logging.getLogger("shared-jev")
 
@@ -90,11 +97,52 @@ class JevUsage:
 
 
 @dataclass
+class JevAnswer:
+    """One question's answer, in one shape for every kind of question.
+
+    kind:         "noul" (yes/no), "choice" (one of your options) or "score" (a rating on your scale).
+    value:        the answer itself: a bool for noul (True when the probability of yes is at least 0.5), the
+                  chosen option for choice, the rating for score.
+    probability:  noul: the calibrated P(yes), in [0, 1]. A yes/no probability already encodes its own
+                  certainty: 0.98 or 0.02 is a confident answer, 0.50 is not, so distance from 0.5 is the
+                  confidence signal. choice and score: Jev's confidence in `value`, in [0, 1] (see the
+                  calibration caveat in this module's docstring).
+    raw:          the SDK's own answer object, for anything not covered above (for example a choice's
+                  per-option probabilities).
+
+    The meaning of `probability` differs by `kind`, so read `kind` when it matters.
+    """
+    kind: Literal["noul", "choice", "score"]
+    value: Any
+    probability: float
+    raw: Any = None
+
+
+def _wrap(key: str, answer: Any) -> JevAnswer:
+    """Turn the SDK's answer for one question into a JevAnswer. An answer of an unknown type is an error, never a guess.
+
+    >>> answer = _wrap("rewrite", _SdkNoulAnswer(noul=0.2))
+    >>> answer.kind, answer.value, answer.probability
+    ('noul', False, 0.2)
+    >>> sdk = ChoiceAnswer(choice="document_overview", confidence=0.9, probabilities={"document_overview": 0.9})
+    >>> _wrap("scope", sdk).value, _wrap("scope", sdk).probability
+    ('document_overview', 0.9)
+    """
+    if isinstance(answer, _SdkNoulAnswer):
+        probability = float(answer.noul)
+        return JevAnswer("noul", probability >= 0.5, probability, answer)
+    if isinstance(answer, ChoiceAnswer):
+        return JevAnswer("choice", answer.choice, float(answer.confidence), answer)
+    if isinstance(answer, ScoreAnswer):
+        return JevAnswer("score", answer.score, float(answer.confidence), answer)
+    raise TypeError(f"Jev answer for question {key!r} has an unknown type: {type(answer).__name__}")
+
+
+@dataclass
 class JevResult:
-    """Return value of JevClient.system_one(): every question's raw SDK answer object
-    (each carries the type-specific value — .noul / .choice / .score — plus
-    .confidence), alongside call metadata and cost tracking."""
-    answers: dict[str, Any]
+    """Return value of JevClient.ask(): every answered question as a JevAnswer, alongside call metadata
+    and cost tracking. A question Jev did not answer is absent from `answers`."""
+    answers: dict[str, JevAnswer]
     tokens_in: int
     tokens_out: int
     ms: float
@@ -103,20 +151,6 @@ class JevResult:
     price_table_version: str | None = None
     estimated: bool = False
     usage: JevUsage | None = None
-
-
-@dataclass
-class NoulAnswer:
-    """One question's result from ask_noul_batch().
-
-    probability is the only signal Noul provides (typesafe_sdk's NoulAnswer has no
-    separate .confidence field — checked directly against the installed SDK's wire
-    schema; unlike Choice/Score, a yes/no probability already encodes its own
-    certainty: 0.98 or 0.02 is confident, 0.50 is not). Treat distance from 0.5 as the
-    confidence signal for a Noul answer — do not expect a separate confidence value to
-    ever be populated here.
-    """
-    probability: float          # .noul — calibrated P(yes), in [0, 1]
 
 
 class JevClient:
@@ -165,7 +199,7 @@ class JevClient:
 
     @staticmethod
     def _extract_usage(resp) -> tuple[int, int]:
-        """Pulls (tokens_in, tokens_out) off a system_one() response, trying both
+        """Pulls (tokens_in, tokens_out) off a Jev response, trying both
         attribute and dict-style access — the exact shape of `.usage` is not fully
         documented, so this degrades to (0, 0) rather than raising if it's absent or
         shaped differently than expected."""
@@ -178,15 +212,17 @@ class JevClient:
             tokens_out = usage.get("output_tokens", 0)
         return tokens_in or 0, tokens_out or 0
 
-    def system_one(self, state: str, questions: dict[str, Any], model: str = JEV_MODEL) -> JevResult:
+    def ask(self, state: str, questions: dict[str, Any], model: str = JEV_MODEL) -> JevResult:
         """One Jev call: answers every question in `questions` against `state` in a
         single parallel pass. `questions` is {key: Noul(...) | Choice(...) | Score(...)}.
+        Returns a JevResult whose `answers` maps each answered key to a JevAnswer.
 
         Retries on rate-limit and transient server errors with exponential backoff
         (retry_base_wait_secs * 2^attempt), matching LLMClient's retry behaviour.
 
         Raises:
             RuntimeError: TYPESAFE_API_KEY is unset, or all retry attempts exhausted.
+            TypeError:    Jev returned an answer of a type this client does not know.
         """
         client = self._get_client()
         last_exc = None
@@ -197,7 +233,11 @@ class JevClient:
                 resp = client.system_one(state=state, model=model, questions=questions)
                 ms = (time.perf_counter() - t0) * 1000
                 tokens_in, tokens_out = self._extract_usage(resp)
-                answers = {key: resp.answers.get(key) for key in questions}
+                answers = {
+                    key: _wrap(key, sdk_answer)
+                    for key in questions
+                    if (sdk_answer := resp.answers.get(key)) is not None
+                }
                 logger.debug(f"[Jev] {model} succeeded (attempt {attempt + 1}), {ms:.0f}ms.")
                 cost_usd = compute_cost("jev", input_tokens=tokens_in, output_tokens=tokens_out)
                 usage = JevUsage(
@@ -239,7 +279,7 @@ class JevClient:
         questions: dict[str, str],
         model: str = JEV_MODEL,
         strict: bool = False,
-    ) -> dict[str, NoulAnswer]:
+    ) -> dict[str, JevAnswer]:
         """Convenience wrapper for the common case: a batch of yes/no questions, each a
         plain instruction string, all answered as Noul (probability-of-yes) in one call.
 
@@ -256,21 +296,19 @@ class JevClient:
         ValueError naming the unanswered questions instead — use it wherever a silently
         missing answer would corrupt a stored decision.
 
-        Returns {question_key: NoulAnswer(probability)}.
+        Returns {question_key: JevAnswer}, each with kind "noul": `.probability` is P(yes) and `.value`
+        is True when it is at least 0.5.
         """
-        result = self.system_one(
+        result = self.ask(
             state=state,
             questions={key: Noul(instructions=instruction) for key, instruction in questions.items()},
             model=model,
         )
         if strict:
-            missing = [key for key, answer in result.answers.items() if getattr(answer, "noul", None) is None]
+            missing = [key for key in questions if key not in result.answers]
             if missing:
                 raise ValueError(f"Jev returned no answer for: {', '.join(missing)}")
-        return {
-            key: NoulAnswer(probability=getattr(answer, "noul", 0.0) if answer else 0.0)
-            for key, answer in result.answers.items()
-        }
+        return {key: result.answers.get(key) or JevAnswer("noul", False, 0.0) for key in questions}
 
     def list_models(self):
         """Thin passthrough to the SDK's model listing (client.models.list()). Exists
