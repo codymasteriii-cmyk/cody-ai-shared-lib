@@ -1,0 +1,184 @@
+# Call trees
+
+These trees show what each public call does, step by step, so you can find the code that does the work. They are a map, not a contract: the contract is `specs/RAG_SPEC.md`. The same trees sit in the docstrings of the code they describe, so you can read them next to the code.
+
+How to read them:
+
+- A word followed by parentheses, like `_begin()`, is a function or method you can search for. A test (`tests/test_docs_call_trees.py`) checks that every such name below still exists in the package, so a rename that leaves this map wrong fails the build.
+- Indentation means "calls". Order top to bottom is the order of execution.
+- `(optional)` marks a step that runs only for some requests.
+- Section numbers (§) point to `specs/RAG_SPEC.md`.
+
+Files named below are in `cody_ai_shared_lib/rag/`.
+
+---
+
+## 1. `query()`: answer a question (engine.py)
+
+```
+query()
+├─ _begin()                          per-request state: id, usage tracker, degradations, deadline, trace
+├─ _resolve_intent()                 decide what the question means
+│  ├─ clamp_intent()                 (caller supplied an intent) force every value into its legal range
+│  └─ route()                        (otherwise) the router reads the question; then temporal.resolve() fixes dates
+├─ _prepare_generation()             everything before the model call
+│  ├─ run()                          retrieval pipeline, see section 2
+│  ├─ _clarification()               mark an unclear question, no model call (§7.10)
+│  └─ assemble_prompt()              fence the passages, fit the token budget, add service notes
+├─ _asks()                           opt-in only: if true, ask_response() returns the question and the call ends
+└─ _generate_and_finish()
+   ├─ generate()                     the one model call
+   ├─ feed()                         FlagStreamBuffer strips the hidden answer-found flag from the visible text
+   └─ finish()                       answering.py: the response, see section 3
+```
+
+On the `no_retrieval` route (small talk) `_prepare_generation()` skips `run()` and `_clarification()` and uses `assemble_conversational()`.
+
+Any exception goes through `_fail()` (attach spend and degradations to the error, tell observers) and is re-raised.
+
+---
+
+## 2. The retrieval pipeline: `run()` (retrieval_pipeline.py)
+
+```
+run()
+├─ embedding_space()                 refuse a store whose vectors came from another embedding model
+├─ scoped_filters()                  filters + guards, validated before any store call (§5.6)
+│  ├─ effective_filters()            tenant, documents, inferred narrowing, similarity floor, soft date window
+│  └─ turn_guards()                  scope, tenant, temporal and sequential-boundary guards for this turn
+│        (empty scope? -> _empty_scope_result(), no store call at all)
+├─ build_context()                   one RetrievalContext carried through every stage
+├─ _variants()                       the primary query plus secondary queries (optional, dropped on a short deadline)
+├─ _execute()                        find candidates, then run the post stages
+│  ├─ _prior_nodes()                 (follow-up) re-fetch last turn's passages under today's filters
+│  ├─ _reuse_alone_suffices()        (follow-up) no new terms? then skip the search entirely
+│  ├─ _fetch()                       the strategy, once per query variant, in parallel
+│  │  ├─ retrieve()                  the strategy itself: dense, hybrid, keyword, full context, find-then-read...
+│  │  └─ fuse_variants()             fuse the ranked results of the variants
+│  ├─ _merge_prior()                 give old and new passages a fair share of the slots
+│  └─ process()                      each post stage in turn: rerank, dedup, threshold, rule boost, top_k
+│        guards are re-applied after every step (_enforce_guards)
+├─ _relax()                          (optional) too few results: loosen soft constraints, run _execute() again
+├─ limit_ranked()                    cut to the size the prompt can hold
+└─ _completeness()                   for a list question: "whole_scope", "searched" or "partial" (§8.13)
+```
+
+Which strategy runs is decided by the profile (`adaptive` picks a tier from what the store can do and how big the scope is, §8.12). `plan()` evaluates that decision without searching.
+
+---
+
+## 3. The ending of a request: `finish()` (answering.py)
+
+```
+finish()
+├─ extract()                         read [n] markers, check each one against a passage the model really saw
+├─ verify()                          check quoted words occur in the cited passage
+├─ sanitize()                        remove fence markers, unsafe links, leaked internals
+├─ list_completeness()               downgrade a list to "partial" if the prompt budget cut read text
+├─ next_state()                      the conversation state handed back to the app (§7.7)
+│  └─ remember_entities()            names the user asked about that a shown passage confirms (§7.10)
+├─ build()                           the inspectable trace
+└─ complete()                        notify observers, write the one INFO summary line
+```
+
+`ask_response()` is the alternative ending: it builds the same kind of response around the clarifying question, with `answer_found=None` and no citations (§7.10).
+
+---
+
+## 4. `stream_query()`: the same steps as events (engine.py)
+
+```
+stream_query()
+├─ _begin()
+└─ _stream_events()                  a generator; each step below yields events
+   ├─ _resolve_intent()              -> event "intent"
+   ├─ _prepare_generation()          -> events "status", "retrieval"
+   ├─ (opt-in ask)                   -> "delta" (the question), "clarification", "citations" (empty), "done"
+   ├─ generate() or stream()         -> "delta" per chunk (buffered: all at once)
+   ├─ finish()
+   └─                                -> "citations", "done"
+```
+
+Order of events for an answer: `intent`, `status(retrieving)`, `retrieval`, `status(generating)`, `delta...`, `citations`, `done`. `degradation` events appear between steps as they happen. On failure the last event is `error`, then the exception is raised. Closing the stream early stops the model call and records it as cancelled.
+
+---
+
+## 5. `retrieve()`: ranked list only (engine.py)
+
+```
+retrieve()
+├─ _begin()
+├─ _resolve_intent()
+├─ run()                             the pipeline of section 2, mode "retrieve"
+├─ _clarification()                  a mark only; this call never asks
+└─ build()                           trace, then observers are told
+```
+
+No prompt is assembled and no model is called for the answer.
+
+---
+
+## 6. `query_batched()`: a list across many documents (batching.py)
+
+```
+query_batched()
+├─ _begin()
+├─ _resolve_intent()
+└─ run()                             BatchedListAnswerer.run()
+   ├─ _gather()                      the documents to read: the app's doc_ids, or those a wide search hit
+   ├─ _read()                        per document, sharing one token budget
+   │  ├─ read_around_hits()          documents found by search: section, window or hit, cheapest that fits
+   │  └─ read_whole_document()       documents the app named: whole, else section by section
+   ├─ pack_batches()                 pack the read text into prompt-sized batches
+   ├─ _map()                         one model call per batch, in parallel, always strict grounding
+   │  └─ parse_map_items()           bullets -> (text, verified citations); unverified claims are dropped
+   ├─ _number()                      drop exact repeats, number the items
+   ├─ _merge()                       one model call grouping duplicates; parse_merge() reads the reply
+   └─ _respond()                     answer text, final [n] numbers, citations, state, trace
+```
+
+A document cap, the batch cap, a failed batch or cut text makes the answer `partial` and is reported in `RAGResponse.batches` (§8.13).
+
+---
+
+## 7. Asking the user to clarify (clarification.py)
+
+```
+_clarification()                     engine.py, after retrieval, in every mode
+└─ find_clarification()
+   ├─ _from_referent()               the router flagged "he/she/it": two remembered names, both confirmed in passages
+   │  └─ _confirmed()                which names occur in which visible passages
+   └─ _from_hook()                   the app gave a candidate_key: two strong groups, none dominating
+
+_asks()                              mode "ask", an askable reason, a state was sent back, not asked last turn
+└─ ask_response()                    answering.py
+   ├─ question_text()                a template filled with the option labels (no model call)
+   └─ next_state()                   sets clarification_asked, so the next turn never asks again
+```
+
+---
+
+## 8. Ingestion (engine.py)
+
+```
+ingest_document()                    split, summarize, embed, upsert; one section at a time, resumable
+├─ validate_owner()                  every key the store requires must be named, before any call
+└─ _ingest_section()                 once per section
+   ├─ write_signatures()             what the stored rows will say they were built with
+   ├─ summarize_section()            (optional) section and unit summaries
+   ├─ build_section_nodes()          split the text into passages
+   ├─ finalize_node()                hash, tokens, rendered text
+   ├─ embed_nodes()                  embed the passages
+   ├─ prepare_summaries()            embed the summaries
+   ├─ prepare_passages()             attach the signatures
+   └─ upsert_section()               one atomic store write per section
+
+sync_document()                      embed only what changed, delete what vanished, keep node ids (§6.6)
+└─ sync()                            DocumentSynchronizer.sync()
+
+prepare_nodes()                      for apps that insert rows themselves (§6.4.1): nothing is written
+├─ embed_each_with_reasons()         each node on its own; a bad node is listed in `failed`
+└─ finalize_node()                   plus the fingerprint the app stores with the row
+
+needs_reindex()                      compare stored fingerprints with what the profile would write now
+```

@@ -2,6 +2,21 @@
 
 Wires the components from the profile and registry, and exposes query, stream, retrieval,
 ingestion and lifecycle calls. The work itself lives in the modules it delegates to.
+
+How a question flows (read `query()` first; docs/CALL_TREES.md has the full trees):
+
+    query()
+      _begin()                  per-request trackers: usage, degradations, deadline, trace
+      _resolve_intent()         router (or the caller's intent) -> clamp -> resolve dates
+      _prepare_generation()     retrieval.pipeline.run() + clarification mark + prompt assembly
+      _generate_and_finish()    one model call, then answering.AnswerFinalizer.finish()
+
+What lives where:
+    this file                 construction, validation, the public calls, streaming, ingestion entry points
+    retrieval_pipeline.py     filters, guards, strategy, post stages, relaxation
+    answering.py              everything after the model call: citations, state, the response
+    batching.py               query_batched (list questions across many documents)
+    clarification.py          deciding that a question is unclear, and the wording of the ask
 """
 from __future__ import annotations
 
@@ -143,7 +158,17 @@ LIST_PARTIAL_NOTE = "This list may be incomplete: only part of the available tex
 
 
 class RAGEngine(Generic[MetaT]):
-    """Main facade for the shared RAG engine."""
+    """Main facade for the shared RAG engine.
+
+    One engine is built per profile and store, once, at app start; it is safe to share between requests
+    because all per-request state lives in the `RequestRun` that `_begin()` creates. To vary the profile or
+    the store per request, use `with_profile()` / `with_store()` (they share the pool, cache and gateway)
+    or set `request.variant` (the named profile variants of §12.1).
+
+    Public calls: `route`, `plan`, `retrieve`, `query`, `stream_query`, `query_batched`, `generate_from_nodes`,
+    `verify_answer`; ingestion: `ingest_document`, `sync_document`, `prepare_node(s)`, `needs_reindex`;
+    lifecycle: `validate`, `with_profile`, `with_store`.
+    """
 
     def __init__(
         self,
@@ -165,6 +190,15 @@ class RAGEngine(Generic[MetaT]):
         filter_inferencer: Any = None,
         candidate_key: CandidateKey | None = None,
     ):
+        """Build every component from the profile. The order matters:
+
+        1. the renderer first, so a renderer that only stubs the protocol fails before anything else;
+        2. startup validation, so a bad profile raises before any pool or client exists;
+        3. text tools (analyzer, splitter), then the prompt side, the answer side, ingestion, retrieval, the router.
+
+        The optional arguments let sibling engines (`with_profile`, `with_store`) share the heavy parts.
+        """
+        # 1. Settings and the pieces every other component reads
         self.profile = profile
         self._variant_name = variant_name
         self.store = store
@@ -184,11 +218,13 @@ class RAGEngine(Generic[MetaT]):
 
         self._raise_on_startup_problems()
 
+        # 2. Shared resources: a cache and a bounded worker pool (a sibling engine passes its own in)
         self.cache: Cache | None = cache
         if self.cache is None and profile.cache.enabled:
             self.cache = InMemoryLRUCache(max_bytes=profile.cache.max_bytes)
         self._pool = pool or make_bounded_pool(profile.runtime.pool_size)
 
+        # 3. Text tools and the bundle of dependencies that registry factories receive
         self.analyzer = self.registry.get("analyzer", profile.analyzer)()
         self.splitter = self.registry.get("splitter", profile.ingestion.splitter)(
             target_size=profile.ingestion.target_size,
@@ -206,6 +242,7 @@ class RAGEngine(Generic[MetaT]):
             registry=self.registry,
         )
 
+        # 4. Prompt side: citation labels, fencing, assembly and conversation state
         self.formatter = self.registry.get("formatter", profile.citations.formatter)(self.renderer)
         # Siblings (with_profile, with_store) share the fencer, so stateless fence ids stay stable (D-06)
         self.fencer = fencer or ContextFencer(rng=self.rng)
@@ -216,6 +253,7 @@ class RAGEngine(Generic[MetaT]):
             max_state_bytes=profile.context.state_max_bytes,
             rolling_summary_max_tokens=profile.context.rolling_summary_max_tokens,
         )
+        # 5. Answer side: the generator, then the checks that run on its output, bundled into the finalizer
         self.generator: GenerationStrategy = self.registry.get("generator", profile.generation.strategy)(self._deps)
         self.citation_extractor = CitationExtractor(profile.citations.on_unverified, self.formatter)
         self.quote_validator = QuoteValidator(analyzer=self.analyzer)
@@ -230,6 +268,7 @@ class RAGEngine(Generic[MetaT]):
             self.conversation_manager,
             self.renderer.prompt_text,
         )
+        # 6. Ingestion: embed, summarize and synchronize documents (used by ingest_document / sync_document)
         self.embedder = BatchEmbedder(
             gateway=self.gateway,
             model=profile.models.embedding,
@@ -257,6 +296,7 @@ class RAGEngine(Generic[MetaT]):
             embed_summaries=profile.ingestion.summaries.embed_summaries,
             granularity=profile.ingestion.granularity,
         )
+        # 7. Retrieval and routing: the pipeline owns filters, guards, strategy and post stages
         self.pipeline: RetrievalPipeline[MetaT] = RetrievalPipeline(
             self._deps, store, self._pool, self.cache, budget_guard, self._explicit_guards
         )
@@ -276,7 +316,13 @@ class RAGEngine(Generic[MetaT]):
     # ── Validation ────────────────────────────────────────────────────────
 
     def _engine_problems(self) -> tuple[list[str], list[str], list[str]]:
-        """Return (problems, missing, capability_gaps) knowable before the first request (§13.3)."""
+        """Return (problems, missing, capability_gaps) knowable before the first request (§13.3).
+
+        `problems` are settings that cannot work (a model or dimension mismatch, a stubbed renderer);
+        `missing` names environment variables that are not set; `capability_gaps` are things the store
+        cannot do that the chosen strategy needs. The first two raise `ProfileConfigError` at startup;
+        a gap raises `StoreCapabilityError`.
+        """
         problems: list[str] = []
         missing: list[str] = []
         gaps: list[str] = []
@@ -351,6 +397,7 @@ class RAGEngine(Generic[MetaT]):
         )
 
     def _raise_on_startup_problems(self) -> None:
+        """Fail fast in the constructor, so a bad profile never reaches a request (§13.3)."""
         report = self.profile.check(self.registry)
         problems, missing, gaps = self._engine_problems()
         if report.problems or problems:
@@ -425,6 +472,11 @@ class RAGEngine(Generic[MetaT]):
     # ── Per-request plumbing ──────────────────────────────────────────────
 
     def _begin(self, request: RAGQueryRequest, cancel: CancelToken | None = None) -> RequestRun:
+        """Create the per-request state: id, usage and degradation trackers, deadline and trace collector.
+
+        Everything a request records goes into the returned `RequestRun`, never onto the engine, which is
+        why one engine can serve many requests at once. Observers are notified from the trackers' callbacks.
+        """
         request_id = request.request_id or f"req-{uuid.uuid4().hex[:12]}"
         filters = request.filters
         variant = request.variant or self._variant_name
@@ -473,6 +525,7 @@ class RAGEngine(Generic[MetaT]):
             exc.retrieval = retrieval
 
     def _fail(self, exc: Exception, run: RequestRun, retrieval: RAGRetrievalResult[MetaT] | None = None) -> None:
+        """Common error path: attach what the request spent, log it, and tell observers. The caller re-raises."""
         self._attach_failure_context(exc, run, retrieval)
         level = logging.INFO if isinstance(exc, RequestCancelled) else logging.ERROR   # a cancel is the caller's choice
         logger.log(level, f"[RAG] id={run.request_id} error={type(exc).__name__} stage={getattr(exc, 'stage', None)}")
@@ -493,6 +546,11 @@ class RAGEngine(Generic[MetaT]):
         return factory(self._deps)
 
     def _resolve_intent(self, request: RAGQueryRequest, intent: QueryIntent | None, run: RequestRun) -> QueryIntent:
+        """Decide what the question means: the caller's intent, or the router's, always clamped and date-resolved.
+
+        An intent the caller passes in is trusted for its shape but still clamped to legal ranges (DG-05),
+        so a hand-built intent cannot send an out-of-range value downstream.
+        """
         if intent is not None:
             clamped = clamp_intent(intent.model_dump(exclude={"ext"}), run.degradations)
             return self.temporal_resolver.resolve(self._with_ext(clamped, intent))
@@ -528,7 +586,16 @@ class RAGEngine(Generic[MetaT]):
         intent: QueryIntent,
         run: RequestRun,
     ) -> tuple[AssembledPrompt[MetaT], RAGRetrievalResult[MetaT], list[Guard], str]:
-        """Retrieve and assemble, or build the conversational prompt on the no-retrieval route."""
+        """Retrieve and assemble, or build the conversational prompt on the no-retrieval route.
+
+        Returns (prompt, retrieval, guards, stage name for usage accounting). Steps, in order:
+
+        1. no_retrieval route: skip search and build a plain chat prompt;
+        2. run the retrieval pipeline;
+        3. mark an unclear question (`retrieval.clarification`), without a model call;
+        4. collect "service notes" the model should see (degradations, a hedge, a partial list);
+        5. assemble the prompt; and if that assembly shows the list became partial, assemble once more with the note.
+        """
         state_fence = request.state.fence_id if request.state else None
         if intent.route == "no_retrieval":
             _, guards, _ = self.pipeline.scoped_filters(request, intent)
@@ -542,6 +609,7 @@ class RAGEngine(Generic[MetaT]):
 
         retrieval, guards = self.pipeline.run(request, intent, "query", run)
         retrieval.clarification = self._clarification(request, intent, retrieval, guards, run)
+        # Service notes are short instructions appended to the prompt so the answer can be honest about its limits
         disclosure = request.degradation_disclosure or self.profile.generation.degradation_disclosure
         notes = (
             list(dict.fromkeys(d.impact for d in run.degradations.degradations if d.impact))
@@ -552,6 +620,7 @@ class RAGEngine(Generic[MetaT]):
         if retrieval.completeness == "partial":
             notes = [*(notes or []), LIST_PARTIAL_NOTE]
         prompt = self.assembler.assemble_prompt(request, retrieval.nodes, state_fence, guards, service_notes=notes)
+        # The note cannot always be known before assembly: the prompt budget may drop text, and only then is the list partial
         if retrieval.completeness != "partial" and self.finalizer.list_completeness(retrieval, prompt) == "partial":
             # The prompt budget left read text out, so the list became partial only now: tell the model too
             notes = [*(notes or []), LIST_PARTIAL_NOTE]
@@ -595,6 +664,11 @@ class RAGEngine(Generic[MetaT]):
         """The engine's suggestion that this question is unclear, in every mode. No check without a reason."""
 
         def prior() -> list[RAGNode[MetaT]]:
+            """The passages shown on earlier turns, re-fetched under today's filters and guards.
+
+            Used to confirm a remembered name against text the user may still see: if the boundary moved
+            back, a name from a hidden passage is not offered. Called lazily, only when a check needs it.
+            """
             state = request.state
             if not (state and state.prior_nodes and self.store.capabilities().supports_fetch_nodes):
                 return []
@@ -633,6 +707,7 @@ class RAGEngine(Generic[MetaT]):
         return self.profile.clarification.hedge_note or after_ask
 
     def _generation_context(self, request: RAGQueryRequest, run: RequestRun, stage: str) -> GenerationContext:
+        """What a generator needs besides the prompt: where to record usage and degradations, and the budget."""
         return GenerationContext(
             usage_tracker=run.usage,
             degradation_tracker=run.degradations,
@@ -694,13 +769,28 @@ class RAGEngine(Generic[MetaT]):
     def query(
         self, request: RAGQueryRequest, intent: QueryIntent | None = None, *, cancel: CancelToken | None = None
     ) -> RAGResponse[MetaT]:
-        """End-to-end question answering (§14). `cancel` lets the caller stop it from another thread (§13.4)."""
+        """End-to-end question answering (§14). `cancel` lets the caller stop it from another thread (§13.4).
+
+        Call tree:
+
+            query()
+            ├─ _begin()                         per-request trackers, deadline, trace
+            ├─ _resolve_intent()                router -> clamp -> resolve dates
+            ├─ _prepare_generation()
+            │  ├─ pipeline.run()                filters, guards, strategy, post stages, relaxation
+            │  ├─ _clarification()              mark an unclear question (no model call)
+            │  └─ assembler.assemble_prompt()   fence, budget and order the text the model sees
+            ├─ _asks()  ->  finalizer.ask_response()     opt-in: return the question instead of an answer
+            └─ _generate_and_finish()
+               ├─ generator.generate()          the one model call
+               └─ finalizer.finish()            citations, quotes, sanitize, state, trace -> RAGResponse
+        """
         if request.variant:
             return self._variant_engine(request.variant).query(
                 request.model_copy(update={"variant": None}), intent, cancel=cancel
             )
         run = self._begin(request, cancel)
-        retrieval: RAGRetrievalResult[MetaT] | None = None
+        retrieval: RAGRetrievalResult[MetaT] | None = None     # kept so a failure can report what was found
         try:
             resolved = self._resolve_intent(request, intent, run)
             prompt, retrieval, guards, stage = self._prepare_generation(request, resolved, run)
@@ -753,6 +843,11 @@ class RAGEngine(Generic[MetaT]):
         stage: str,
         run: RequestRun,
     ) -> RAGResponse[MetaT]:
+        """Make the model call and turn its raw text into the final response.
+
+        The model's text carries a hidden answer-found flag; `FlagStreamBuffer` strips it from what the user
+        sees and reports it separately. A cancelled request raises here, before any answer is saved.
+        """
         run.deadline.check("generation")
         started = run.trace.elapsed_ms()
         result = self.generator.generate(prompt, self._generation_context(request, run, stage))
@@ -827,11 +922,22 @@ class RAGEngine(Generic[MetaT]):
         intent: QueryIntent | None,
         run: RequestRun,
     ) -> Iterator[RAGStreamEvent]:
+        """The generator behind `stream_query`. It is the streaming twin of `query()`, with the same steps.
+
+        Event order for an answer (§10.8):
+            intent, [degradation], status(retrieving), [degradation], retrieval, status(generating),
+            delta..., [degradation], citations, done
+        Event order for an opt-in ask (§7.10): the same up to `retrieval`, then
+            delta (the question), clarification, citations (empty), done
+        On failure: `error` is the last event, then the exception is re-raised. When the consumer closes the
+        stream early, `GeneratorExit` is raised at a `yield` and the `except GeneratorExit` branch cleans up.
+        """
         retrieval: RAGRetrievalResult[MetaT] | None = None
-        chunks: Any = None
+        chunks: Any = None                  # the live model stream, so a cancel can close it (RAG-OPS-2)
         emitted_degradations = 0
 
         def new_degradations() -> list[RAGStreamEvent]:
+            """Degradation events not yet sent; called between steps so the client sees them as they happen."""
             nonlocal emitted_degradations
             pending = run.degradations.degradations[emitted_degradations:]
             emitted_degradations += len(pending)
@@ -891,9 +997,11 @@ class RAGEngine(Generic[MetaT]):
             visible_parts: list[str] = []
 
             def deltas_for(texts: list[str]) -> list[RAGStreamEvent]:
+                """Turn the buffer's visible text into delta events, keeping a copy for the final answer."""
                 visible_parts.extend(texts)
                 return [RAGStreamEvent(event="delta", data={"text": text}) for text in texts]
 
+            # "buffered" waits for the whole answer, then emits it; "native" forwards the model's chunks as they arrive
             if self.profile.generation.stream_mode == "buffered":
                 result = self.generator.generate(prompt, context)
                 run.deadline.raise_if_cancelled("generation")
@@ -939,6 +1047,7 @@ class RAGEngine(Generic[MetaT]):
             )
             yield RAGStreamEvent(event="done", data=self._done_data(response, run, request, citations, sources))
         except GeneratorExit:
+            # The consumer closed the stream early (a disconnect or a `break`)
             # Closing the model stream makes the gateway record the cancelled call (RAG-OPS-2)
             if chunks is not None:
                 chunks.close()
@@ -1047,7 +1156,12 @@ class RAGEngine(Generic[MetaT]):
         deg_tracker: DegradationTracker,
         owner: OwnerScope | None,
     ) -> IngestionProgress:
-        """Summarize, split, embed and atomically upsert one section (RAG-ING-3, RAG-ING-10, RAG-ING-12)."""
+        """Summarize, split, embed and atomically upsert one section (RAG-ING-3, RAG-ING-10, RAG-ING-12).
+
+        Steps: write signatures (what the stored rows will say they were built with) -> summarize ->
+        split into passages -> embed passages -> embed summaries -> one atomic `upsert_section`.
+        The write is atomic per section, so a failure leaves the store as it was and the job can resume.
+        """
         uses_tokens = self.store.capabilities().uses_analyzer_tokens
         signatures = write_signatures(
             self.profile.models.embedding, self.store.embedding_space(), self.splitter, self.analyzer, uses_tokens
@@ -1136,6 +1250,7 @@ class RAGEngine(Generic[MetaT]):
         if not nodes:
             return PreparedBatch[MetaT]()
 
+        # Each node is embedded on its own, so one bad node cannot sink the batch
         doc_ids = list(dict.fromkeys(node.span.doc_id for node in nodes))
         tracker, degradations = self._ingestion_trackers(f"prepare-{uuid.uuid4().hex[:12]}", doc_ids, owner)
         try:
@@ -1161,6 +1276,7 @@ class RAGEngine(Generic[MetaT]):
                 impact="Failed nodes were returned in `failed`; the rest are ready to insert",
             )
 
+        # The fingerprint travels with the node so the app's insert stores what `needs_reindex` later compares
         uses_tokens = self.store.capabilities().uses_analyzer_tokens
         emb_sig = embedding_signature(self.profile.models.embedding, self.store.embedding_space(), self.splitter)
         fts_sig = fts_signature(self.analyzer, uses_tokens)

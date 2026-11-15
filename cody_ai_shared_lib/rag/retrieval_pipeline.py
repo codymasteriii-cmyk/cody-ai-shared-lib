@@ -1,4 +1,25 @@
-"""Retrieval pipeline: filters, strategy, follow-up reuse, post-stages, relaxation, guards (§5.3, §7.6, §7.7, §8, §9)."""
+"""Retrieval pipeline: filters, strategy, follow-up reuse, post-stages, relaxation, guards (§5.3, §7.6, §7.7, §8, §9).
+
+Call tree of `RetrievalPipeline.run()`, the one entry point:
+
+    run()
+    ├─ scoped_filters()              request filters + intent window + guard patches; validated before any store call
+    │  ├─ effective_filters()        tenant, documents, inferred narrowing, similarity floor, soft date window
+    │  └─ turn_guards()              the guards active this turn (scope, tenant, temporal, sequential boundary...)
+    ├─ build_context()               one RetrievalContext carried through every stage
+    ├─ _variants()                   the primary query plus any secondary queries from transforms
+    ├─ _execute()                    find candidates, then run the post stages
+    │  ├─ _prior_nodes()             follow-up: re-fetch last turn's passages under today's filters
+    │  ├─ _fetch()                   the strategy (dense, hybrid, find-then-read...), once per query variant
+    │  ├─ _merge_prior()             give old and new passages a fair share of the slots
+    │  └─ stage.process() ...        rerank, dedup, threshold, boost, top_k; guards re-applied after each
+    ├─ _relax()                      too few results: loosen soft constraints one step at a time, re-run _execute()
+    ├─ limit_ranked() + guards       cut to the target size, one last guard pass
+    └─ _completeness()               for a list question, did we read everything?
+
+A guard is applied after every step that can add text, not once at the end: an earlier step must never
+hand a hidden passage to a later one (§5.3).
+"""
 from __future__ import annotations
 
 import logging
@@ -38,7 +59,11 @@ CONVERSATION_REUSE = "conversation_reuse"
 
 
 class RetrievalPipeline(Generic[MetaT]):
-    """Turns a request and intent into guarded, ranked nodes."""
+    """Turns a request and intent into guarded, ranked nodes.
+
+    Built once per engine; holds only configuration (stages, transforms, relaxation steps), never per-request
+    state. Everything a single request learns goes into the `RequestRun` and the `RetrievalContext` passed in.
+    """
     filter_inferencer: Any = None   # set by RAGEngine (§5.5)
 
 
@@ -51,6 +76,7 @@ class RetrievalPipeline(Generic[MetaT]):
         budget_guard: Any,
         engine_guards: list[Guard],
     ):
+        # Components named in the profile are built once here, by name, from the registry (§8.8)
         self.deps = deps
         self.profile = deps.profile
         self.registry = deps.registry
@@ -68,6 +94,7 @@ class RetrievalPipeline(Generic[MetaT]):
         self.followup_terms = FollowupTermCheck(deps.analyzer)
 
     def _build_stage(self, configured: str) -> Any:
+        """Build one post stage from its profile entry; "name:argument" passes the argument to the factory."""
         name, argument = split_component_name(configured)
         factory = self.registry.get("stage", name)
         return factory(self.deps, argument) if argument is not None else factory(self.deps)
@@ -126,7 +153,11 @@ class RetrievalPipeline(Generic[MetaT]):
         return cls.soft_date_window(request, intent) is not None
 
     def turn_guards(self, request: RAGQueryRequest, filters: RAGFilterSpec, soft_date: bool = False) -> list[Guard]:
-        """Build the guards active for this turn; a soft date window is not a guard (D-04)."""
+        """Build the guards active for this turn; a soft date window is not a guard (D-04).
+
+        Guards are the safety net behind filters: filters ask the store for the right rows, guards check
+        every returned node again, so a store that ignores a filter still cannot leak a hidden passage.
+        """
         # The guard enforces only the caller's hard range; the soft window is the relaxable part (D-04)
         guard_filters = (
             filters.model_copy(update={"date_range_utc": request.filters.date_range_utc}) if soft_date else filters
@@ -145,7 +176,11 @@ class RetrievalPipeline(Generic[MetaT]):
         request: RAGQueryRequest,
         intent: QueryIntent | None,
     ) -> tuple[RAGFilterSpec, list[Guard], bool]:
-        """Return validated filters with every guard's patch applied, before any store call (§5.6)."""
+        """Return validated filters with every guard's patch applied, before any store call (§5.6).
+
+        Returns (filters, guards, soft_date). Also the single place an empty scope is detected, so
+        callers can skip every store call when the hard constraints already rule everything out.
+        """
         soft_date = self.has_soft_date_window(request, intent)
         filters = self.effective_filters(request, intent)
         guards = self.turn_guards(request, filters, soft_date)
@@ -165,7 +200,11 @@ class RetrievalPipeline(Generic[MetaT]):
         mode: Literal["query", "retrieve"],
         run: RequestRun,
     ) -> tuple[RAGRetrievalResult[MetaT], list[Guard]]:
-        """Run retrieval and return the result with the guards that were enforced."""
+        """Run retrieval and return the result with the guards that were enforced.
+
+        `mode` is "query" (the result feeds generation) or "retrieve" (the caller wants the ranked list).
+        """
+        # Refuse to search a store whose vectors came from a different embedding model: scores would be noise
         space = self.store.embedding_space()
         if space.model != self.profile.models.embedding:
             raise EmbeddingSignatureMismatch(
@@ -176,6 +215,7 @@ class RetrievalPipeline(Generic[MetaT]):
 
         filters, guards, soft_date = self.scoped_filters(request, intent)
         if filters.is_empty_scope:
+            # Contradictory hard filters match nothing: answer "nothing found" without touching the store
             return self._empty_scope_result(intent, filters, run), guards
 
         ctx = self.build_context(request, intent, filters, mode, run)
@@ -186,11 +226,15 @@ class RetrievalPipeline(Generic[MetaT]):
         ctx.rerank_active = any(stage.name == "rerank" for stage in stages)
 
         nodes = self._execute(ctx, strategy, stages, guards, run)
+        # Too few ranked results? Loosen soft constraints step by step (relaxation is opt-in in the profile)
         nodes, ctx, relaxations = self._relax(nodes, ctx, strategy, stages, guards, soft_date, request, run)
 
+        # Cut to the size the prompt can hold; a cut marks the list partial (see _completeness)
         limited = limit_ranked(nodes, ctx.target_limit())
         ctx.truncated = ctx.truncated or len(limited) < len(nodes)
         nodes = self._enforce_guards(limited, guards, run)
+
+        # Record what ran, for the trace the app can inspect
 
         run.trace.tier_decision_reason = ctx.last_tier_reason
         run.trace.scope_revision = ctx.scope_revision
@@ -216,7 +260,11 @@ class RetrievalPipeline(Generic[MetaT]):
     @staticmethod
     def _completeness(intent: QueryIntent, ctx: RetrievalContext[MetaT]) -> Completeness | None:
         """Only reading the whole visible scope proves a list complete (OI-4). Reading around every hit of a search
-        is "searched"; a plain top-k search read only the best passages, a known loss, so it is "partial" (1.2.16)."""
+        is "searched"; a plain top-k search read only the best passages, a known loss, so it is "partial" (1.2.16).
+
+        Decision order: not a list question -> None; anything cut -> "partial"; whole scope read -> "whole_scope";
+        every hit read in full -> "searched"; otherwise "partial".
+        """
         if not intent.wants_list:
             return None
         if ctx.truncated:
@@ -231,6 +279,7 @@ class RetrievalPipeline(Generic[MetaT]):
         filters: RAGFilterSpec,
         run: RequestRun,
     ) -> RAGRetrievalResult[MetaT]:
+        """The result for a scope that matches nothing: no nodes, and the reason in the trace."""
         reason = "empty_scope: hard filters match nothing"
         run.trace.tier_decision_reason = reason
         return RAGRetrievalResult[MetaT](
@@ -250,6 +299,11 @@ class RetrievalPipeline(Generic[MetaT]):
         mode: Literal["query", "retrieve"],
         run: RequestRun,
     ) -> RetrievalContext[MetaT]:
+        """Bundle everything a strategy or stage may need into one object, so none reaches back into the engine.
+
+        The context also carries mutable outputs (which strategy ran, why, whether the scope was read in full)
+        that strategies set and `run()` reads afterwards.
+        """
         return RetrievalContext[MetaT](
             request=request,
             intent=intent,
@@ -272,6 +326,7 @@ class RetrievalPipeline(Generic[MetaT]):
         )
 
     def _resolve_strategy(self, request: RAGQueryRequest) -> RetrievalStrategy[MetaT]:
+        """Pick the strategy: the request's override, else the profile's default (usually "adaptive")."""
         name = request.strategy_override or self.profile.retrieval.default_strategy
         cls = self.registry.get("strategy", name)
         if cls is None:
@@ -279,6 +334,11 @@ class RetrievalPipeline(Generic[MetaT]):
         return cls()
 
     def _variants(self, request: RAGQueryRequest, intent: QueryIntent, run: RequestRun) -> list[QueryVariant]:
+        """The queries to search with: the primary one first, then distinct secondary queries from transforms.
+
+        Secondary queries are optional work, so when the deadline is short they are dropped (DG-10)
+        and only the primary query runs.
+        """
         primary = QueryVariant(text=intent.search_query or request.question, weight=1.0, origin="primary")
         variants = [primary]
         seen = {primary.text}
@@ -328,7 +388,11 @@ class RetrievalPipeline(Generic[MetaT]):
         guards: list[Guard],
         run: RequestRun,
     ) -> list[RAGNode[MetaT]]:
-        """Find candidates, then run every stage, with guards after each one (§5.3)."""
+        """Find candidates, then run every stage, with guards after each one (§5.3).
+
+        A follow-up that adds no new terms reuses last turn's passages and skips the search entirely
+        (`CONVERSATION_REUSE`); otherwise the strategy searches and old passages are merged in.
+        """
         prior, complete = self._prior_nodes(ctx, guards, run)
         if complete and self._reuse_alone_suffices(ctx, prior):
             ctx.last_strategy_used = CONVERSATION_REUSE
@@ -352,6 +416,7 @@ class RetrievalPipeline(Generic[MetaT]):
 
         for stage in stages:
             run.deadline.raise_if_cancelled(stage.name)
+            # A stage with a time budget is optional: skip it when the deadline cannot fit it (DG-10)
             budget_key = getattr(stage, "deadline_budget_key", None)
             if budget_key is not None:
                 budget = self.profile.runtime.stage_budgets.get(budget_key, 0.0)
@@ -387,6 +452,11 @@ class RetrievalPipeline(Generic[MetaT]):
         return bool(getattr(chosen, "query_independent", False))
 
     def _fetch(self, ctx: RetrievalContext[MetaT], strategy: RetrievalStrategy[MetaT]) -> list[RAGNode[MetaT]]:
+        """Run the strategy once per query variant (in parallel) and fuse the ranked results.
+
+        Ordered layers (summaries, windows, whole-scope text) are not ranked, so they are kept once and
+        placed first; only ranked passages compete, fused with reciprocal-rank fusion weighted per variant.
+        """
         if len(ctx.variants) <= 1 or self._query_independent(ctx, strategy):
             # Tier 0 and "no retrieval" do not depend on the query: run them once, not per variant
             return call_store(strategy.name, lambda: strategy.retrieve(ctx))
@@ -508,6 +578,7 @@ class RetrievalPipeline(Generic[MetaT]):
         guards: list[Guard],
         run: RequestRun,
     ) -> list[RAGNode[MetaT]]:
+        """Apply the guards and record how many nodes each one dropped, for the trace."""
         return apply_guards(nodes, guards, run.trace.record_guard_effect)
 
 
@@ -516,7 +587,11 @@ def apply_guards(
     guards: list[Guard],
     record_effect: Callable[[str, int, int], None] | None = None,
 ) -> list[RAGNode[MetaT]]:
-    """Run every guard's verify over the nodes, reporting how many each dropped or truncated."""
+    """Run every guard's verify over the nodes, reporting how many each dropped or truncated.
+
+    A guard's `verify` returns the node (keep), None (drop) or a shortened copy (keep, but trimmed to what
+    may be shown, e.g. text past a reading boundary). Guards run one after another, each on the survivors.
+    """
     result = nodes
     for guard in guards:
         kept: list[RAGNode[MetaT]] = []
@@ -540,4 +615,5 @@ def _ranked_count(nodes: list[RAGNode[MetaT]]) -> int:
 
 
 def _utc(value: datetime | None) -> datetime | None:
+    """Normalize a date to UTC; None stays None."""
     return as_utc(value) if value is not None else None

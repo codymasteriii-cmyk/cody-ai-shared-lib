@@ -12,6 +12,14 @@ and reads each document as cheaply as the store allows (`reading.read_around_hit
 
 The result is Tier 0 style text. A ranked finder can never prove it saw every match, so the best this strategy
 reports is "searched" (the text around every hit was read, nothing capped or cut), never "whole_scope" (§8.13).
+
+Call tree:
+
+    FindThenReadStrategy.retrieve()
+    ├─ find_hits()                 the ordinary search (hybrid, else dense, else keyword), feed-sized
+    ├─ group the ranked hits by document, in rank order; keep the first `list_max_documents`
+    ├─ reading.read_around_hits()  per document, sharing one token budget between documents
+    └─ mark every node Tier 0 style (FLAG_FULL_SCOPE) and set `ctx.scope_searched`
 """
 from __future__ import annotations
 
@@ -29,12 +37,14 @@ from .reading import read_around_hits
 
 
 class FindThenReadStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
+    """The strategy behind list questions: search to find the documents, then read around the hits."""
     name: ClassVar[str] = "find_then_read"
     version: ClassVar[str] = "1.1.0"
     requires: ClassVar[frozenset[str]] = frozenset(["supports_full_scope_fetch"])
 
     @classmethod
     def is_runnable(cls, capabilities: Any) -> bool:
+        """Needs a store that can fetch whole scopes, plus at least one way to search (vector, keyword or both)."""
         return bool(capabilities.supports_full_scope_fetch) and (
             HybridRRFStrategy.is_runnable(capabilities)
             or capabilities.supports_vector_search
@@ -42,6 +52,7 @@ class FindThenReadStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
         )
 
     def retrieve(self, ctx: RetrievalContext[MetaT]) -> list[RAGNode[MetaT]]:
+        """Return the text read around the hits, as unranked Tier 0 style nodes, and say how complete the read was."""
         caps = ctx.store.capabilities()
         if not self.is_runnable(caps):
             raise StoreCapabilityError("FindThenReadStrategy requires a searchable store with 'supports_full_scope_fetch'")
@@ -51,7 +62,7 @@ class FindThenReadStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
         for hit in find_hits(ctx):
             if is_ranked(hit):
                 by_doc.setdefault(hit.span.doc_id, []).append(hit)
-        documents = list(by_doc)
+        documents = list(by_doc)                       # rank order: the best-matching document is read first
         capped = len(documents) > cfg.list_max_documents
         documents = documents[: cfg.list_max_documents]
 
@@ -69,6 +80,7 @@ class FindThenReadStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
                 stopped = True
                 break
 
+        # A document cap or an early stop is a known loss (truncated). "searched" additionally needs no cut read.
         ctx.truncated = ctx.truncated or capped or stopped
         ctx.scope_searched = not (capped or stopped or cut)
         for node in read.values():

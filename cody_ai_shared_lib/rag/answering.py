@@ -2,6 +2,17 @@
 
 It also owns the two other ways a request ends: the clarifying question (§7.10) and the conversation state every
 answer hands back, so the state is updated in one place whichever entry point answered.
+
+Call tree of `AnswerFinalizer.finish()`, the normal ending of a request:
+
+    finish()
+    ├─ citation_extractor.extract()      read [n] markers out of the text, check each against the shown passages
+    ├─ quote_validator.verify()          check quoted words really occur in the cited passage (or compute_coverage)
+    ├─ sanitizer.sanitize()              strip fence markers, unsafe links and leaked internals
+    ├─ list_completeness()               was a list answer read in full, or did the prompt budget cut text?
+    ├─ next_state()                      the conversation state handed back to the app
+    ├─ run.trace.build()                 the inspectable trace
+    └─ complete()                        notify observers, write the one summary log line
 """
 from __future__ import annotations
 
@@ -36,7 +47,12 @@ logger = logging.getLogger("shared-rag")
 
 
 class AnswerFinalizer(Generic[MetaT]):
-    """Verifies citations, sanitizes the answer, updates state, and reports the outcome."""
+    """Verifies citations, sanitizes the answer, updates state, and reports the outcome.
+
+    It holds no per-request state, so one instance serves every request of an engine. The engine builds it
+    once; `query`, `stream_query`, `generate_from_nodes` and `query_batched` all end here, which is why an
+    answer looks the same whichever door it came through.
+    """
 
     def __init__(
         self,
@@ -69,7 +85,12 @@ class AnswerFinalizer(Generic[MetaT]):
         guards: Sequence[Guard],
         run: RequestRun,
     ) -> RAGResponse[MetaT]:
-        """Build the response for a completed generation (§10.5, §11)."""
+        """Build the response for a completed generation (§10.5, §11).
+
+        `raw_text` is what the model wrote; `visible_text` is that text with the hidden answer-found flag
+        removed; `flag` is the flag itself ("yes", "no", "partial" or None). Only passages that actually
+        fit in the prompt (`prompt.included_nodes`) can be cited: a model cannot cite what it never saw.
+        """
         nodes = prompt.included_nodes
         clean_text, citations = self.citation_extractor.extract(
             visible_text,
@@ -85,7 +106,8 @@ class AnswerFinalizer(Generic[MetaT]):
             coverage = compute_coverage(citations, clean_text, self.analyzer)
         final_answer = self.sanitizer.sanitize(clean_text, nodes=nodes, fence_id=prompt.fence_id)
 
-        # RAG-RES-4: a search that found nothing is "no"; on the no-retrieval route nothing was searched.
+        # What the answer-found flag finally says (RAG-RES-4): the engine's own knowledge beats the model's flag.
+        # A search that found nothing is "no" whatever the model claims; the no-retrieval route searched nothing, so None.
         no_retrieval = retrieval.intent is not None and retrieval.intent.route == "no_retrieval"
         no_data = not retrieval.nodes
         answer_found = None if no_retrieval else ("no" if no_data else flag)
@@ -93,9 +115,10 @@ class AnswerFinalizer(Generic[MetaT]):
         if completeness == "partial" and answer_found == "yes":
             answer_found = "partial"          # a list known to be missing items is not a plain "yes" (OI-4)
         if no_data:
-            citations = []
+            citations = []                    # nothing was retrieved, so any marker the model wrote cannot be real
         sources = self.deduplicated_sources(citations)
 
+        # The state the app stores and sends back next turn; it remembers only passages the model actually saw
         state = self.next_state(request.state, prompt.fence_id, retrieval.intent, prompt.included_nodes)
         answer_id = f"ans-{uuid.uuid4().hex[:12]}"
         degradations = run.degradations.degradations
@@ -121,6 +144,7 @@ class AnswerFinalizer(Generic[MetaT]):
             retrieved=retrieval,
             grounded=self._is_grounded(prompt, final_answer),
             answer_found=answer_found,
+            # abstained means "refused to answer from outside the sources", which only strict mode promises
             abstained=answer_found == "no" and prompt.grounding_mode == "strict",
             completeness=completeness,
             degraded=bool(degradations),
@@ -143,7 +167,12 @@ class AnswerFinalizer(Generic[MetaT]):
         prompt: AssembledPrompt[MetaT],
         run: RequestRun,
     ) -> RAGResponse[MetaT]:
-        """The clarifying question as the answer, shaped so it cannot be mistaken for one; no generation call (§7.10)."""
+        """The clarifying question as the answer, shaped so it cannot be mistaken for one; no generation call (§7.10).
+
+        Shape of the response: the question text in `answer` and `answer_final`; `answer_found=None` (never "no",
+        because a reader of "no" treats it as proof of absence); no citations or sources; `grounded=False`;
+        `abstained=False`; `completeness=None`; `clarification.asked=True`.
+        """
         found, previous = retrieval.clarification, request.state
         assert found is not None and previous is not None      # the engine asks only with both (RAGEngine._asks)
         clarification = found.model_copy(update={"asked": True})
@@ -181,7 +210,11 @@ class AnswerFinalizer(Generic[MetaT]):
         return "partial" if prompt_cut(retrieval.nodes, prompt) else retrieval.completeness
 
     def current_revisions(self, nodes: Sequence[Any]) -> dict[str, str] | None:
-        """One batched staleness lookup for nodes that carry a revision (§11.2)."""
+        """One batched staleness lookup for nodes that carry a revision (§11.2).
+
+        A citation is marked stale when the passage changed after it was retrieved. Returns None when the
+        store keeps no revisions or no node has one, so the caller skips the check without a store call.
+        """
         if not self.store.capabilities().supports_revisions:
             return None
         ids = [n.node_id for n in nodes if n.revision is not None]
@@ -195,6 +228,7 @@ class AnswerFinalizer(Generic[MetaT]):
 
     @staticmethod
     def deduplicated_sources(citations: list[RAGCitation]) -> list[RAGCitation]:
+        """One entry per cited passage, verified citations only: the "sources" list an app shows under an answer."""
         seen: set[str] = set()
         sources: list[RAGCitation] = []
         for citation in citations:
@@ -212,7 +246,11 @@ class AnswerFinalizer(Generic[MetaT]):
         *,
         asked: bool = False,
     ) -> ConversationState:
-        """The state to hand back: one more turn, the passages shown, and the never-ask-twice guard (§7.7, §7.10)."""
+        """The state to hand back: one more turn, the passages shown, and the never-ask-twice guard (§7.7, §7.10).
+
+        The app stores this and sends it with the next question; it is how a follow-up ("and the next week?")
+        knows what "it" refers to. It is copied, never edited in place, and pruned to a size limit at the end.
+        """
         state = previous.model_copy(deep=True) if previous is not None else ConversationState(fence_id=fence_id)
         state.fence_id = fence_id
         state.turn_count += 1
@@ -251,4 +289,5 @@ def prompt_cut(nodes: Sequence[RAGNode[Any]], prompt: AssembledPrompt[Any]) -> b
 
 
 def state_size(state: ConversationState) -> int:
+    """Size of the state as the app will store it, in bytes; recorded in the trace."""
     return len(state.model_dump_json().encode("utf-8"))
