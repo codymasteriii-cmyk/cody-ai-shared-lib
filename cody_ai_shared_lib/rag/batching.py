@@ -24,7 +24,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from .errors import NEVER_DEGRADABLE
+from .errors import NEVER_DEGRADABLE, DeadlineExceeded
 from .generation.flag_buffer import FlagStreamBuffer
 from .generation.stuff import GenerationContext
 from .granularity import FLAG_FULL_SCOPE, is_ranked
@@ -176,7 +176,7 @@ class BatchedListAnswerer:
         kept_ids = {node.node_id for batch in batches for node in batch}
         read_docs = {doc for doc, part in units if part and all(n.node_id in kept_ids for n in part)}
 
-        capped_by: Literal["documents", "batches", "time"] | None = None
+        capped_by: Literal["documents", "batches"] | None = None
         if capped_docs:
             capped_by = "documents"
         elif unread or over:
@@ -199,8 +199,6 @@ class BatchedListAnswerer:
 
         items = self._number([item for m in mapped for item in m.items])
         groups, merge_skipped = self._merge(items, len(batches), run, gen)
-        if merge_skipped and capped_by is None:
-            capped_by = "time"
 
         partial = bool(capped_by or failed)
         report = BatchReport(
@@ -210,6 +208,7 @@ class BatchedListAnswerer:
             batches_read=len([m for m in mapped if m.error is None]),
             batches_failed=failed,
             capped_by=capped_by,
+            merge_skipped=merge_skipped,
             items_dropped_unverified=sum(m.dropped_unverified for m in mapped),
         )
         whole = bool(doc_ids) and not partial and len(read_docs) == found
@@ -332,7 +331,17 @@ class BatchedListAnswerer:
         if batch_count <= 1 or len(items) <= 1:
             return own, False
         run.deadline.raise_if_cancelled("list_merge")
-        if run.degradations.skip_for_deadline(run.deadline, "list_merge", self.e.profile.runtime.stage_budgets.get("list_merge", 5.0)):
+        budget = self.e.profile.runtime.stage_budgets.get("list_merge", 5.0)
+        if not run.deadline.fits(budget):
+            if self.e.profile.fallbacks.get("deadline") == "raise":
+                raise DeadlineExceeded("Deadline leaves no time for the list merge", stage="list_merge")
+            # Nothing is missing: only de-duplication is skipped, so this is a degradation, not a partial answer
+            run.degradations.record(
+                dg_id="DG-10", stage="list_merge",
+                reason=f"{run.deadline.remaining_seconds():.1f}s left, the merge needs {budget:.1f}s",
+                fallback_used="skip_optional_stage",
+                impact="The list may contain duplicates: the merge was skipped to meet the deadline",
+            )
             return own, True
         e = self.e
         fence_id = e.fencer.generate_fence_id()

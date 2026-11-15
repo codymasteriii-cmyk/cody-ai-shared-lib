@@ -361,15 +361,25 @@ def test_a_cancelled_request_makes_no_model_call():
     assert llm.calls == []
 
 
-def test_when_time_runs_out_before_the_merge_the_items_are_combined_without_a_model():
+def test_a_merge_skipped_for_time_keeps_every_item_and_is_not_partial():
+    """No items are missing, only de-duplication was skipped: a degradation says so, the answer is not partial."""
     ticks = {"now": 0.0}
     clock = FrozenClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
     clock.monotonic = lambda: ticks["now"]
     llm = ListLLM(on_call=lambda is_merge: ticks.__setitem__("now", ticks["now"] + 100.0))   # each call "takes" 100 s of the 30 s deadline
     response = _ask(_batched(_store(_docs(3)), llm, clock=clock))
-    assert "merge" not in llm.calls and response.batches.capped_by == "time"
-    assert response.answer_found == "partial"
+    assert "merge" not in llm.calls
+    assert response.batches.merge_skipped is True and response.batches.capped_by is None
+    assert response.answer_found == "yes", "every item was found: a skipped merge is not a partial answer"
+    assert "may be incomplete" not in response.answer_final
     assert {c.node_id for c in response.citations} == {"d1-1", "d2-1", "d3-1"}
+    notes = [d for d in response.degradations if d.id == "DG-10" and "duplicates" in d.impact]
+    assert notes, "a degradation says the list may contain duplicates"
+
+
+def test_unread_documents_and_failed_batches_stay_partial_even_when_the_merge_runs():
+    response = _ask(_batched(_store(_docs(6)), ListLLM(), max_batches=2))
+    assert response.batches.merge_skipped is False and response.answer_found == "partial"
 
 
 def test_list_caps_must_be_at_least_one():

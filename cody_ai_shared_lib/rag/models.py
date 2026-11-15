@@ -434,7 +434,8 @@ class BatchReport(BaseModel):
     batches_planned: int = 0
     batches_read: int = 0
     batches_failed: list[int] = Field(default_factory=list)          # 0-based batch numbers
-    capped_by: Literal["documents", "batches", "time"] | None = None
+    capped_by: Literal["documents", "batches"] | None = None
+    merge_skipped: bool = False          # the deadline skipped the merge: items may repeat, none are missing (DG-10)
     items_dropped_unverified: int = 0
 
 
