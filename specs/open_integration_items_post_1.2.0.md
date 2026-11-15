@@ -10,6 +10,14 @@
 
 None of the three is a bug that loses data or breaks isolation. All three concern the surface the apps consume (stream events, stored quotes, profile fingerprints), so the apps are the right judges of the cost of changing them.
 
+## Update 2026-11-14: effect of RAG_SPEC 1.2.6
+
+1.2.6 records the text-rules design (§7.9, design only, nothing built). It does not change these three items, and the questions below still stand. It bears on them in three ways:
+
+1. **Item 1 has a stronger case.** In 1.2.6 the lib confirmed (KnowledgeBase K4) that the stream's `done` event carries the same flags as the buffered response. Item 1 is the same principle for coverage: a client reading the stream should not get less than one reading the final response. The additive option (keep the number, add `citation_coverage_detail`) fits that principle and breaks nothing.
+2. **Item 3's fix will cover every set-like profile field.** 1.2.6 adds profile settings that enter the fingerprint (the default strength and droppability of router-guessed names, and possibly lists of rule kinds). Whatever you answer, sorting and de-duplicating before hashing (option a) will apply to all such fields when they are built, not only `allowed_link_hosts`.
+3. **K5 (filtered recall, listed under "Not in this note") matters more for News.** 1.2.6 lets News filter names on the vector branch too. A strict filter on an HNSW index can return too few rows unless Postgres's iterative index scan is on, and too few rows triggers the widening step for several names (§7.9). The kit's filtered-recall check against real Supabase is what catches this, so News should run it once its RPC applies the rules.
+
 ## 1. The streamed `citations` event carries a bare coverage number
 
 - **Today:** the `citations` stream event has `"citation_coverage": 0.83` (`engine.py`, in `stream_query`). The non-streaming `RAGResponse.citation_coverage` is the full `CitationCoverage` object (`sentences_total`, `sentences_cited`, `ratio`, `uncited_sentences`, `total_citations`, `verified_citations`). The spec (§3.10) uses the object.
