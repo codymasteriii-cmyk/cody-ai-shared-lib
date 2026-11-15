@@ -177,7 +177,11 @@ class AnswerFinalizer(Generic[MetaT]):
         assert found is not None and previous is not None      # the engine asks only with both (RAGEngine._asks)
         clarification = found.model_copy(update={"asked": True})
         retrieval.clarification = clarification
-        question = question_text(clarification, request.question, self.profile.clarification.templates)
+        # The labels come from user-held state and document text, so the question is sanitized like an answer (1.2.18)
+        question = self.sanitizer.sanitize(
+            question_text(clarification, request.question, self.profile.clarification.templates),
+            nodes=retrieval.nodes, fence_id=prompt.fence_id,
+        )
         # Nothing was shown, so no passage is remembered; the guard is set so the next turn never asks again
         state = self.next_state(previous, prompt.fence_id, retrieval.intent, [], asked=True)
         degradations = run.degradations.degradations

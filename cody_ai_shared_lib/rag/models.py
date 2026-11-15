@@ -167,13 +167,20 @@ class TextRule(BaseModel):
 def merge_text_rules(current: list[TextRule], incoming: list[TextRule]) -> list[TextRule]:
     """Union by (kind, text). The same rule twice keeps the stricter strength; droppable only if both are.
 
-    So an app rule and a router rule about the same name become one rule, and the stricter wins.
+    So an app rule and a router rule about the same name become one rule, and the stricter wins. The grouping is
+    not a strictness question but a statement of what the app or caller asked for: when a router rule meets an
+    app or caller rule, the app's or caller's `group` and `origin` win (1.2.18). "Articles mentioning X or Y"
+    stays "any" even when the router also found X and Y in the question.
 
     >>> a = TextRule(text="Li Wei", strength="prefer", droppable=True)
     >>> b = TextRule(text="li  wei", strength="filter")
     >>> merged = merge_text_rules([a], [b])
     >>> len(merged), merged[0].strength, merged[0].droppable
     (1, 'filter', False)
+    >>> router = TextRule(text="Apple", group="auto", origin="router")
+    >>> caller = TextRule(text="Apple", group="any", origin="caller")
+    >>> [(r.group, r.origin) for r in merge_text_rules([router], [caller])]
+    [('any', 'caller')]
     """
     merged: dict[tuple[str, str], TextRule] = {rule.key: rule.model_copy(deep=True) for rule in current}
     for rule in incoming:
@@ -184,6 +191,8 @@ def merge_text_rules(current: list[TextRule], incoming: list[TextRule]) -> list[
         have.strength = "filter" if "filter" in (have.strength, rule.strength) else "prefer"
         have.droppable = have.droppable and rule.droppable
         have.alternatives = list(dict.fromkeys([*have.alternatives, *rule.alternatives]))
+        if have.origin == "router" and rule.origin != "router":
+            have.group, have.origin = rule.group, rule.origin      # what the app or caller stated beats a guess
     return list(merged.values())
 
 

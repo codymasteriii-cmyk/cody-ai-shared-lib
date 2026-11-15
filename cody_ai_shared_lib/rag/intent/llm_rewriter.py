@@ -351,6 +351,7 @@ class LLMIntentRouter:
                         # The model never sets rules itself: only `must_not`, checked against the question below.
                         # `rules` is for app routers and callers (§7.9, 1.2.16).
                         parsed.pop("rules", None)
+                        parsed.pop("router_source", None)     # the engine names the source, not the model (1.2.18)
                         intent = clamp_intent(parsed, degradation_tracker, self.intent_schema)
                         if not intent.search_query:
                             intent.search_query = query

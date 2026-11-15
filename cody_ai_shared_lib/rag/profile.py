@@ -70,7 +70,7 @@ class ClarificationConfig(BaseModel):
     """Asking the user to clarify (§7.10, OI-5). Off by default: nothing changes unless an app opts in."""
     model_config = {"frozen": True, "extra": "forbid"}
     mode: Literal["answer", "ask"] = "answer"          # "ask" needs the conversation state sent back each turn
-    max_options: int = Field(default=4, ge=1)
+    max_options: int = Field(default=4, ge=2)          # a question needs two options to be a choice (1.2.18)
     min_group_hits: int = Field(default=2, ge=1)       # passages a candidate needs to count (untuned)
     dominance: float = Field(default=0.7, gt=0.0, le=1.0)   # a candidate holding more of the grouped passages than this is not ambiguous (untuned)
     hedge_note: bool = False                           # tell the model to answer its best guess and say which, when a referent is unresolved

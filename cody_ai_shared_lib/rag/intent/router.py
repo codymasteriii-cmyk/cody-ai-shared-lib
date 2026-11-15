@@ -152,6 +152,25 @@ class HybridIntentRouter:
         self.llm_router = llm_router
         self.temporal_resolver = temporal_resolver
 
+    @staticmethod
+    def _jev_may_decide(
+        request: RAGQueryRequest, state: ConversationState | None, h_intent: QueryIntent | None, ctx: RouterContext
+    ) -> bool:
+        """Whether a Jev fast-path intent could describe this question without losing anything (§7.4, 1.2.18).
+
+        Jev returns only a route, a scope and the question as the search: no names, no exact terms, no list mark, no
+        follow-up or unclear-reference flags. So it may decide only a standalone question that needs none of them:
+          * no earlier turn (history, or a state that has turns): a follow-up needs the model's reading of the
+            conversation (`is_followup`, `unresolved_referent`, follow-up reuse, clarification);
+          * no heuristic cue (exact terms, a list cue): those would be lost;
+          * the profile does not filter on names (`text_rules.names="filter"`): only the model finds the names.
+        """
+        if request.history or (state is not None and state.turn_count > 0):
+            return False
+        if h_intent is not None:
+            return False
+        return ctx.profile.text_rules.names != "filter"
+
     def _jev_gate_usable(self, ctx: RouterContext) -> bool:
         """The Jev gate is optional work: off unless the profile enables it, and skipped when the deadline is short (DG-10)."""
         if not ctx.profile.router.enable_jev or self.jev_gate is None:
@@ -174,8 +193,9 @@ class HybridIntentRouter:
             if h_intent.route == "no_retrieval" or h_intent.scope == "document_overview":
                 return h_intent
 
-        # Layer 2: Jev System One fast path (if enabled in profile & constructed, AC-RAG-14)
-        if self._jev_gate_usable(ctx):
+        # Layer 2: Jev System One fast path (if enabled in profile & constructed, AC-RAG-14), only for questions
+        # whose intent it can fully describe (1.2.18)
+        if self._jev_may_decide(request, state, h_intent, ctx) and self._jev_gate_usable(ctx):
             j_intent = self.jev_gate.route(
                 query=request.question,
                 usage_tracker=ctx.usage_tracker,

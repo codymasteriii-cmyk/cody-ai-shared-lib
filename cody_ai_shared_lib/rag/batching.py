@@ -83,9 +83,9 @@ MAP_INSTRUCTION = (
 
 MERGE_SYSTEM = (
     "Merge these list items into one list. Each input line is `I<number>: <text>`. Reply with one line per output item, "
-    "written as `<ids> | <text>`, where <ids> are the comma-separated numbers of the input items it covers. "
-    "Combine items that name the same thing, keep every other item as it is, put them in a sensible order, and do not "
-    "add items or citation markers."
+    "written as `<ids> | <text>`, where <ids> are the comma-separated numbers of the input items it covers and <text> is "
+    "copied exactly from one of those items. Combine items that name the same thing, keep every other item as it is, put "
+    "them in a sensible order, and do not add items, words or citation markers."
 )
 
 _BULLET = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.*\S)\s*$")
@@ -169,6 +169,25 @@ def parse_merge(reply: str, item_ids: set[int]) -> list[tuple[list[int], str]]:
             used.update(ids)
             groups.append((ids, match.group(2).strip()))
     return groups
+
+
+def group_text(merged: str, item_texts: list[str]) -> str:
+    """The text shown for one merged group: the merge model's wording only if it is one of the group's own items.
+
+    The merge call only groups. Its reply is not checked against any passage, so wording it invented would be shown
+    with real citations; an item's text was checked by its map call. Compared case- and space-insensitively, else
+    the first item's text is used (1.2.18).
+
+    >>> group_text("Seedance 1.5", ["seedance  1.5", "Seedance-1.5"])
+    'Seedance 1.5'
+    >>> group_text("Seedance 1.5, the best model ever", ["Seedance 1.5", "Seedance-1.5"])
+    'Seedance 1.5'
+    """
+    def fold(text: str) -> str:
+        return " ".join(text.split()).casefold()
+    if any(fold(merged) == fold(text) for text in item_texts):
+        return merged
+    return item_texts[0]
 
 
 def pack_batches(nodes: list[RAGNode[Any]], budget_tokens: int) -> list[list[RAGNode[Any]]]:
@@ -470,7 +489,8 @@ class BatchedListAnswerer:
         numbering: dict[str, int] = {}
         carried: dict[str, RAGCitation] = {}
         lines: list[str] = []
-        for ids, text in groups:
+        for ids, merged_text in groups:
+            text = group_text(merged_text, [by_id[i].text for i in ids])
             node_ids: list[str] = []
             for i in ids:
                 for citation in by_id[i].citations:
@@ -503,7 +523,7 @@ class BatchedListAnswerer:
             nodes=nodes, intent=intent, strategy_used="query_batched",
             tier_decision_reason=f"query_batched: {report.documents_read} of {report.documents_found} documents, "
             f"{report.batches_read} batches", applied_filters=gathered.applied_filters,
-            truncated=bool(report.capped_by or report.batches_failed), completeness=completeness,
+            truncated=bool(report.capped_by or report.batches_failed or report.text_cut), completeness=completeness,
             degradations=run.degradations.degradations, usage=run.usage.stage_usages,
         )
         # The same state update as `query()`, so a follow-up question works after a list answer too

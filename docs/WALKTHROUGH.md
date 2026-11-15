@@ -13,7 +13,7 @@ The setting: a reading app. The user has one novel loaded. The novel has two cha
 | Step | What happens | Output (dummy) |
 |---|---|---|
 | `_begin()` | A request id and fresh trackers are made. Nothing is shared between requests. | `request_id="req-3f9a..."` |
-| `_resolve_intent()` | The router reads the question. | `QueryIntent(route="retrieve", scope="document", search_query="festival start date", is_followup=False)` |
+| `_resolve_intent()` | The router reads the question. | `QueryIntent(route="rag", scope="local_lookup", search_query="festival start date", is_followup=False)` |
 | `scoped_filters()` | Request filters, the document and the guards combine. A reader's boundary would hide text past their position here. | filters: `tenant u1`, `doc_ids ["novel-1"]` |
 | `_fetch()` | The strategy searches the store with the query. Say it returns 20 candidates. | 20 ranked passages |
 | post stages | Rerank, remove near-duplicates, drop weak matches, keep the top few. Guards run again after each. | 6 passages, best first |

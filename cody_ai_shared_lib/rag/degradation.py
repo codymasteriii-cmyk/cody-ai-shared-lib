@@ -129,6 +129,13 @@ AGREED_DEGRADATIONS: dict[str, dict[str, Any]] = {
         "log_level": logging.ERROR,
         "fallback": "continue_without_batch",
     },
+    "DG-16": {
+        "stage": "clarification",
+        "description": "The store lookup that confirms a clarification candidate failed",
+        "default": "on",
+        "log_level": logging.ERROR,
+        "fallback": "no_clarification_mark",
+    },
 }
 
 

@@ -40,6 +40,7 @@ from .context.conversation import ConversationManager, reusable_node_ids
 from .context.fence import ContextFencer
 from .degradation import DegradationTracker
 from .errors import (
+    NEVER_DEGRADABLE,
     EmbeddingProviderError,
     GenerationError,
     ProfileConfigError,
@@ -680,10 +681,21 @@ class RAGEngine(Generic[MetaT]):
             fetched = call_store("fetch_nodes", lambda: self.store.fetch_nodes(ids, filters))
             return apply_guards(fetched, guards, run.trace.record_guard_effect)
 
-        return find_clarification(
-            state=request.state, intent=intent, nodes=retrieval.nodes, prior=prior,
-            candidate_key=self.candidate_key, config=self.profile.clarification, prompt_text=self.renderer.prompt_text,
-        )
+        try:
+            return find_clarification(
+                state=request.state, intent=intent, nodes=retrieval.nodes, prior=prior,
+                candidate_key=self.candidate_key, config=self.profile.clarification, prompt_text=self.renderer.prompt_text,
+            )
+        except NEVER_DEGRADABLE:
+            raise
+        except RAGEngineError as exc:
+            # The mark is optional: a failed confirming lookup must not fail the answer (DG-16, 1.2.18). An app's own
+            # candidate_key error is not an engine error and still propagates.
+            run.degradations.record(
+                dg_id="DG-16", stage="clarification", reason=f"Clarification lookup failed: {exc}",
+                impact="No clarification mark this turn", error_type=type(exc).__name__,
+            )
+            return None
 
     def _asks(self, request: RAGQueryRequest, retrieval: RAGRetrievalResult[MetaT]) -> bool:
         """Ask instead of answering: opted in, an askable reason, never twice in a row, and only with a state sent back."""
