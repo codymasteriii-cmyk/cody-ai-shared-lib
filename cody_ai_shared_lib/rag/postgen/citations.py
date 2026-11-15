@@ -260,7 +260,6 @@ class CitationExtractor(Generic[MetaT]):
             document_id=node.span.doc_id,
             section_id=node.span.section_id,
             revision=node.revision,
-            quote=node.text[:200],
             span=span,
         )
         if not all(guard.verify_citation(citation) for guard in guards):

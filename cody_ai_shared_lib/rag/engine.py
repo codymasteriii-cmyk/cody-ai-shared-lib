@@ -49,6 +49,7 @@ from .intent.llm_rewriter import clamp_intent
 from .intent.router import IntentRouter, RouterContext
 from .intent.temporal import TemporalResolver
 from .models import (
+    CitationCoverage,
     IngestionProgress,
     FailedNode,
     MetaT,
@@ -792,6 +793,7 @@ class RAGEngine(Generic[MetaT]):
                     "citations": citations,
                     "sources": sources,
                     "citation_coverage": coverage.ratio if coverage else 1.0,
+                    "citation_coverage_detail": coverage.model_dump() if coverage else CitationCoverage().model_dump(),
                 },
             )
             yield RAGStreamEvent(

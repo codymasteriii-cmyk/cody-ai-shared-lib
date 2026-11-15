@@ -173,6 +173,16 @@ VALID_FALLBACK_VALUES: dict[str, set[str]] = {
 IMPLEMENTED_CITATION_POLICIES = {"filter"}
 
 
+# Fields whose order means nothing: sorted and de-duplicated before hashing (§12.1). The type stays list.
+_SET_LIKE_FIELDS = ("allowed_link_hosts",)
+
+
+def _canonical_sets(data: dict[str, Any]) -> None:
+    for name in _SET_LIKE_FIELDS:
+        if isinstance(data.get(name), list):
+            data[name] = sorted(set(data[name]))
+
+
 class EngineProfile(BaseModel):
     """Complete, immutable, fingerprinted engine profile configuration."""
     model_config = {"frozen": True, "extra": "forbid"}
@@ -202,7 +212,11 @@ class EngineProfile(BaseModel):
 
     def fingerprint(self) -> str:
         """Stable sha256 fingerprint of resolved configuration, independent of dict insertion order."""
-        dumped = json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        data = self.model_dump(mode="json")
+        _canonical_sets(data)
+        for override in data.get("variants", {}).values():
+            _canonical_sets(override)
+        dumped = json.dumps(data, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
 
     def with_overrides(self, **changes: Any) -> "EngineProfile":
