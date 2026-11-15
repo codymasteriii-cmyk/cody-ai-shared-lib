@@ -267,6 +267,10 @@ class ConversationState(BaseModel):
     rolling_summary: str | None = None
     turn_count: int = 0
     profile_fingerprint: str | None = None
+    # §7.10 (1.2.14), both optional: an older state without them works as before. State can travel through the
+    # browser, so the engine treats `recent_entities` as untrusted (capped, trimmed, confirmed against passages).
+    recent_entities: list[str] = Field(default_factory=list)
+    clarification_asked: bool = False
 
 
 # ── Citations (§3.8) ───────────────────────────────────────────────────────────
@@ -375,6 +379,9 @@ class QueryIntent(BaseModel, Generic[ExtT]):
     # The answer is an enumeration whose items the question does not name ("list every X mentioned"). A per-subject
     # question ("A, B and C: what does each do?") is not a list (§7.9, OI-4).
     wants_list: bool = False
+    # A pronoun or "that one" with no clear referent in the conversation (§7.10). The router's judgement alone never
+    # asks a question: the engine needs two candidates confirmed in visible passages.
+    unresolved_referent: bool = False
 
     suggested_top_k: int | None = None
     beyond_boundary_risk: float = 0.0
@@ -408,6 +415,21 @@ class RAGQueryRequest(BaseModel):
     trace_level: Literal["light", "verbose"] | None = None
     system_prompt_variables: dict[str, str] = Field(default_factory=dict)
     degradation_disclosure: Literal["silent", "note"] | None = None   # overrides the profile (§10.10)
+    clarify: Literal["answer", "ask"] | None = None                    # overrides profile.clarification.mode (§7.10)
+
+
+class ClarificationOption(BaseModel):
+    """One thing the user may have meant; the label comes only from passages inside the visible scope (§7.10)."""
+    label: str
+    key: str
+    node_ids: list[str] = Field(default_factory=list)
+
+
+class Clarification(BaseModel):
+    """The engine's suggestion that a question is unclear, and what the user may have meant (§7.10, OI-5)."""
+    reason: Literal["several_matches", "unresolved_referent", "too_broad"]
+    options: list[ClarificationOption] = Field(default_factory=list)
+    asked: bool = False                  # True: the engine asked instead of answering
 
 
 class RAGRetrievalResult(BaseModel, Generic[MetaT]):
@@ -422,6 +444,7 @@ class RAGRetrievalResult(BaseModel, Generic[MetaT]):
     truncated: bool = False
     # Only for a `wants_list` question: "whole_scope" when the whole visible scope was read, else "partial" (OI-4)
     completeness: Literal["whole_scope", "partial"] | None = None
+    clarification: Clarification | None = None      # §7.10: set in every mode; `asked` only when the engine asked
     degradations: list[Degradation] = Field(default_factory=list)
     usage: list[StageUsage] = Field(default_factory=list)
     trace: Any | None = None
@@ -454,6 +477,7 @@ class RAGResponse(BaseModel, Generic[MetaT]):
     degraded: bool = False
     citation_coverage: CitationCoverage | None = None
     batches: BatchReport | None = None             # set by query_batched only (OI-4)
+    clarification: Clarification | None = None     # §7.10 (OI-5)
     state: ConversationState = Field(default_factory=ConversationState)
     usage: list[StageUsage] = Field(default_factory=list)
     usage_total: UsageTotal = Field(default_factory=lambda: UsageTotal(stage="total"))
@@ -464,7 +488,7 @@ class RAGResponse(BaseModel, Generic[MetaT]):
 
 class RAGStreamEvent(BaseModel):
     """Standardized event emitted during streaming execution (§3.11, §10.8)."""
-    event: Literal["intent", "status", "retrieval", "delta", "citations", "degradation", "done", "error"]
+    event: Literal["intent", "status", "retrieval", "delta", "clarification", "citations", "degradation", "done", "error"]
     data: dict[str, Any]
 
 

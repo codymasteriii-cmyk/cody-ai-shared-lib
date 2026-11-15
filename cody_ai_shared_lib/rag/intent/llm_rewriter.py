@@ -41,12 +41,15 @@ Analyze the user's question and any conversation history. Return a JSON object w
   "exact_terms": ["<quoted or exact code phrases>", ...],
   "negation": false,
   "wants_list": false,
+  "unresolved_referent": false,
   "must_not": ["<a name or phrase the user explicitly excludes, exactly as written in the question>", ...],
   "suggested_top_k": 8
 }
 Fill "must_not" only for phrases the user explicitly asks to exclude ("not about X", "without X"); copy them as written.
 Set "wants_list" to true only when the answer is an enumeration whose items the question does not name ("list every
 model mentioned this year"). A question that names its subjects ("A, B and C: what does each do?") is not a list.
+Set "unresolved_referent" to true only when the question uses a pronoun or "that one" and the conversation does not make
+clear which of several people or things it means. Do not guess the referent.
 Use "require" only when the answer must come from passages that name the entity exactly; otherwise use "ignore".
 "search_query" covers the main part of the question. When the question has another part that needs different
 passages (a second subject to compare, or a second question such as "who is X and what is his job"), add one
@@ -180,6 +183,7 @@ def clamp_intent(
         exact_terms=exact_list,
         negation=bool(raw.get("negation", False)),
         wants_list=bool(raw.get("wants_list", False)),
+        unresolved_referent=bool(raw.get("unresolved_referent", False)),
         rules=rules,
         suggested_top_k=top_k,
         beyond_boundary_risk=risk,

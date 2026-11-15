@@ -33,6 +33,17 @@ class TextRulesConfig(BaseModel):
     prefer_boost: float = 2.0                            # a passage satisfying a `prefer` rule ranks as if its rank were divided by this; 1.0 turns it off (untuned)
 
 
+class ClarificationConfig(BaseModel):
+    """Asking the user to clarify (§7.10, OI-5). Off by default: nothing changes unless an app opts in."""
+    model_config = {"frozen": True, "extra": "forbid"}
+    mode: Literal["answer", "ask"] = "answer"          # "ask" needs the conversation state sent back each turn
+    max_options: int = Field(default=4, ge=1)
+    min_group_hits: int = Field(default=2, ge=1)       # passages a candidate needs to count (untuned)
+    dominance: float = Field(default=0.7, gt=0.0, le=1.0)   # a candidate holding more of the grouped passages than this is not ambiguous (untuned)
+    hedge_note: bool = False                           # tell the model to answer its best guess and say which, when a referent is unresolved
+    templates: dict[str, str] = Field(default_factory=dict)   # "en" / "zh" -> text with {options}; empty: built-in
+
+
 class RouterConfig(BaseModel):
     model_config = {"frozen": True, "extra": "forbid"}
     name: str = "auto"
@@ -210,6 +221,7 @@ class EngineProfile(BaseModel):
     models: ModelBindings
     router: RouterConfig = Field(default_factory=RouterConfig)
     text_rules: TextRulesConfig = Field(default_factory=TextRulesConfig)
+    clarification: ClarificationConfig = Field(default_factory=ClarificationConfig)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     transforms: list[str] = Field(default_factory=lambda: ["secondary_fanout"])
     post_stages: list[str] = Field(default_factory=list)

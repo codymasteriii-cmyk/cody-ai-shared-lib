@@ -19,6 +19,7 @@ from .models import (
 )
 from .ports import Guard, RAGStore, call_store
 from .postgen.citations import CitationExtractor
+from .clarification import remember_entities
 from .postgen.quotes import QuoteValidator, compute_coverage
 from .postgen.sanitizer import OutputSanitizer
 from .profile import EngineProfile
@@ -116,6 +117,7 @@ class AnswerFinalizer(Generic[MetaT]):
             completeness=completeness,
             degraded=bool(degradations),
             citation_coverage=coverage,
+            clarification=retrieval.clarification,
             state=state,
             usage=usage,
             usage_total=usage_total,
@@ -174,7 +176,9 @@ class AnswerFinalizer(Generic[MetaT]):
         state.fence_id = prompt.fence_id
         state.turn_count += 1
         state.profile_fingerprint = self.profile.fingerprint()
+        state.clarification_asked = False                 # the guard lasts one turn (§7.10)
         if intent is not None:
+            state.recent_entities = remember_entities(state.recent_entities, intent, prompt.included_nodes)
             state.last_intent = {"route": intent.route, "scope": intent.scope, "is_followup": intent.is_followup}
         state.prior_nodes.extend(
             NodeRef(node_id=node.node_id, revision=node.revision, turn=state.turn_count)

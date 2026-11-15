@@ -19,7 +19,8 @@ from ..pricing import get_model_pricing
 from .answering import AnswerFinalizer
 from .cache import Cache, InMemoryLRUCache
 from .context.assembler import AssembledPrompt, ContextAssembler
-from .context.conversation import ConversationManager
+from .clarification import find_clarification, hedge_note, may_ask, question_text
+from .context.conversation import ConversationManager, reusable_node_ids
 from .context.fence import ContextFencer
 from .degradation import DegradationTracker
 from .errors import (
@@ -50,6 +51,7 @@ from .intent.router import IntentRouter, RouterContext
 from .intent.temporal import TemporalResolver
 from .models import (
     CitationCoverage,
+    Clarification,
     IngestionProgress,
     FailedNode,
     MetaT,
@@ -161,6 +163,7 @@ class RAGEngine(Generic[MetaT]):
         variant_name: str | None = None,
         fencer: ContextFencer | None = None,
         filter_inferencer: Any = None,
+        candidate_key: Any = None,
     ):
         self.profile = profile
         self._variant_name = variant_name
@@ -257,6 +260,9 @@ class RAGEngine(Generic[MetaT]):
             self._deps, store, self._pool, self.cache, budget_guard, self._explicit_guards
         )
         self.filter_inferencer = filter_inferencer          # §5.5: narrow-only, app-supplied
+        # §7.10: node -> (key, label) | None. Only an app can tell referents apart (two characters both called
+        # Li Ming); without it several_matches and too_broad never fire, because different documents are not different meanings.
+        self.candidate_key = candidate_key
         self.pipeline.filter_inferencer = filter_inferencer
         self.router: IntentRouter = router or self.registry.get("router", profile.router.name)(self._deps)
         if router is None and profile.router.name == "auto" and not profile.models.intent:
@@ -376,6 +382,7 @@ class RAGEngine(Generic[MetaT]):
             variant_name=variant_name,
             fencer=self.fencer,
             filter_inferencer=self.filter_inferencer,
+            candidate_key=self.candidate_key,
         )
 
     def with_store(self, store: RAGStore[MetaT]) -> "RAGEngine[MetaT]":
@@ -402,6 +409,7 @@ class RAGEngine(Generic[MetaT]):
             variant_name=self._variant_name,
             fencer=self.fencer,
             filter_inferencer=self.filter_inferencer,
+            candidate_key=self.candidate_key,
         )
 
     def _variant_engine(self, name: str) -> "RAGEngine[MetaT]":
@@ -532,6 +540,7 @@ class RAGEngine(Generic[MetaT]):
             return prompt, retrieval, guards, "generation_no_retrieval"
 
         retrieval, guards = self.pipeline.run(request, intent, "query", run)
+        retrieval.clarification = self._clarification(request, intent, retrieval, guards, run)
         disclosure = request.degradation_disclosure or self.profile.generation.degradation_disclosure
         notes = (
             list(dict.fromkeys(d.impact for d in run.degradations.degradations if d.impact))
@@ -539,8 +548,114 @@ class RAGEngine(Generic[MetaT]):
         )
         if retrieval.completeness == "partial":
             notes = [*(notes or []), LIST_PARTIAL_NOTE]
+        if retrieval.clarification is not None and self._wants_hedge_note(request, retrieval):
+            notes = [*(notes or []), hedge_note(retrieval.clarification)]
         prompt = self.assembler.assemble_prompt(request, retrieval.nodes, state_fence, guards, service_notes=notes)
         return prompt, retrieval, guards, "generation"
+
+    @staticmethod
+    def _done_data(
+        response: RAGResponse[MetaT], run: RequestRun, request: RAGQueryRequest,
+        citations: list[dict[str, Any]], sources: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """The stream's `done` payload; one place, so an ask and an answer cannot drift apart."""
+        return {
+            "answer_id": response.answer_id,
+            "answer_final": response.answer_final,
+            "citations": citations,
+            "sources": sources,
+            "usage": [u.model_dump() for u in response.usage],
+            "usage_total": response.usage_total.model_dump(),
+            "degradations": [d.model_dump() for d in response.degradations],
+            "state": response.state.model_dump(),
+            "grounded": response.grounded,
+            "answer_found": response.answer_found,
+            "abstained": response.abstained,
+            "completeness": response.completeness,
+            "clarification": response.clarification.model_dump() if response.clarification else None,
+            "request_id": run.request_id,
+            "message_id": request.metadata.get("message_id"),
+        }
+
+    # ── Clarification (§7.10, OI-5) ───────────────────────────────────────
+
+    def _clarification(
+        self,
+        request: RAGQueryRequest,
+        intent: QueryIntent,
+        retrieval: RAGRetrievalResult[MetaT],
+        guards: list[Guard],
+        run: RequestRun,
+    ) -> Clarification | None:
+        """The engine's suggestion that this question is unclear, in every mode. No check without a reason."""
+
+        def prior() -> list[RAGNode[MetaT]]:
+            state = request.state
+            if not (state and state.prior_nodes and self.store.capabilities().supports_fetch_nodes):
+                return []
+            limits = self.profile.context
+            ids = reusable_node_ids(state, limits.reused_turns, limits.max_reused_nodes)
+            filters, _, _ = self.pipeline.scoped_filters(request, intent)
+            fetched = call_store("fetch_nodes", lambda: self.store.fetch_nodes(ids, filters))
+            return apply_guards(fetched, guards, run.trace.record_guard_effect)
+
+        return find_clarification(
+            state=request.state, intent=intent, nodes=retrieval.nodes, prior=prior,
+            candidate_key=self.candidate_key, config=self.profile.clarification, prompt_text=self.renderer.prompt_text,
+        )
+
+    def _asks(self, request: RAGQueryRequest, retrieval: RAGRetrievalResult[MetaT]) -> bool:
+        """Ask instead of answering: opted in, an askable reason, never twice in a row, and only with a state sent back."""
+        mode = request.clarify or self.profile.clarification.mode
+        return (
+            mode == "ask"
+            and may_ask(retrieval.clarification)
+            and request.state is not None
+            and not request.state.clarification_asked
+        )
+
+    def _wants_hedge_note(self, request: RAGQueryRequest, retrieval: RAGRetrievalResult[MetaT]) -> bool:
+        """Opt-in, or automatically the turn right after an ask, when the reference is still unresolved."""
+        c = retrieval.clarification
+        if c is None or c.reason != "unresolved_referent" or self._asks(request, retrieval):
+            return False
+        after_ask = request.state is not None and request.state.clarification_asked
+        return self.profile.clarification.hedge_note or after_ask
+
+    def _ask_response(
+        self, request: RAGQueryRequest, retrieval: RAGRetrievalResult[MetaT], prompt: AssembledPrompt[MetaT], run: RequestRun
+    ) -> RAGResponse[MetaT]:
+        """The question as the answer, shaped so it cannot be mistaken for one; no generation call was made."""
+        found, previous, intent = retrieval.clarification, request.state, retrieval.intent
+        assert found is not None and previous is not None and intent is not None      # _asks() guarantees all three
+        clarification = found.model_copy(update={"asked": True})
+        retrieval.clarification = clarification
+        question = question_text(clarification, request.question, self.profile.clarification.templates)
+        state = previous.model_copy(deep=True)
+        state.fence_id = prompt.fence_id
+        state.turn_count += 1
+        state.profile_fingerprint = self.profile.fingerprint()
+        state.clarification_asked = True
+        state.last_intent = {
+            "route": intent.route, "scope": intent.scope, "is_followup": intent.is_followup,
+        }
+        state = self.conversation_manager.prune_state(state)
+        degradations = run.degradations.degradations
+        usage, usage_total = run.usage.stage_usages, run.usage.total()
+        answer_id = f"ans-{uuid.uuid4().hex[:12]}"
+        trace = run.trace.build(
+            applied_filters=retrieval.applied_filters, degradations=degradations, usage=usage, usage_total=usage_total,
+            answer_id=answer_id, state_size_bytes=len(state.model_dump_json().encode("utf-8")),
+        )
+        response = RAGResponse[MetaT](
+            answer_id=answer_id, answer=question, answer_final=question, citations=[], sources=[], retrieved=retrieval,
+            grounded=False, answer_found=None, abstained=False, completeness=None, degraded=bool(degradations),
+            citation_coverage=None, clarification=clarification, state=state, usage=usage, usage_total=usage_total,
+            degradations=degradations, latency_ms=trace.total_latency_ms, trace=trace,
+        )
+        run.trace.dispatcher.notify_complete(trace, response)
+        self.finalizer._log_summary(run, response)
+        return response
 
     def _generation_context(self, request: RAGQueryRequest, run: RequestRun, stage: str) -> GenerationContext:
         return GenerationContext(
@@ -590,7 +705,8 @@ class RAGEngine(Generic[MetaT]):
         run = self._begin(request, cancel)
         try:
             resolved = self._resolve_intent(request, intent, run)
-            result, _ = self.pipeline.run(request, resolved, "retrieve", run)
+            result, guards = self.pipeline.run(request, resolved, "retrieve", run)
+            result.clarification = self._clarification(request, resolved, result, guards, run)
         except Exception as exc:
             self._fail(exc, run)
             raise
@@ -613,6 +729,8 @@ class RAGEngine(Generic[MetaT]):
         try:
             resolved = self._resolve_intent(request, intent, run)
             prompt, retrieval, guards, stage = self._prepare_generation(request, resolved, run)
+            if self._asks(request, retrieval):
+                return self._ask_response(request, retrieval, prompt, run)
             return self._generate_and_finish(request, prompt, retrieval, guards, stage, run)
         except Exception as exc:
             self._fail(exc, run, retrieval)
@@ -766,6 +884,22 @@ class RAGEngine(Generic[MetaT]):
                     },
                 )
 
+            if self._asks(request, retrieval):
+                # Opt-in ask: the question as a delta (a delta-only client shows it), then the structured event
+                response = self._ask_response(request, retrieval, prompt, run)
+                yield RAGStreamEvent(event="delta", data={"text": response.answer_final})
+                if response.clarification is not None:
+                    yield RAGStreamEvent(event="clarification", data=response.clarification.model_dump())
+                yield RAGStreamEvent(
+                    event="citations",
+                    data={
+                        "citations": [], "sources": [], "citation_coverage": 1.0,
+                        "citation_coverage_detail": CitationCoverage().model_dump(),
+                    },
+                )
+                yield RAGStreamEvent(event="done", data=self._done_data(response, run, request, [], []))
+                return
+
             yield RAGStreamEvent(event="status", data={"stage": "generating"})
             run.deadline.check("generation")
             started = run.trace.elapsed_ms()
@@ -821,25 +955,7 @@ class RAGEngine(Generic[MetaT]):
                     "citation_coverage_detail": coverage.model_dump() if coverage else CitationCoverage().model_dump(),
                 },
             )
-            yield RAGStreamEvent(
-                event="done",
-                data={
-                    "answer_id": response.answer_id,
-                    "answer_final": response.answer_final,
-                    "citations": citations,
-                    "sources": sources,
-                    "usage": [u.model_dump() for u in response.usage],
-                    "usage_total": response.usage_total.model_dump(),
-                    "degradations": [d.model_dump() for d in response.degradations],
-                    "state": response.state.model_dump(),
-                    "grounded": response.grounded,
-                    "answer_found": response.answer_found,
-                    "abstained": response.abstained,
-                    "completeness": response.completeness,
-                    "request_id": run.request_id,
-                    "message_id": request.metadata.get("message_id"),
-                },
-            )
+            yield RAGStreamEvent(event="done", data=self._done_data(response, run, request, citations, sources))
         except GeneratorExit:
             # Closing the model stream makes the gateway record the cancelled call (RAG-OPS-2)
             if chunks is not None:
