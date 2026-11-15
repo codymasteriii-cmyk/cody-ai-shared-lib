@@ -5,8 +5,8 @@
 | **To** | NewsIntelligence coding agent |
 | **From** | `cody-ai-shared-lib` agent, with the owner (Cody) |
 | **Date** | 2026-11-13 |
-| **Lib version** | `RAG_SPEC.md` 1.2.5-draft, `main` |
-| **Status** | Informational. Nothing here needs a reply, except that the three open items in `open_integration_items_post_1.2.0.md` still wait for your answers. |
+| **Lib version** | `RAG_SPEC.md` 1.2.7-draft, `main` (updated 2026-11-14: §2.13 added; open items decided) |
+| **Status** | Informational. Nothing here needs a reply. The three open integration items are decided (spec §18, OI-6). |
 
 AudioReading integrated first and is in production. Every item below cost Audio a debugging session or a review round. They are listed so News does not repeat them. Spec sections are given so you can read the rule, not only the advice.
 
@@ -24,7 +24,7 @@ No. Everything §16.2 lists for phase P3 is built and tested:
 
 Not built, and not needed for News: the citation coverage policy and repair (phase P4), the engine-made rolling summary (§10.2, later), and the evaluation system (Q-06, after P4).
 
-What News builds itself (§12.4): the store adapter, the renderer, the router extension for `analytics`, and the chat and feed routes.
+What News builds itself (§12.4): the store adapter, the renderer, any router extension (for example `depth_intent`), and the chat and feed routes. Counting questions stay app-owned; News has no analytics service today.
 
 ## 2. The mistakes that actually happened, and the rule for each
 
@@ -97,15 +97,15 @@ The 1.0 code returned empty results where it failed. The engine now raises. Spec
 - Stream events end with `done` (it carries `usage`, `usage_total`, `abstained`, the full `citations` and `sources`). A failed or cancelled stream emits an `error` event and then raises.
 - To stop a request when the client disconnects: create a `CancelToken` (from `cody_ai_shared_lib.rag`) and pass it as `cancel=` to `route`, `retrieve`, `query`, `stream_query` or `generate_from_nodes`. Call `token.cancel("client left")` from any thread. The engine raises `RequestCancelled`, logged at INFO and never degraded.
 - It stops the request **between steps**, not inside a provider call already in flight. Do not promise instant stop in the UI.
-- The stream's `citations` event carries `citation_coverage` as a bare number today. That is open item 1 in the other note. Do not build a UI that depends on its shape until you reply.
+- The stream's `citations` event carries `citation_coverage` as a bare number. Decided (OI-6, not built): a `citation_coverage_detail` object is added next to it; the number stays.
 
 ### 2.10 Citations and prompt safety (§10.9, §11, RAG-SEC)
 
 - Markers `[1]`, `[2]` are the **position in the list of passages sent for that turn**, not ids. The engine keeps `turn_map` (marker to node id) and verifies each marker against the nodes in this turn's fence. Unverified markers are removed, so the text the user sees only contains markers that map to a source.
 - Persist `answer_id`, node ids, intent and profile version from the response if you want feedback or thumbs up (R-08). Feedback storage stays in News.
 - The fence has a per-engine secret. `engine.with_store()` siblings share it. Do not strip or re-wrap the context text.
-- Link sanitization is on. `allowed_link_hosts` decides which hosts survive in answers. Set it from a fixed list (open item 3 asks how you set it).
-- `citation.quote` is currently pre-filled with the first 200 characters of the source when the model quoted nothing (open item 2). Treat it as an excerpt, not the model's words, until that is decided.
+- Link sanitization is on. With `allowed_link_hosts` empty, only the retrieved sources' own hosts are trusted (subdomains included); any other link keeps its text and loses its URL, any other image becomes its alt text (§11.6). Set the list from a fixed literal.
+- `citation.quote` is currently pre-filled with the first 200 characters of the source when the model quoted nothing. Decided (OI-6, not built): it becomes `None` unless the answer quoted something. Do not display or store it as the model's words.
 
 ### 2.11 Chat history and state (§7.7, §10.2)
 
@@ -119,14 +119,22 @@ The 1.0 code returned empty results where it failed. The engine now raises. Spec
 - All apps install `@main` (Q-02). The lib owner coordinates changes. Record the lib commit SHA you tested against in your own notes, and run the kit in News's CI on every upgrade.
 - On a 512 MB host: `import cody_ai_shared_lib.rag` needs no optional extra. The engine runs a small bounded thread pool for concurrency (D-19). Do not add parallel work around it.
 
+### 2.13 Names and exact phrases are not enforced for News yet (§7.9, OI-2)
+
+- **Today** a name the router marks as required (`entity_mode="require"`) and an exact phrase (`exact_terms`) reach only stores that use engine-cut word groups (`uses_analyzer_tokens=True`). News uses Postgres English search, so its store never receives them and nothing enforces them.
+- **Agreed design, not built:** spec 1.2.6 §7.9 records the rule record you reviewed in the feature-boundaries round. Rules are delivered to every store; your RPC applies them with `p_must_contain` / `p_must_not` on both branches; your profile sets router-guessed names to `filter`, non-droppable. If the owner schedules it before your adapter, add the rule arrays in the same RPC migration as `p_user_id` and the score columns.
+- **Until then**, enforce a name with today's code: call `engine.route(request)`, put a filter your store declares in `request.filters.custom` (for example `supported_custom_filters={"must_contain": list}` and `{"must_contain": ["Bill Gates"]}`), then call `engine.query(request, intent=intent)`. Such a filter is a hard filter: it applies to every search of the request and is never relaxed.
+- **Use the interim filter for a single name only.** Because it applies to every search of the request alike, a multi-name or comparison question would require all names in every search, which is the failure §7.9 fixes. If your adapter accepts a list, define it as "at least one of these", and wait for the rule record for multi-name questions.
+- **Filtered recall (K5).** Once your RPC filters names on the vector branch, run the kit's filtered-recall check against real Supabase in a throwaway schema, with the iterative index scan set, off-peak (the project is shared with AudioReading). Too few rows from a strict filter on an HNSW index would trigger the several-names widening (§7.9).
+
 ## 3. A suggested order of work
 
 1. Build `PulseRenderer` (extend `DefaultRenderer`), run `renderer_problems`.
 2. Write `PulseArchiveRAGStore` with the capabilities above and run the kit against a real Supabase project. Fix the RPCs the kit reports, owner filter first.
-3. Add the engine at startup with `news_intelligence()` and the `news_chat` variant. Map `RAGEngineError` subclasses in the chat route. Keep the `analytics` branch in the app (`engine.route(req)` then `engine.query(req, intent=intent)`).
+3. Add the engine at startup with `news_intelligence()` and the `news_chat` variant. Map `RAGEngineError` subclasses in the chat route. If you add an analytics or name-filter branch, use the two-call pattern (`engine.route(req)`, then `engine.query(req, intent=intent)`); counting questions stay app-owned (§7.9).
 4. Move feed search to `retrieve()` with `news_search` and the 2,001 `max_top_k`.
 5. Run old and new retrieval side by side with `diff_retrievals` in a background job before switching traffic.
-6. Answer the three open items in `open_integration_items_post_1.2.0.md`.
+6. Track the decided surface changes (spec §18, OI-6): `citation_coverage_detail`, `quote` as `None` unless quoted, canonical profile fingerprints.
 
 ## 4. What we would like back
 

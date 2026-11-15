@@ -2,7 +2,7 @@
 
 | | |
 | :--- | :--- |
-| **Document Version** | 1.2.6-draft |
+| **Document Version** | 1.2.7-draft |
 | **Status** | Draft, design agreed. Sibling feedback (AUD-01..26, NF-01..40, KB-01..23) was consolidated into C-01..C-39 and folded in; owner decisions Q-01..Q-08, the failure model and the pushbacks (Appendix C) are settled, and all three app agents (AudioReading, NewsIntelligence, KnowledgeBase) agreed through 1.1.8. Version 1.1.14 changes parts of that agreed contract after the Phase 1–3 review (Appendix B). Version 1.2.0 adds the changes agreed with AudioReading after its first integration (INT-01..INT-09); they are additive. This file records the outcome and its reasoning; the exchange itself was removed after agreement and remains in git history (commit `37d76fd`). This file is the only record of the design and its reasoning; the round's working files were removed on 2026-11-08. |
 | **Package Namespace** | `cody_ai_shared_lib.rag` (`cody-ai-shared-lib >= 0.8.0`) |
 | **Target Runtime** | Python 3.13+ (1.2.0: the owner's floor for all projects; the models use PEP 696 `TypeVar` defaults), synchronous core (matching the rest of `cody_ai_shared_lib`) with a bounded thread pool for independent calls |
@@ -514,7 +514,7 @@ class RAGCitation(BaseModel):
     span: SourceSpan                  # snapped to the retrieved node (§11.2)
     revision: str | None = None
     label: str                        # renderer.citation_label(node)
-    quote: str | None = None
+    quote: str | None = None          # today: the first 200 chars of the source until verification; decided 1.2.7 (not built): None unless the answer quoted something
     verified: bool = True
     verification_score: float = 1.0   # 1.0 exact; SequenceMatcher ratio for quotes
     stale: bool = False               # node.revision != store's current revision
@@ -867,6 +867,7 @@ The kit also ships:
 > **Rationale:**
 > - All three apps asked for a conformance kit independently (AUD-17, NF-35, KB-08). It is what makes "a thin adapter per app" safe without the lib owning any SQL (D-01).
 > - Filtered recall is a real pgvector/HNSW trap: post-filtering an approximate index can return fewer than `k` rows for one small book. Only a test catches it (AUD-04).
+> - **Who runs it against real Postgres (1.2.7).** It only means something on a real approximate index. AudioReading has none by design (every search is limited to one article and sorted exactly), so the check does not apply to it. NewsIntelligence and KnowledgeBase will run it against real Postgres in a throwaway schema, with the iterative index scan set, before turning on name filters on the vector branch (§7.9) or their retrieval tiers. Audio and News share one Supabase project, so such runs go off-peak.
 > - Remedies for a failing check are the adapter's choice: an exact scan when `doc_id` is fixed, iterative index scans, or partitioning.
 > - Audio's self-declared "recall verified" flag was replaced by this test (R-02).
 
@@ -1411,7 +1412,7 @@ class ConversationState(BaseModel):
   - State fields are validated and capped.
   - A tampered state can make an answer worse but cannot widen scope: every id is re-fetched under current filters and guards, and the fence id is re-checked against content.
   - **No signing is required** (D-08).
-- If `profile_fingerprint` differs from the current profile, prior nodes are still reused, but `last_intent` is ignored.
+- **`profile_fingerprint` and `last_intent` are stored, not read (corrected 1.2.7).** The engine writes both into the state after each answer, but nothing reads either today: prior nodes are reused whatever the fingerprint, and `last_intent` has no effect. (Earlier text said `last_intent` is ignored when the fingerprint differs; that described nothing.) Apps store states across upgrades (AudioReading keeps one per thread), so **if the engine ever starts comparing the fingerprint, it is announced first**, and a state from an older profile or lib version never causes an error; at most it is not reused.
 - `rolling_summary` **[later]**: the engine does not produce one yet (§10.2). An app may put a summary of its own in the state; the engine includes it as history, trimmed to `rolling_summary_max_tokens`. When it is built, it will be generated through `ModelBindings.summary` when the history zone overflows, and fenced as history.
 
 > **Rationale:**
@@ -1899,11 +1900,12 @@ class GenerationStrategy(Protocol):
 | `status` | at stage starts (optional) | `{"stage": "retrieving" \| "reranking" \| "generating" ...}` |
 | `retrieval` | after guard enforcement | node refs (`nodes`), their citation `labels`, `node_count`, `strategy_used`, `applied_filters` |
 | `delta` | per model chunk | `{"text": "..."}`, raw text (markers included, flag withheld) |
-| `citations` | after the full text is verified | verified `citations`, `sources`, `citation_coverage` (the ratio, a number; the full `CitationCoverage` is in `RAGResponse`) |
+| `citations` | after the full text is verified | verified `citations`, `sources`, `citation_coverage` (the ratio, a number; the full `CitationCoverage` is in `RAGResponse`). Decided 1.2.7, not built: an added `citation_coverage_detail` with the full object; the number stays |
 | `degradation` | immediately when an agreed degradation fires | the `Degradation` record; pre-generation ones arrive before the first `delta`, so a UI can show a notice |
 | `done` | last | `answer_id`, `answer_final`, the full `citations` and `sources` lists (same as the `citations` event), `usage`, `usage_total`, `degradations`, `state`, `grounded`, `answer_found`, `abstained`, `request_id`, `message_id` if supplied |
 | `error` | when the engine raises | `{"type": ..., "stage": ..., "message": ..., "request_id": ..., "usage": [...], "usage_total": {...}}` (no stack traces; usage of the calls already made, RAG-OPS-1); the iterator then raises the same exception. That exception is for the caller's logging and control flow; the route MUST NOT send a second error to the client |
 
+- **Stable field names (1.2.7).** Apps read these by name, so they are not renamed or removed without a versioned announcement. AudioReading reads, per citation in `citations`: `marker`, `index`, `span.section_seq`, `span.char_start`, `span.char_end`; and from `done`: `answer_final`, `grounded`, `answer_found`, `state`, `usage_total`. New fields are added alongside, never in place of these.
 - **Verification happens at end of stream.** Deltas carry raw text. A UI that needs clean text uses `answer_final` from `done`, or `strip_markers(text, formatter)` while streaming.
 - **Cancel-safe.** Closing the iterator (`GeneratorExit`) stops all further model and store calls and releases pool threads. Observers still receive `on_complete(trace, None)` for the cancelled request (RAG-EVAL-8).
 - **Cancelling from another thread (1.2.4).** Closing works only for a consumer that is between events. Before the first event the engine runs routing and retrieval inside one blocking step, and a generator cannot be closed from another thread while it runs. A caller that needs to stop a request at any moment passes a `CancelToken` (`engine.stream_query(request, cancel=token)`) and calls `token.cancel(reason)` from any thread. The request then ends at its next checkpoint (§13.4): the stream yields a final `error` event with `type="RequestCancelled"`, the spend so far in `usage` and `usage_total`, and then raises `RequestCancelled`. No `done` event is sent, so there is no answer to save. A model call already in flight is closed and recorded as cancelled when it is a stream; a blocking call (router, embedding, buffered generation) finishes first.
@@ -2012,7 +2014,7 @@ KB may register its own `[page§entry, vN]` formatter. The trade-off (model-visi
 
 ### 11.6 Output sanitizer (RAG-SEC-6) **[v1]**
 Default last stage. It:
-1. Neutralizes Markdown images and links whose URL host is not among the retrieved sources' URLs (taken from the renderer's metadata) or `profile.allowed_link_hosts`. The link text is kept and the URL is dropped. Reference-style definitions (`[1]: https://…`, which turn `![x][1]` into a remote image) and autolinks (`<https://…>`) to untrusted hosts are removed too (1.2.0).
+1. Neutralizes Markdown images and links whose URL host is not among the retrieved sources' URLs (taken from the renderer's metadata) or `profile.allowed_link_hosts`. The link text is kept and the URL is dropped; an untrusted image becomes its alt text. **With an empty `allowed_link_hosts` (the default), only the retrieved sources' own hosts are trusted**, subdomains included; it is neither "strip all" nor "allow all". Plain-text URLs are not touched. Reference-style definitions (`[1]: https://…`, which turn `![x][1]` into a remote image) and autolinks (`<https://…>`) to untrusted hosts are removed too (1.2.0).
 2. Removes the fence id, the `[[answer_found=…]]` flag and any fence-like tag from `answer_final`.
 
 > **Rationale:**
@@ -2059,7 +2061,7 @@ class EngineProfile(BaseModel):
     runtime: "RuntimeConfig"         # deadline_seconds, stage budgets, pool_size
     cache: "CacheConfig"
     trace_level: Literal["light", "verbose"] = "light"
-    allowed_link_hosts: list[str] = []            # hosts are compared case-insensitively; order is irrelevant
+    allowed_link_hosts: list[str] = []            # hosts are compared case-insensitively; order is irrelevant; empty = only the retrieved sources' hosts (§11.6)
     injection_scanner: str | None = None
     variants: dict[str, dict] = {}   # named overrides, e.g. {"search": {...}}
 
@@ -2074,6 +2076,7 @@ class EngineProfile(BaseModel):
 - `validate()` lists **every** problem at once: missing bindings for enabled stages, unknown component names, threshold/score-kind mismatches, a zone ratio sum above 1, and a Tier 0 gate that does not fit: `full_context_max_tokens` plus the reserved instruction, history and question zones must not exceed `max_context_tokens` (the question reserve is counted since 1.2.0).
 - **Model lists.** Each binding is an ordered list. Its models may come from the same provider (for example two Gemini models when an app has only a Gemini key). A one-model list is valid; the backup-model degradation (DG-02) then does not apply, and a failure after retries raises.
 - `fingerprint()` and `version` are recorded in every trace. The fingerprint hashes the profile with sorted keys, so it does not depend on dict insertion order (1.2.0).
+- **Set-like fields are canonical (decided 1.2.7, not built).** A field whose order carries no meaning (`allowed_link_hosts` today, and the set-like settings §7.9 adds) is sorted and de-duplicated before hashing, so the same hosts in another order give the same fingerprint. The field type stays `list`.
 - **Validation (1.2.0)** also rejects: a `fallbacks` value the row does not accept (`rerank`: `raise`/`keep_order`; `summarizer`: `raise`/`skip`; `query_embedding`: `raise`/`keyword`; `jev`, `cache`, `deadline`: `raise`); a `citations.policy` other than `filter`, and a non-zero `min_citation_coverage`, until §11.4 is built; and a store whose embedding dimensions differ from the model's (RAG-ING-7). Router `auto` without `models.intent` is valid but logs a startup WARNING that routing is heuristic-only. Named variants (`news_chat`, `news_search`) share one base and differ only in their override block.
 - **Sibling engines.** `engine.with_profile(profile)` and `engine.with_store(store)` (1.2.0) return engines that share the pool, cache, gateway, registry, observers and guards, and differ only in the profile or the store. They also share the fence secret, so stateless fence ids, and with them the cacheable prompt prefix, stay the same across siblings (D-06). `with_store` is how an app serves each request from a store scoped to the signed-in user (§5.6) without building a pool per request.
 
@@ -2836,6 +2839,7 @@ Each entry: the decision, the alternative rejected, and why. Sections refer here
 | **OI-3** | Relaxation counts summaries and windows | §7.6 | **Agreed to-do:** count ranked passages only |
 | **OI-4** | Lists and new question shapes | §7.9 | **Later:** a "complete list" mark with find-then-read-whole for chunked documents; batch-then-merge across documents; timeline and "what changed" shapes. Waits for an app that needs them |
 | **OI-5** | Asking the user to clarify | §7.9 | **Later:** engine notices and suggests, app decides and asks; options only from the visible scope. All apps would use "answer anyway" |
+| **OI-6** | Three surface changes agreed with all apps (2026-11-14) | §10.8, §3.8, §12.1, §11.6 | **Decided, not built:** (1) add `citation_coverage_detail` to the `citations` event, keeping the number; (2) `RAGCitation.quote` is `None` unless the answer quoted something (no app reads it today); (3) sort and de-duplicate set-like profile fields before fingerprinting. None blocks an app; cheaper before KB's P4 |
 | **Pushbacks** | Requests kept in the apps | Appendix C | **Decided by the owner:** all upheld; sent to the app agents for agreement |
 
 ---
@@ -2911,6 +2915,7 @@ Each entry: the decision, the alternative rejected, and why. Sections refer here
 | **1.2.4-draft** | 2026-11-12 | cody-ai-shared-lib agent | **Cancel token** (AudioReading integration test). A caller could stop generation by closing the stream, but not while the engine was routing or retrieving, because a generator cannot be closed from another thread while it runs. New `CancelToken` and `RequestCancelled`; `route`, `retrieve`, `query`, `stream_query` and `generate_from_nodes` take an optional keyword-only `cancel` (§10.8, §13.4, error tree). AC-RAG-113. Additive: calls without `cancel` behave as before. Granularity is the engine's stage boundaries, not a provider call in flight. |
 | **1.2.5-draft** | 2026-11-13 | cody-ai-shared-lib agent | **Pre-production review fixes.** (1) `TenantGuard` and `ScopeGuard` read metadata with `getattr(...) or extra.get(...)`, so a present `False`, `0` or `""` was taken as a missing field and the node was kept against a filter it did not match (affects `generate_from_nodes` and any store that misses a filter); only `None` now means missing (§5.1). (2) `TemporalGuard` treated a date stored as an ISO string or a `date` as no date, so a caller date range dropped every such node; it now parses them, as `DefaultRenderer.timestamp` already did. (3) A failed Jev call is recorded with `billing="unknown"` (RAG-OPS-1). (4) Spec text: the `done` event lists `usage_total` and `abstained`, and `GenerationError` lists the `"other"` reason, as the code already sent. AC-RAG-114. |
 | **1.2.6-draft** | 2026-11-14 | cody-ai-shared-lib agent | **Design record, nothing built: text rules** (feature-boundaries round with all three apps and the owner; working notes `rag_feature_boundaries_proposal.md`, `closing_feature_boundaries.md` and the six app replies).New §7.9: a rule record (`must_mention`, `exact`, `must_not`; alternatives; `group` auto/all/any; `strength` filter/prefer; `droppable`; origin) delivered to every store, not only analyzer-token stores. `filter` constrains every ranked passage on every leg; `prefer` never excludes. Defaults: router-guessed names `prefer` and droppable (News overrides to `filter`, non-droppable), exact codes and app or caller rules `filter`. Several names follow AudioReading's measured A1 rule (names in each search's own text, widen to any-of when that store call returns fewer than the effective `top_k`, narrow results first). Script-aware default text check, over-fetch when the engine post-filters, kit checks aware of the store's word matching. Recorded: counting stays app-owned (News has no analytics service yet; §12.4 note), lists and shapes later, flags are information, clarification later. Open items OI-2 to OI-5. |
+| **1.2.7-draft** | 2026-11-14 | cody-ai-shared-lib agent | **Design record, nothing built: the open integration items after 1.2.0**, answered by all three apps (working notes `open_integration_items_post_1.2.0.md` and three app replies, removed after agreement; see git history). OI-6: additive `citation_coverage_detail` on the `citations` event; `quote` is `None` unless quoted; set-like profile fields canonical before fingerprinting. Recorded: the sanitizer's empty-list behaviour (only the sources' own hosts; §11.6); AudioReading's stream field names as stable (§10.8); filtered recall does not apply to AudioReading by design (§4.6). **Spec correction:** `profile_fingerprint` and `last_intent` are written into the state but never read; §7.7 claimed `last_intent` was ignored on a fingerprint change. A future comparison is announced first, and an old stored state never errors. |
 
 ## Appendix C. Requests kept in the apps (pushbacks)
 
