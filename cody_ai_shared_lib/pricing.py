@@ -4,6 +4,16 @@ Centralizes per-model pricing across text, embedding, decision, rerank,
 image, voice, and video modalities. Model modules (llm.py, embedding.py,
 jev.py, rerank.py, image_gen.py, video_gen.py) call compute_cost() to
 compute real dollar spend without hardcoding vendor prices locally.
+
+How a cost is worked out (`compute_cost`): find the model's price (an override first, then the catalog); then, per kind of model,
+    text / voice   (input tokens not cached x input price) + (cached tokens x cached price) + (output tokens x output price)
+    image          tokens x token prices + images x price per image
+    video          tokens x token prices + prompt images x image price + seconds x price per second
+Prices are per million tokens. The result is rounded to six decimals, or None when the model has no price. A cached token costs
+25% of the input price unless the table says otherwise.
+
+`PRICE_TABLE_VERSION` is recorded with every cost, so a number in a report can always be traced to the table that produced it.
+An app can override a price at runtime (`set_price_override`), for example from its own settings.
 """
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Union
@@ -128,7 +138,10 @@ def get_price_table_version() -> str:
 def get_model_pricing(model: str) -> Optional[ModelPricingType]:
     """Retrieve pricing structure for a model, checking overrides first then catalog.
 
-    Supports exact match first, then normalized model name (stripped of common provider prefixes).
+    Supports exact match first, then a case-insensitive match against the catalog names.
+
+    >>> get_model_pricing("JEV") == get_model_pricing("jev"), get_model_pricing("no-such-model")
+    (True, None)
     """
     if model in _PRICE_OVERRIDES:
         return _PRICE_OVERRIDES[model]
@@ -160,6 +173,13 @@ def compute_cost(
     Accepts either a usage object/dict as positional second argument, or explicit keyword args.
     Returns:
         float cost in USD (rounded to 6 decimal places), or None if the model is unpriced.
+
+    >>> compute_cost("gemini-embedding-2", input_tokens=1_000_000)
+    0.2
+    >>> compute_cost("claude-opus-5-5", input_tokens=1_000_000, cached_tokens=1_000_000)       # all of it read from the cache
+    1.0
+    >>> compute_cost("no-such-model", input_tokens=10) is None
+    True
     """
     pricing = get_model_pricing(model)
     if pricing is None:
@@ -217,7 +237,13 @@ def estimate_cost(
     images: int = 0,
     seconds: float = 0.0,
 ) -> Optional[float]:
-    """Estimate dollar cost before making a call to allow pre-call budget checks."""
+    """Estimate dollar cost before making a call to allow pre-call budget checks.
+
+    The same arithmetic as `compute_cost`, on the caller's estimate of the call's size. A BudgetGuard receives this before the call.
+
+    >>> estimate_cost("gemini-embedding-2", est_input_tokens=500_000)
+    0.1
+    """
     pricing = get_model_pricing(model)
     if pricing is None:
         return None

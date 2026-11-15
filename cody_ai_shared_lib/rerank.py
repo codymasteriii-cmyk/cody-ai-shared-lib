@@ -2,6 +2,11 @@
 
 Calls the Jina Rerank API (https://api.jina.ai/v1/rerank).
 Tracks token counts and computes USD cost using cody_ai_shared_lib.pricing ($0.05 / 1M tokens).
+
+A reranker reads the question and each candidate passage together and scores how well the passage answers the question: slower
+and more accurate than the first search, so it is used on a short list. The RAG engine calls this through `rag/gateway.py` and
+`rag/postretrieval/rerank.py`, which add the budget guard and the fallback to the original order. The client itself is only the
+HTTP call: one retry, a short timeout (4 s, because a reranker is optional work), and cost accounting.
 """
 from __future__ import annotations
 
@@ -45,7 +50,11 @@ class RerankResult:
 
 
 class RerankClient:
-    """Client for Jina Cross-Encoder Rerank API with retries and cost tracking."""
+    """Client for Jina Cross-Encoder Rerank API with retries and cost tracking.
+
+    The API key is read from `JINA_API_KEY` at call time unless given to the constructor, so the client can be built before the
+    environment is set.
+    """
 
     def __init__(
         self,

@@ -350,3 +350,46 @@ class TestMyStore(RAGStoreContractTests)       the app's own test file
 ```
 
 `BrokenStore` has known defects and must fail the kit; if it ever passed, a check would have gone blind. `InMemoryRAGStore` is the reference store that passes all of it.
+
+---
+
+## 18. The older top-level modules (`cody_ai_shared_lib/*.py`, outside `rag/`)
+
+These are used by the apps directly and by the RAG engine underneath. Paths are relative to `cody_ai_shared_lib/`.
+
+### Fetching an article (fetcher.py, url_validator.py, pdf_text.py)
+
+```
+fetch_article()
+├─ normalize_url()                   canonical form
+├─ validate_public_url()             refuse anything that is not a public web address (SSRF guard)
+├─ is_pdf_url()?  yes
+│  └─ _fetch_pdf()
+│     ├─ safe_get()                  download; every redirect hop is validated; size counted while streaming
+│     └─ extract_pdf_text()          PdfTextReader, one page at a time; repeated headers and footers removed
+└─ no
+   ├─ _fetch_via_jina()              Jina Reader returns Markdown; a 422 on the target selector retries without it
+   └─ _has_empty_jina_content()      a 200 with an empty body is an error (paywall, bot wall), never stored silently
+```
+
+### One model call (llm.py, pricing.py)
+
+```
+generate_with_usage()                routes by the model name's prefix
+├─ _gemini_generate()                "gemini-*"
+├─ _claude_generate()                "claude-*"   (cacheable prompt blocks marked for the provider)
+└─ _openai_generate()                "gpt-*"
+   each: build the request -> retry 429 and 5xx with doubling waits -> read the provider's usage
+         -> compute_cost() from the one price table -> return text, usage, normalized finish reason
+```
+
+The RAG gateway (section 13) wraps these calls with model fallback lists and the budget guard. `generate_embedding()` follows its own ladder: chunked batch, one retry, then per-item calls, with a zero vector for any item that still fails.
+
+### Speech (tts.py)
+
+```
+synthesize()                         one Edge-TTS call, one retry, never another voice
+├─ clean_text_for_tts()              (the caller's step first) strip Markdown, code, links, emoji
+└─ align_cues()                      Edge's word timings -> character offsets for highlighting; [] if they do not line up
+TTSCache                             get_key() -> get() / put(): the same text and voice is read from disk the second time
+```

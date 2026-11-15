@@ -22,6 +22,14 @@ Usage:
     # result.audio: bytes (MP3)
     # result.cues: list of {text, start, end, char_start, char_end}
     # result.duration: float (seconds)
+
+The pieces, in the order a request meets them:
+
+    clean_text_for_tts()   remove Markdown, code, links, emoji and symbols that a voice would read aloud or stumble on
+    detect_language()      "en" or "zh" from the character mix, to pick a default voice (default_voice)
+    TTSCache               has this exact text and voice been synthesized before? (disk, least recently used)
+    synthesize()           one Edge-TTS call (one retry, never another voice); returns audio, cues and duration
+    align_cues()           turn Edge's word timings into character offsets a browser can highlight while the audio plays
 """
 
 import asyncio
@@ -82,7 +90,11 @@ class UnknownVoiceError(TTSError):
 
 @dataclass(frozen=True)
 class SynthResult:
-    """Result of a speech synthesis operation."""
+    """Result of a speech synthesis operation.
+
+    `audio` is MP3 bytes; `cues` is a list of {text, start, end, char_start, char_end} (times in seconds, offsets in UTF-16 units
+    so a JavaScript client can slice the same text) or None when cues were not requested or could not be aligned; `duration` is seconds.
+    """
     audio: bytes
     cues: Optional[List[Dict[str, Any]]]
     duration: float
@@ -92,6 +104,8 @@ class SynthResult:
 # Voice Catalog & Registry
 # ---------------------------------------------------------------------------
 
+# The voices apps may offer. Each has an id (Edge's ShortName), language, gender and a display label. The list is a convenience
+# catalog, not a limit: `synthesize` also accepts any id of the form "xx-XX-NameNeural".
 VOICES: List[Dict[str, Any]] = [
     {
         "id": "en-US-GuyNeural",
@@ -168,6 +182,11 @@ def default_voice(lang: str, enabled: Optional[List[str]] = None) -> str:
 
     If `enabled` list is provided, returns the first enabled voice matching the language.
     Otherwise returns the catalog default: 'en-US-GuyNeural' for English, 'zh-CN-XiaoxiaoNeural' for Chinese.
+
+    >>> default_voice("en"), default_voice("zh-CN")
+    ('en-US-GuyNeural', 'zh-CN-XiaoxiaoNeural')
+    >>> default_voice("zh-CN", enabled=["en-US-AriaNeural", "zh-CN-YunxiNeural"])
+    'zh-CN-YunxiNeural'
     """
     is_en = lang.lower().startswith("en")
     target_prefix = "en" if is_en else "zh"
@@ -189,7 +208,11 @@ def default_voice(lang: str, enabled: Optional[List[str]] = None) -> str:
 
 
 def is_mostly_english(text: str) -> bool:
-    """Detect whether text is primarily English based on Latin vs Chinese character frequency."""
+    """Detect whether text is primarily English based on Latin vs Chinese character frequency.
+
+    >>> is_mostly_english("Hello there"), is_mostly_english("你好，世界")
+    (True, False)
+    """
     ascii_letters = sum(1 for c in text if c.isascii() and c.isalpha())
     chinese_chars = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
     return ascii_letters > (chinese_chars * 2)
@@ -220,6 +243,11 @@ def clean_text_for_tts(text: str, *, asterisk_spans: str = "drop") -> str:
     5. Remove ~, ～, emoji and symbol categories (So, Sk, Cn, Cs, U+FE0F, U+200D) except the
        measurement signs in _SPOKEN_SYMBOLS (°, ℃, ℉) that change the meaning of a number;
        collapse whitespace; remove space before punctuation marks (. , ! ? ; :).
+
+    >>> clean_text_for_tts("Hello **world**! See [the docs](https://x.org) `code`")
+    'Hello world! See the docs'
+    >>> clean_text_for_tts("It was 25℃ outside *smiles*")          # roleplay actions are dropped; the degree sign is kept
+    'It was 25℃ outside'
     """
     if not text:
         return ""
@@ -282,6 +310,13 @@ def align_cues(text: str, boundaries: List[Dict[str, Any]]) -> List[Dict[str, An
     - Converts character offsets into UTF-16 code units (for JavaScript consumer).
     - Enforces monotonic media time (start <= end).
     - Degrades to [] if >10% of tokens missed or cues end before 70% of text.
+
+    Edge-TTS reports each spoken word with its start time and length in 100-nanosecond ticks. This finds each word in the text so a
+    reader can highlight it. Returning no cues at all is better than wrong ones: a client then simply does not highlight.
+
+    >>> boundaries = [{"text": "Hello", "offset": 0, "duration": 5_000_000}, {"text": "world", "offset": 6_000_000, "duration": 5_000_000}]
+    >>> [(c["text"], c["start"], c["end"], c["char_start"], c["char_end"]) for c in align_cues("Hello world", boundaries)]
+    [('Hello', 0.0, 0.5, 0, 5), ('world', 0.6, 1.1, 6, 11)]
     """
     if not text or not boundaries:
         return []
@@ -293,6 +328,7 @@ def align_cues(text: str, boundaries: List[Dict[str, Any]]) -> List[Dict[str, An
     text_utf16_len = len(text.encode("utf-16-le")) // 2
 
     def is_skippable(skipped: str) -> bool:
+        """True when the text between two matched words is only punctuation, spaces or markup symbols (so the match is safe)."""
         if len(skipped) > 32:
             return False
         for c in skipped:
@@ -389,6 +425,18 @@ class TTSCache:
     Storage: {key}.mp3 and {key}.json in cache_dir.
     Writes: Atomic (temp file then rename).
     Eviction: Byte-bounded LRU based on file mtime.
+
+    Synthesizing is the slow, rate-limited part, and the same sentence is often read again, so a repeat is served from disk. Reading
+    an entry refreshes its modification time, so the entries least recently used are the ones removed when the folder grows past
+    `max_bytes`.
+
+    >>> import tempfile
+    >>> with tempfile.TemporaryDirectory() as folder:
+    ...     cache = TTSCache(cache_dir=folder)
+    ...     key = TTSCache.get_key("hello", "en-US-GuyNeural")
+    ...     cache.put(key, b"mp3", [{"text": "hello"}], 1.5)
+    ...     cache.get(key)
+    (b'mp3', [{'text': 'hello'}], 1.5)
     """
 
     def __init__(
@@ -525,6 +573,9 @@ async def synthesize(
     - At most one retry on transient connection errors, with the SAME voice.
     - Never substitutes another voice on failure.
     - Returns SynthResult(audio: bytes, cues: list | None, duration: float).
+
+    `rate`, `pitch` and `volume` use Edge's relative syntax ("+10%", "-5Hz"). Raises `TTSError` for empty text or after the retry
+    fails, and `UnknownVoiceError` for an id that is neither in the catalog nor shaped like a neural voice id.
     """
     if not text or not text.strip():
         raise TTSError("Cannot synthesize empty text")

@@ -39,6 +39,9 @@ _supabase_client: Optional[Client] = None
 def _get_supabase_client() -> Client:
     """Return the shared Supabase client, creating it on first call.
 
+    Uses the service-role (secret) key, which bypasses Row Level Security, so it belongs only in backend code that has already
+    checked who the user is (see auth.py). A browser must never receive this key.
+
     Re-reads os.getenv() at call time (not the module-level SUPABASE_URL/KEY
     snapshot above) so env vars set after import — e.g. by a test fixture —
     are picked up. Fails fast with RuntimeError if the required env vars are

@@ -19,6 +19,20 @@ internal address.
 Service layer: projects should not call requests.get() or r.jina.ai directly.
 Import fetch_article from cody_ai_shared_lib.fetcher so all fetch behaviour
 stays in one place.
+
+What `fetch_article(url)` does, in order:
+
+    fetch_article()
+    ├─ normalize_url()              canonical form (lower-case host, no double slashes, no trailing slash)
+    ├─ validate_public_url()        refuse any URL that is not a public web address (SSRF guard, url_validator.py)
+    ├─ is_pdf_url()?  yes ->  _fetch_pdf()
+    │                         ├─ safe_get()            download, validating every redirect hop; size checked while streaming
+    │                         └─ extract_pdf_text()    pdfminer, one page at a time, headers/footers removed
+    └─ otherwise     ->  _fetch_via_jina()             Jina turns the page into Markdown; a 422 on the target selector retries without it
+       └─ _has_empty_jina_content()                    a 200 with an empty body is a content failure (paywall, bot wall): ValueError
+
+Both paths return the same framing ("URL Source", "Markdown Content:") so a caller handles them identically; use
+`extract_title_and_markdown` to split a result into its title and body.
 """
 import logging
 import os
@@ -113,6 +127,9 @@ def normalize_url(url: str) -> str:
     - Lowercases scheme and host (RFC 3986).
     - Collapses accidental consecutive slashes in the path (e.g. '//writing/x' -> '/writing/x').
     - Strips trailing slash on non-root paths while leaving root '/' and query/fragment intact.
+
+    >>> normalize_url("  HTTPS://Example.COM//a//b/  ")
+    'https://example.com/a/b'
     """
     url = (url or "").strip()
     if not url:
@@ -130,6 +147,11 @@ def extract_title_and_markdown(raw_fetched: str, fallback_url: str = "") -> tupl
     1. Looks for 'Title: <title>' in the Jina header block.
     2. Splits body after 'Markdown Content:'.
     3. Falls back to the first '# ' H1 heading in the Markdown body, or the URL path slug.
+
+    >>> extract_title_and_markdown("Title: Hello\\n\\nMarkdown Content:\\nBody text")
+    ('Hello', 'Body text')
+    >>> extract_title_and_markdown("plain body", fallback_url="https://x.org/my-first_post.pdf")[0]
+    'My First Post'
     """
     title = ""
     for line in raw_fetched.splitlines()[:10]:
@@ -197,6 +219,8 @@ def extract_pdf_text(
     """
     from .pdf_text import PdfTextReader
 
+    # Three independent stops: the page cap, the character target and the time budget. A damaged page costs only itself.
+
     started = time.monotonic()
     reader = PdfTextReader(pdf_bytes, profile_pages=_PDF_PROFILE_PAGES)
     try:
@@ -239,6 +263,9 @@ def is_pdf_url(url: str) -> bool:
     Handles two cases:
     - Path ends with .pdf (query-string-safe: 'paper.pdf?X-Amz-Signature=...' → True)
     - arXiv PDF URLs: arxiv.org/pdf/<id> serves PDFs without a .pdf extension
+
+    >>> is_pdf_url("https://x.org/paper.pdf?sig=1"), is_pdf_url("https://arxiv.org/pdf/2401.00001"), is_pdf_url("https://x.org/page")
+    (True, True, False)
     """
     parsed = urlparse(url)
     if parsed.path.lower().endswith(".pdf"):
@@ -256,6 +283,9 @@ def _has_empty_jina_content(text: str) -> bool:
     When it cannot render the page body (bot detection, paywall, auth gate,
     or a PDF binary served at an HTML URL), the header is present but the body
     is empty. Threshold of 50 chars filters out noise like a lone newline.
+
+    >>> _has_empty_jina_content("Title: x\\n\\nMarkdown Content:\\n  "),_has_empty_jina_content("no marker at all")
+    (True, False)
     """
     marker = "Markdown Content:"
     idx = text.find(marker)
@@ -343,6 +373,7 @@ def _fetch_via_jina(
     target_selector: str | None,
     retain_images: bool = False,
 ) -> str:
+    """Ask Jina Reader for the page as Markdown. The selectors tell Jina what to cut (cookie walls, navigation) and what to keep."""
     jina_url = f"{_JINA_BASE}{url}"
     headers = {"Accept": "text/plain"}
     if api_key := os.getenv("JINA_API_KEY"):

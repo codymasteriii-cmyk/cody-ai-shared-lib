@@ -1,4 +1,9 @@
-"""Text token estimation shared by the model modules and the RAG engine (§6.1)."""
+"""Text token estimation shared by the model modules and the RAG engine (§6.1).
+
+The library budgets prompts in tokens but does not load a tokenizer (it would be slow to start and tied to one model's
+vocabulary). Instead it estimates: roughly four Latin characters per token, and about one token per Chinese, Japanese or Korean
+character, plus a 10% safety margin. The estimate errs high on purpose, so a prompt built to fit the budget really does.
+"""
 from __future__ import annotations
 
 import math
@@ -24,7 +29,11 @@ CJK_CHAR_CLASS = "".join(f"{chr(lo)}-{chr(hi)}" for lo, hi in CJK_RANGES)
 
 
 def is_cjk_char(ch: str) -> bool:
-    """Return True if character falls in CJK Unified Ideographs, Kana, Hangul, or related ranges."""
+    """Return True if character falls in CJK Unified Ideographs, Kana, Hangul, or related ranges.
+
+    >>> is_cjk_char("你"), is_cjk_char("a")
+    (True, False)
+    """
     cp = ord(ch)
     return any(lo <= cp <= hi for lo, hi in CJK_RANGES)
 
@@ -34,6 +43,9 @@ def estimate_tokens(text: str) -> int:
 
     CJK characters count 1.0 token each; other characters count 0.25 each; then +10%.
     Returns an integer ceiling.
+
+    >>> estimate_tokens("abcd"), estimate_tokens("你好"), estimate_tokens("")
+    (2, 3, 0)
     """
     if not text:
         return 0

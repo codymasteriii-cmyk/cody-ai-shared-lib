@@ -20,6 +20,25 @@ Design principles:
 Usage tracking: generate_with_usage() returns real token counts and USD cost
 calculated from cody_ai_shared_lib.pricing. finish_reason is normalized to
 ("stop", "length", "safety", "other").
+
+Shape of the file:
+
+    LLMClient.generate()                 text only (calls generate_with_usage and drops the usage)
+    LLMClient.generate_with_usage()      routes by model name prefix, returns LLMResult(text, usage, finish_reason)
+    ├─ _gemini_generate()                one method per provider, the same pattern in each (below)
+    ├─ _claude_generate()
+    └─ _openai_generate()
+    LLMClient.stream()                   the same routing, yielding LLMStreamChunk; the last chunk carries the usage
+    ├─ _gemini_stream() / _claude_stream() / _openai_stream()
+
+The pattern every provider method follows: build the provider's request from the shared arguments -> loop up to `retry_max`
+attempts -> on success, read the provider's own usage fields, convert to LLMUsage, compute the cost, normalize the finish
+reason -> on a retryable error (429, 5xx, overloaded), wait retry_base_wait_secs * 2^attempt and try again; on any other error,
+raise at once. If `response_schema` is given and the text does not validate, `ModelCallError` is raised WITH the usage, because
+the provider already billed the call.
+
+Used by the RAG engine through `rag/gateway.py`, which adds model fallback lists, budgets and usage tracking on top; an app that
+only needs one call can use `LLMClient` directly.
 """
 from __future__ import annotations
 
@@ -39,7 +58,11 @@ __all__ = ["LLMClient", "LLMUsage", "LLMResult", "LLMStreamChunk", "ModelCallErr
 # ── Error classification & Exception Types ─────────────────────────────────────
 
 class ModelCallError(Exception):
-    """Raised when a model call fails or post-processing fails after a billed response (AC-RAG-70)."""
+    """Raised when a model call fails or post-processing fails after a billed response (AC-RAG-70).
+
+    Carries the `usage` when the provider answered (so the spend is still recorded) and `billing`: "billed" when the call
+    certainly cost money, "unknown" when it is not known.
+    """
 
     def __init__(
         self,
@@ -55,7 +78,13 @@ class ModelCallError(Exception):
 
 
 def _is_retryable(exc: Exception) -> bool:
-    """Return True for rate-limit and transient server errors that warrant retry."""
+    """Return True for rate-limit and transient server errors that warrant retry.
+
+    The providers' SDKs raise different exception types, so this reads the message for the usual signs.
+
+    >>> _is_retryable(Exception("429 Too Many Requests")), _is_retryable(Exception("invalid api key"))
+    (True, False)
+    """
     msg = str(exc).lower()
     return any(t in msg for t in (
         "429", "rate limit", "quota", "resource exhausted", "too many requests",
@@ -130,6 +159,8 @@ class LLMClient:
         self._openai_client = None
 
     # ── SDK singleton accessors ────────────────────────────────────────────────
+    # Each SDK is imported and its client built on first use only, so an app that never calls a Claude model never needs
+    # the anthropic package installed.
 
     def _get_gemini_client(self):
         if self._gemini_client is None:
@@ -159,7 +190,14 @@ class LLMClient:
 
     @staticmethod
     def _normalize_finish_reason(raw: Any) -> str | None:
-        """Normalize provider-specific finish reason to 'stop', 'length', 'safety', or 'other'."""
+        """Normalize provider-specific finish reason to 'stop', 'length', 'safety', or 'other'.
+
+        The callers (the gateway) only need to know four things: finished normally, ran out of output space, was blocked, or
+        something else. Each provider spells them differently.
+
+        >>> [LLMClient._normalize_finish_reason(r) for r in ("STOP", "max_tokens", "FinishReason.SAFETY", "weird", None)]
+        ['stop', 'length', 'safety', 'other', None]
+        """
         if raw is None:
             return None
         raw_str = str(raw).lower().strip()
@@ -230,6 +268,9 @@ class LLMClient:
 
         user_blocks: the user message as ordered (text, cacheable) blocks. Claude sends them as content
         blocks and marks the cacheable ones with cache_control; other providers use user_message.
+
+        The provider is chosen by the model name's prefix: "gemini..." -> Google, "claude..." -> Anthropic, "gpt..." -> OpenAI;
+        any other prefix raises ValueError. Options a provider does not support are ignored for it.
         """
         if model.startswith("gemini"):
             return self._gemini_generate(
@@ -278,6 +319,11 @@ class LLMClient:
 
         Yields LLMStreamChunk(delta=...). The final chunk has delta="" and
         contains usage and finish_reason.
+
+        NOTE: a retryable error that happens AFTER some text was yielded makes the provider method start the request again, and
+        the text it yields next begins from the start. A consumer that has already shown the first part would see it twice. The
+        RAG gateway therefore treats any error it sees after the first chunk as final, but a retry that the client itself performs
+        mid-stream happens below that check.
         """
         if model.startswith("gemini"):
             yield from self._gemini_stream(
@@ -333,6 +379,10 @@ class LLMClient:
         stream: bool = False,
         cache_breakpoints: bool | list[int] | None = None,
     ) -> LLMResult:
+        """One Gemini call (or a streamed one collected into a single result), with retry and usage accounting.
+
+        Gemini reports "thinking" tokens separately from visible output; both are billed, so both are counted as output.
+        """
         from google.genai import types
 
         config_kwargs: dict = {"system_instruction": system_prompt}
@@ -462,6 +512,13 @@ class LLMClient:
         cache_breakpoints: bool | list[int] | None = None,
         user_blocks: list[tuple[str, bool]] | None = None,
     ) -> LLMResult:
+        """One Claude call with retry and usage accounting.
+
+        Claude requires `max_tokens`, so 8192 is used when the caller gives none. When the caller asks for cache breakpoints the
+        system prompt is marked cacheable, and the cacheable blocks of the user turn are marked by `_claude_user_content`, so the
+        stable part of a long prompt is billed at the cheaper cached rate on later calls. Claude's input count excludes cache
+        reads, so they are added back to get the total prompt size.
+        """
         client = self._get_anthropic_client()
 
         create_kwargs: dict = {
@@ -565,6 +622,11 @@ class LLMClient:
         response_schema: type | None = None,
         stream: bool = False,
     ) -> LLMResult:
+        """One OpenAI chat call with retry and usage accounting.
+
+        Reasoning models take a different set of arguments (`max_completion_tokens`, no `temperature`), which is decided
+        from the model name below.
+        """
         client = self._get_openai_client()
         # Reasoning models (gpt-6 series, o1, o3) enforce max_completion_tokens and reject temperature
         is_reasoning = any(x in model.lower() for x in ("gpt-6", "o1", "o3"))
@@ -687,6 +749,7 @@ class LLMClient:
         thinking_level: str | None = None,
         cache_breakpoints: bool | list[int] | None = None,
     ) -> Iterator[LLMStreamChunk]:
+        """Stream a Gemini answer: text chunks as they arrive, then one final chunk with the usage (Gemini reports it at the end)."""
         from google.genai import types
 
         config_kwargs: dict = {"system_instruction": system_prompt}
@@ -769,6 +832,7 @@ class LLMClient:
         cache_breakpoints: bool | list[int] | None = None,
         user_blocks: list[tuple[str, bool]] | None = None,
     ) -> Iterator[LLMStreamChunk]:
+        """Stream a Claude answer: text chunks, then one final chunk with the usage and finish reason."""
         client = self._get_anthropic_client()
 
         create_kwargs: dict = {
@@ -844,6 +908,7 @@ class LLMClient:
         stop_sequences: list[str] | None = None,
         response_mime_type: str | None = None,
     ) -> Iterator[LLMStreamChunk]:
+        """Stream an OpenAI answer. `include_usage` makes the API send the token counts in a last chunk."""
         client = self._get_openai_client()
         is_reasoning = any(x in model.lower() for x in ("gpt-6", "o1", "o3"))
         messages = [
@@ -929,6 +994,11 @@ def _claude_user_content(user_message: str, user_blocks: list[tuple[str, bool]] 
     The RAG engine puts the stable data (Tier 0 sections, admitted summaries) first, so marking that
     block lets Claude reuse it across turns instead of re-reading the whole document (§10.3, §15).
     Falls back to the plain message when the blocks do not add up to it.
+
+    >>> _claude_user_content("ab", [("a", True), ("b", False)])
+    [{'type': 'text', 'text': 'a', 'cache_control': {'type': 'ephemeral'}}, {'type': 'text', 'text': 'b'}]
+    >>> _claude_user_content("ab", [("x", True)])          # the blocks do not add up to the message
+    'ab'
     """
     if not user_blocks or "".join(text for text, _ in user_blocks) != user_message:
         return user_message

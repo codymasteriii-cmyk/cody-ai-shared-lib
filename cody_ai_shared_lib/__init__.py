@@ -1,3 +1,32 @@
+"""Cody AI shared library: the building blocks the Cody AI apps share.
+
+A map of what is here and which app uses it. Everything below is importable from `cody_ai_shared_lib` directly.
+
+    models and AI calls
+      llm            LLMClient: one call interface for Gemini, Claude and OpenAI models, with retry, usage and cost
+      embedding      generate_embedding: 768-dimension vectors, batched, with a failure ladder
+      rerank         RerankClient: Jina cross-encoder reranking
+      jev            JevClient: TypeSafe's Jev "System One" typed decisions
+      pricing        one price table and compute_cost / estimate_cost; every module above uses it
+      tokens         estimate_tokens and the CJK character ranges
+
+    content and safety
+      fetcher        fetch_article: a web page via Jina Reader, or a PDF read directly
+      url_validator  validate_public_url / safe_get: refuse addresses that are not public (SSRF guard)
+      pdf_text       PdfTextReader: clean plain text from a PDF, for reading aloud
+
+    services
+      auth           verify_supabase_jwt: check a Supabase session token
+      email          send_email: one HTML email through Resend
+      supabase_client  get_supabase_client: a lazy, shared database connection
+      tts            Edge-TTS speech synthesis with word timings and a disk cache (needs `edge-tts`; optional)
+
+    rag            the retrieval-augmented generation engine: `from cody_ai_shared_lib.rag import RAGEngine`
+                   (its own map is in docs/CALL_TREES.md and its contract in specs/RAG_SPEC.md)
+
+Nothing here reads configuration at import time except `.env` loading in `auth`, `email` and `supabase_client`; clients are
+created on first use, so importing the package never needs a key or a network.
+"""
 from .auth import AuthError, extract_bearer_token, verify_supabase_jwt
 from .email import EmailError, send_email
 from .embedding import (

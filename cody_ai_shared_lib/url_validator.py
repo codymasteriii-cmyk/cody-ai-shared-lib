@@ -20,6 +20,14 @@ address. safe_get() follows redirects manually and validates every hop.
 
 Known limit: DNS is resolved here and again by requests when it connects, so a
 hostname that changes its answer between the two (DNS rebinding) is not covered.
+
+Why this matters: SSRF (server-side request forgery). If a user can make the server fetch a URL, a hostile URL such as
+http://169.254.169.254/ (a cloud metadata service) or http://localhost:5432/ makes the server read its own internal network
+and hand the result back. The defence is to fetch only public addresses.
+
+    validate_public_url("https://example.com/a")        returns None: the host resolves to public addresses only
+    validate_public_url("http://127.0.0.1/admin")       ValueError: a loopback address
+    validate_public_url("file:///etc/passwd")           ValueError: not http or https
 """
 import ipaddress
 import socket
@@ -30,7 +38,11 @@ _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
 
 def _is_public_address(raw: str) -> bool:
-    """True if the resolved address is publicly routable."""
+    """True if the resolved address is publicly routable.
+
+    >>> _is_public_address("8.8.8.8"), _is_public_address("127.0.0.1"), _is_public_address("::ffff:127.0.0.1")
+    (True, False, False)
+    """
     addr = ipaddress.ip_address(raw.split("%", 1)[0])  # drop any IPv6 zone id
     if addr.version == 6 and addr.ipv4_mapped:
         addr = addr.ipv4_mapped  # judge ::ffff:a.b.c.d by its embedded IPv4 address
@@ -48,6 +60,12 @@ def validate_public_url(url: str) -> None:
 
     Raises:
         ValueError: with a descriptive message if the URL fails any check.
+
+    >>> try:
+    ...     validate_public_url("ftp://example.com/x")
+    ... except ValueError as exc:
+    ...     print(str(exc).split(":")[0])
+    Disallowed URL scheme 'ftp'
     """
     parsed = urlparse(url)
 

@@ -15,6 +15,16 @@ Failure strategy:
   3. Each chunk is retried once (with a 3-second delay) on failure.
   4. Any chunk that fails both attempts falls back to per-item individual
      calls, truncated to 8,000 characters.
+
+The same text in order, as a picture (`generate_embedding`):
+
+    inputs ["a", "", "b", "c", ...]
+    ├─ blank inputs            -> a zero vector in their own slot (so positions still line up)
+    ├─ the rest, 8 at a time   -> one batch call each, one retry after 3 s
+    └─ a chunk that failed twice -> each of its items alone (cut to 8,000 characters); an item that still fails keeps a zero vector
+
+Every step keeps the output the same length and order as the input. The one thing a caller MUST do is treat an all-zero vector as
+a failure and never store it: such a vector matches nothing. The RAG engine's embedder (`rag/ingestion/embedder.py`) does that.
 """
 import os
 import time
@@ -44,7 +54,10 @@ class EmbeddingUsage:
 
 @dataclass
 class EmbeddingResult:
-    """Vectors and token usage for generate_embedding_with_usage()."""
+    """Vectors and token usage for generate_embedding_with_usage().
+
+    `vectors` is one vector for a single string input, or a list of vectors for a list input.
+    """
     vectors: Union[List[float], List[List[float]]]
     usage: EmbeddingUsage
 
@@ -65,6 +78,7 @@ _gemini_client = None
 
 
 def _get_gemini_client():
+    """The process-wide Gemini client, created on first use (so importing this module needs no key)."""
     global _gemini_client
     if _gemini_client is None:
         _gemini_client = genai.Client(
@@ -220,7 +234,8 @@ def generate_embedding_with_usage(
 ) -> EmbeddingResult:
     """Generates embeddings and returns usage with cost computed from pricing table.
 
-    Token usage is estimated with estimate_tokens and marked estimated=True (AC-RAG-69).
+    Token usage is estimated with estimate_tokens and marked estimated=True (AC-RAG-69): the embedding API does not report
+    token counts, so the cost is an estimate and says so.
     """
     if not text:
         return EmbeddingResult(

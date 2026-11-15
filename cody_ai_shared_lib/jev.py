@@ -146,6 +146,7 @@ class JevClient:
         self._client = None
 
     def _get_client(self) -> TypeSafeClient:
+        """The SDK client, created on first use; raises RuntimeError with a clear message when no API key is set."""
         if self._client is None:
             api_key = self._api_key or os.getenv("TYPESAFE_API_KEY") or os.getenv("VERCEL_API_KEY")
             if not api_key:

@@ -20,6 +20,11 @@ Usage:
     # 3. Access verified user claims
     user_id = claims["user_id"]  # Normalized from standard 'sub' claim
     email = claims.get("email")
+
+Why public keys and not a shared secret: Supabase signs each session token with a private key and publishes the matching public
+keys at a well-known address (JWKS). This module downloads and caches those public keys, so it can prove a token is genuine without
+ever holding a secret. It checks the signature, the expiry, the audience ("authenticated") and the issuer (this Supabase project).
+What the user is allowed to DO is the app's decision; this only says who they are.
 """
 
 import logging
@@ -48,6 +53,11 @@ def extract_bearer_token(authorization_header: Optional[str]) -> Optional[str]:
 
     Handles case-insensitive 'Bearer ' prefix and whitespace stripping.
     Prevents prefix-stripping bypass attacks by using a single split.
+
+    >>> extract_bearer_token("Bearer abc123"), extract_bearer_token("bearer   xyz "), extract_bearer_token("Basic abc")
+    ('abc123', 'xyz', None)
+    >>> extract_bearer_token(None) is None
+    True
     """
     if not authorization_header or not isinstance(authorization_header, str):
         return None
@@ -91,6 +101,9 @@ def verify_supabase_jwt(
             - user_metadata: Dictionary of user metadata
             - claims: Full raw decoded claims dictionary
         Returns None (or raises AuthError) if verification fails.
+
+    Call with the default `raise_error=False` for a simple "is this request signed in?" check; use `raise_error=True` when the caller
+    wants the reason (expired, wrong audience, wrong issuer) as an exception. Every failure is also logged.
     """
     if not token or not isinstance(token, str):
         msg = "Token is missing or empty"

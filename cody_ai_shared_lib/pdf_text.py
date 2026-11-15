@@ -61,7 +61,7 @@ _COMPOUND_RE = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)+")
 
 
 class PdfTextError(Exception):
-    """The PDF could not be opened. `code` is a stable machine-readable reason."""
+    """The PDF could not be opened. `code` is a stable machine-readable reason ("invalid_pdf", "encrypted_pdf")."""
 
     code = "invalid_pdf"
 
@@ -73,15 +73,18 @@ class PdfTextError(Exception):
 
 
 class PdfEncryptedError(PdfTextError):
+    """The PDF is password-protected or encrypted; reading it needs a password this module does not take."""
     code = "encrypted_pdf"
 
 
 class PdfEmptyError(PdfTextError):
+    """The PDF opened but has no pages."""
     code = "invalid_pdf"
 
 
 @dataclass
 class TextBox:
+    """One layout box of a page (usually a paragraph or a heading): its lines of text and its vertical position (y0 bottom, y1 top)."""
     lines: List[str]
     y0: float
     y1: float
@@ -89,6 +92,7 @@ class TextBox:
 
 @dataclass
 class PdfPageText:
+    """The text boxes of one page and the page height, which is what header and footer detection measures against."""
     height: float
     boxes: List[TextBox] = field(default_factory=list)
 
@@ -101,16 +105,23 @@ def placeholder_page(message: str) -> PdfPageText:
 
 @dataclass
 class _Profile:
+    """What sampling the first pages taught us about the document: its repeated headers/footers, its hyphenated compounds, and whether its quotes are mis-decoded."""
     repeated: Set[str]
     hyphenated: Set[str]
     odd_quotes: bool
 
 
 def _norm(s: str) -> str:
+    """A header/footer's identity: lower-cased, spaces collapsed, every number replaced by "#", so "Page 3" and "Page 4" match.
+
+    >>> _norm("Page  12 of 40")
+    'page # of #'
+    """
     return re.sub(r"\d+", "#", re.sub(r"\s+", " ", s.lower())).strip()
 
 
 def _in_zone(box: TextBox, height: float) -> bool:
+    """True when the box lies in the top or bottom 8% of the page, where headers and footers live."""
     return box.y1 >= (1 - ZONE) * height or box.y0 <= ZONE * height
 
 
@@ -123,6 +134,7 @@ def _line_fixes(raw: str) -> str:
 
 
 def _compounds(pages: Sequence[PdfPageText]) -> Set[str]:
+    """Every hyphenated word that appears in the pages ("red-teaming"), lower-cased: the document's own evidence that a hyphen is real."""
     found: Set[str] = set()
     for pg in pages:
         for b in pg.boxes:
@@ -132,7 +144,16 @@ def _compounds(pages: Sequence[PdfPageText]) -> Set[str]:
 
 
 def _join_lines(out: str, nxt: str, hyphenated: Set[str]) -> str:
-    """Join two consecutive lines, rejoining a word that was hyphenated at the line end."""
+    """Join two consecutive lines, rejoining a word that was hyphenated at the line end.
+
+    A hyphen at the end of a line is either a soft break ("exam-" + "ple" -> "example") or a real hyphen ("red-" + "teaming").
+    The document's own vocabulary decides: a compound seen elsewhere keeps its hyphen.
+
+    >>> _join_lines("an exam-", "ple of text", set())
+    'an example of text'
+    >>> _join_lines("the red-", "teaming plan", {"red-teaming"})
+    'the red-teaming plan'
+    """
     m = re.search(r"([A-Za-z]{2,})-$", out)
     n = re.match(r"([a-z]+)", nxt)
     if m and n:
@@ -143,6 +164,7 @@ def _join_lines(out: str, nxt: str, hyphenated: Set[str]) -> str:
 
 
 def _box_to_paragraph(lines: List[str], hyphenated: Set[str]) -> str:
+    """One layout box's lines joined into a single paragraph."""
     out = lines[0]
     for nxt in lines[1:]:
         out = _join_lines(out, nxt, hyphenated)
@@ -150,6 +172,11 @@ def _box_to_paragraph(lines: List[str], hyphenated: Set[str]) -> str:
 
 
 def _hygiene(text: str, odd_quotes: bool) -> str:
+    """Final tidy of a paragraph: ligatures spelled out, invisible characters and bullets removed, spacing before punctuation fixed.
+
+    >>> _hygiene("the scams , which \ufb01nd you", False)
+    'the scams, which find you'
+    """
     for k, v in _LIGATURES.items():
         text = text.replace(k, v)
     text = text.replace("\xa0", " ").replace("\u00ad", "").replace("\u200b", "").replace("\ufeff", "")
@@ -164,7 +191,11 @@ def _hygiene(text: str, odd_quotes: bool) -> str:
 
 
 class PdfTextReader:
-    """Page-at-a-time PDF text reader. Not thread-safe; close() it (it holds the file open)."""
+    """Page-at-a-time PDF text reader. Not thread-safe; close() it (it holds the file open).
+
+    Page-at-a-time keeps memory low and lets a caller keep its own time budget: read a few pages, check the clock, read more.
+    The first `profile_pages` pages are kept in memory because both header/footer detection and later cleaning use them.
+    """
 
     def __init__(self, source: Union[bytes, bytearray, str, Path], profile_pages: int = PROFILE_PAGES):
         from pdfminer.converter import PDFPageAggregator
@@ -204,9 +235,11 @@ class PdfTextReader:
 
     @property
     def page_count(self) -> int:
+        """The number of pages in the document."""
         return len(self._pages)
 
     def close(self) -> None:
+        """Release the file. Safe to call more than once."""
         fp, self._fp = self._fp, None
         if fp is not None:
             fp.close()

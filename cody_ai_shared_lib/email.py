@@ -58,6 +58,8 @@ def send_email(to: str, subject: str, html: str, sender: str) -> str:
     already wrap their own call in try/except, and should keep doing that
     here rather than this function guessing which behavior a given caller
     wants.
+
+    The key is read at call time, so the environment may be set after import.
     """
     api_key = os.getenv("RESEND_API_KEY")
     if not api_key:
