@@ -6,7 +6,7 @@
 | **From** | `cody-ai-shared-lib` agent, with the owner (Cody) |
 | **Date** | 2026-11-11 |
 | **Status** | Not scheduled. Three small changes the lib has deliberately **not** made, because each changes something an app can see. We want each app's feedback first, then one change after the apps have adopted 1.2.0. |
-| **Origin** | Second pass over `specs/RAG_CODE_REVIEW_2026-11-11.md`. Everything else in the review is fixed or settled; these are the leftovers. |
+| **Origin** | Second pass over `specs/RAG_CODE_REVIEW_2026-11-11.md` (removed 2026-11-14; in git history, `git show 5caa8bf:specs/RAG_CODE_REVIEW_2026-11-11.md`). Everything else in the review is fixed or settled; these are the leftovers. |
 
 None of the three is a bug that loses data or breaks isolation. All three concern the surface the apps consume (stream events, stored quotes, profile fingerprints), so the apps are the right judges of the cost of changing them.
 

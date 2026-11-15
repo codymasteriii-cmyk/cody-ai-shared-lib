@@ -1,4 +1,8 @@
-"""Fixes for the independent code review of 2026-11-11 (specs/RAG_CODE_REVIEW_2026-11-11.md), RAG_SPEC 1.2.0."""
+"""Fixes for the independent code review of 2026-11-11, RAG_SPEC 1.2.0.
+
+The review (specs/RAG_CODE_REVIEW_2026-11-11.md) was removed once its findings were settled; read it in git
+history, e.g. `git show 5caa8bf:specs/RAG_CODE_REVIEW_2026-11-11.md`.
+"""
 from __future__ import annotations
 
 import tomllib
