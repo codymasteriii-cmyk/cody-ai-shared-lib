@@ -544,3 +544,29 @@ class RAGStoreContractTests:
             future.result()
         # Two calls are not one snapshot, but a reader must never see a partial set of passages
         assert all(n in (0, 4) for n, _ in seen)
+
+    # ── Check 25: "any of these names" and "all of these names" groups (§7.9, A1) ──
+    def test_check_25_any_of_name_group(self):
+        store = self.make_store()
+        caps = store.capabilities()
+        if not (caps.uses_analyzer_tokens and caps.supports_keyword_fts):
+            return
+        nodes = [
+            _node("nm_a", "Alice walked home alone", "nm_doc", 0),
+            _node("nm_b", "Bob stayed at the mill", "nm_doc", 40),
+            _node("nm_ab", "Alice and Bob argued", "nm_doc", 80),
+            _node("nm_none", "Nothing here at all", "nm_doc", 120),
+        ]
+        self.write(store, "nm_doc", nodes, [[0.1] * DIM for _ in nodes])
+        filters = self.make_filters("nm_doc")
+
+        def phrase(*tokens: str) -> TokenGroup:
+            return TokenGroup(tokens=list(tokens), mode="phrase", origin="entity")
+
+        # AND of two name phrases: only the passage naming both
+        both = store.keyword_search("alice bob", filters, top_k=10, analyzer_tokens=[phrase("alice"), phrase("bob")])
+        assert {hit.node_id for hit in both} == {"nm_ab"}, "phrase groups are joined with AND"
+        # one any_of group: every passage naming at least one, and no other
+        any_of = TokenGroup(tokens=["alice", "bob"], mode="any_of", origin="entity", alternatives=[["alice"], ["bob"]])
+        either = store.keyword_search("alice bob", filters, top_k=10, analyzer_tokens=[any_of])
+        assert {hit.node_id for hit in either} == {"nm_a", "nm_b", "nm_ab"}, "an any_of group matches any alternative"

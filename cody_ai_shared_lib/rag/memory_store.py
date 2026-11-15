@@ -243,6 +243,8 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         """Apply one token group: any token, or all of them adjacent and in order (§6.1)."""
         if group.mode == "any":
             return bool(set(group.tokens) & set(tokens))
+        if group.mode == "any_of":
+            return any(InMemoryRAGStore._matches_group(tokens, TokenGroup(tokens=alt, mode="phrase")) for alt in group.alternatives)
         size = len(group.tokens)
         return any(tokens[i:i + size] == group.tokens for i in range(len(tokens) - size + 1))
 

@@ -227,10 +227,21 @@ class CjkAwareAnalyzer:
 
 
 class TokenGroup(BaseModel):
-    """Group of tokens for full-text search query construction."""
+    """Group of tokens for full-text search query construction.
+
+    `any`: at least one token. `phrase`: all tokens adjacent and in order. `any_of` (§7.9): at least one of
+    `alternatives`, each of which is itself a phrase; `tokens` then holds all their tokens, flattened, so a
+    store can still score with them.
+    """
     tokens: list[str]
-    mode: Literal["any", "phrase"]
+    mode: Literal["any", "phrase", "any_of"]
     origin: Literal["free_text", "exact_term", "entity"] = "free_text"
+    alternatives: list[list[str]] = []
+
+
+def _contains_run(tokens: list[str], run: list[str]) -> bool:
+    size = len(run)
+    return any(tokens[i:i + size] == run for i in range(len(tokens) - size + 1))
 
 
 def tokenize_query_groups(
@@ -240,34 +251,66 @@ def tokenize_query_groups(
     entity_terms: Sequence[str] | None = None,
     entity_mode: Literal["require", "ignore"] = "ignore",
 ) -> list[TokenGroup]:
-    """Tokenize a query and its exact/entity terms into TokenGroups per §6.1.
+    """Tokenize a query and its exact/entity terms into TokenGroups per §6.1 and §7.9.
 
     - Free-text query tokens become a 'free_text' group with mode='any'.
     - Each exact_term becomes an 'exact_term' group with mode='phrase'.
-    - With entity_mode='require', each entity_term becomes an 'entity' group with mode='phrase'.
+    - With entity_mode='require' and one name, it becomes an 'entity' group with mode='phrase'.
+    - With several names, the search requires the names that occur in its own text (one phrase group each);
+      when none occurs, one 'any_of' group of all the names.
     """
     groups: list[TokenGroup] = []
+    query_tokens: list[str] = []
     if query:
-        free_tokens = analyzer.tokenize(analyzer.normalize(query))
-        if free_tokens:
-            groups.append(TokenGroup(tokens=free_tokens, mode="any", origin="free_text"))
+        query_tokens = analyzer.tokenize(analyzer.normalize(query))
+        if query_tokens:
+            groups.append(TokenGroup(tokens=query_tokens, mode="any", origin="free_text"))
     for term in exact_terms or []:
         toks = analyzer.tokenize(analyzer.normalize(term))
         if toks:
             groups.append(TokenGroup(tokens=toks, mode="phrase", origin="exact_term"))
     if entity_mode == "require":
+        names: list[list[str]] = []
         for ent in entity_terms or []:
             toks = analyzer.tokenize(analyzer.normalize(ent))
-            if toks:
-                groups.append(TokenGroup(tokens=toks, mode="phrase", origin="entity"))
+            if toks and toks not in names:
+                names.append(toks)
+        if len(names) <= 1:
+            groups.extend(TokenGroup(tokens=toks, mode="phrase", origin="entity") for toks in names)
+        else:
+            present = [toks for toks in names if _contains_run(query_tokens, toks)]
+            if present:
+                groups.extend(TokenGroup(tokens=toks, mode="phrase", origin="entity") for toks in present)
+            else:
+                groups.append(_any_of(names))
     return groups
+
+
+def _any_of(names: list[list[str]]) -> TokenGroup:
+    return TokenGroup(
+        tokens=[token for toks in names for token in toks], mode="any_of", origin="entity", alternatives=names
+    )
+
+
+def widen_name_groups(groups: list[TokenGroup]) -> list[TokenGroup] | None:
+    """The same search with its required names relaxed to "at least one of them" (§7.9 rule 3).
+
+    None when there is nothing to widen: fewer than two required names (a single name never widens, and
+    an 'any_of' group is already as wide as it gets).
+    """
+    required = [i for i, g in enumerate(groups) if g.origin == "entity" and g.mode == "phrase"]
+    if len(required) < 2:
+        return None
+    wide = _any_of([groups[i].tokens for i in required])
+    return [wide if i == required[0] else g for i, g in enumerate(groups) if i == required[0] or i not in required]
 
 
 def build_tsquery(groups: list[TokenGroup]) -> str:
     """Build PostgreSQL websearch/tsquery-safe string from token groups.
 
     Guarantees no unescaped tsquery operators or quotes from token text.
-    'phrase' groups use '<->' adjacency; 'any' groups use '|'; groups are joined with '&'.
+    'phrase' groups use '<->' adjacency; 'any' groups use '|'; 'any_of' groups use '|' between
+    parenthesised phrases (no other operator); groups are joined with '&'.
     """
     clean_parts: list[str] = []
     # Strip any dangerous tsquery characters from tokens: only keep letters, digits, and CJK
@@ -278,7 +321,17 @@ def build_tsquery(groups: list[TokenGroup]) -> str:
         sanitized = [t for t in sanitized if t]
         if not sanitized:
             continue
-        if g.mode == "phrase":
+        if g.mode == "any_of":
+            alternatives = []
+            for alt in g.alternatives:
+                parts = [part for part in (safe_re.sub("", t) for t in alt) if part]
+                if parts:
+                    alternatives.append(parts[0] if len(parts) == 1 else f"({' <-> '.join(parts)})")
+            if len(alternatives) == 1:
+                clean_parts.append(alternatives[0])
+            elif alternatives:
+                clean_parts.append(f"({' | '.join(alternatives)})")
+        elif g.mode == "phrase":
             if len(sanitized) == 1:
                 clean_parts.append(sanitized[0])
             else:

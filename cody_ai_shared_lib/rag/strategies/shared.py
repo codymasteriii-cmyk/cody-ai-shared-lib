@@ -1,9 +1,11 @@
 """Query steps shared by the retrieval strategies (§8.3–§8.6)."""
 from __future__ import annotations
 
+from typing import Callable
+
 from ..errors import EmbeddingProviderError
 from ..models import MetaT, RAGNode
-from ..text.analyzer import TokenGroup, tokenize_query_groups
+from ..text.analyzer import TokenGroup, tokenize_query_groups, widen_name_groups
 from .context import RetrievalContext
 
 
@@ -22,6 +24,25 @@ def query_token_groups(ctx: RetrievalContext[MetaT]) -> list[TokenGroup] | None:
         ctx.intent.entity_terms,
         ctx.intent.entity_mode,
     )
+
+
+def search_widening_names(
+    ctx: RetrievalContext[MetaT],
+    call: Callable[[list[TokenGroup] | None], list[RAGNode[MetaT]]],
+) -> list[RAGNode[MetaT]]:
+    """Run one keyword-bearing store call; widen "all these names" to "any of them" when it returns too few (§7.9).
+
+    "Too few" is fewer rows than the request's effective top_k, counted on this one call's rows. The narrow rows
+    stay first and the widened ones are appended without duplicates. A search with fewer than two required names
+    never widens.
+    """
+    groups = query_token_groups(ctx)
+    rows = call(groups)
+    wide = widen_name_groups(groups) if groups else None
+    if wide is None or len(rows) >= ctx.target_limit():
+        return rows
+    seen = {node.node_id for node in rows}
+    return [*rows, *(node for node in call(wide) if node.node_id not in seen)]
 
 
 def embed_query(ctx: RetrievalContext[MetaT]) -> list[float]:
@@ -60,11 +81,11 @@ def keyword_fallback(ctx: RetrievalContext[MetaT], top_k: int) -> list[RAGNode[M
         fallback_used="keyword_search",
         impact="Fell back to keyword-only retrieval",
     )
-    return ctx.store.keyword_search(
-        query_text=query_text(ctx),
-        top_k=top_k,
-        filters=ctx.filters,
-        analyzer_tokens=query_token_groups(ctx),
+    return search_widening_names(
+        ctx,
+        lambda groups: ctx.store.keyword_search(
+            query_text=query_text(ctx), top_k=top_k, filters=ctx.filters, analyzer_tokens=groups
+        ),
     )
 
 

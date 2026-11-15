@@ -11,7 +11,7 @@ from ..errors import StoreCapabilityError
 from ..models import MetaT, RAGNode
 from ..vectors import is_zero_vector
 from .context import RetrievalContext, RetrievalStrategy
-from .shared import embed_query, keyword_fallback, query_text, query_token_groups, with_local_window
+from .shared import embed_query, keyword_fallback, query_text, search_widening_names, with_local_window
 
 
 class HybridRRFStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
@@ -51,15 +51,18 @@ class HybridRRFStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
 
         if caps.supports_native_hybrid_rpc:
             w_vec, w_fts = self._fusion_weights(ctx)
-            results = ctx.store.hybrid_search(
-                query_text=query_text(ctx),
-                query_vector=query_vector,
-                top_k=top_k,
-                filters=ctx.filters,
-                rrf_k=ctx.profile.retrieval.rrf_k,
-                w_vec=w_vec,
-                w_fts=w_fts,
-                analyzer_tokens=query_token_groups(ctx),
+            results = search_widening_names(
+                ctx,
+                lambda groups: ctx.store.hybrid_search(
+                    query_text=query_text(ctx),
+                    query_vector=query_vector,
+                    top_k=top_k,
+                    filters=ctx.filters,
+                    rrf_k=ctx.profile.retrieval.rrf_k,
+                    w_vec=w_vec,
+                    w_fts=w_fts,
+                    analyzer_tokens=groups,
+                ),
             )
         else:
             results = self._fuse_in_engine(ctx, query_vector, top_k)
@@ -76,11 +79,11 @@ class HybridRRFStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
             return ctx.store.vector_search(query_vector, top_k=top_k * 2, filters=ctx.filters)
 
         def keyword_leg() -> list[RAGNode[MetaT]]:
-            return ctx.store.keyword_search(
-                query_text(ctx),
-                top_k=top_k * 2,
-                filters=ctx.filters,
-                analyzer_tokens=query_token_groups(ctx),
+            return search_widening_names(
+                ctx,
+                lambda groups: ctx.store.keyword_search(
+                    query_text(ctx), top_k=top_k * 2, filters=ctx.filters, analyzer_tokens=groups
+                ),
             )
 
         if ctx.pool is not None:

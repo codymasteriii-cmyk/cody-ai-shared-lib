@@ -7,15 +7,15 @@ from ..errors import StoreCapabilityError
 from ..models import MetaT, RAGNode
 from .context import RetrievalContext, RetrievalStrategy
 from .hybrid_rrf import HybridRRFStrategy
-from .shared import query_text, query_token_groups
+from .shared import query_text, search_widening_names
 
 
 def _keyword_hits(ctx: RetrievalContext[MetaT]) -> list[RAGNode[MetaT]]:
-    return ctx.store.keyword_search(
-        query_text(ctx),
-        top_k=ctx.candidate_limit(),
-        filters=ctx.filters,
-        analyzer_tokens=query_token_groups(ctx),
+    return search_widening_names(
+        ctx,
+        lambda groups: ctx.store.keyword_search(
+            query_text(ctx), top_k=ctx.candidate_limit(), filters=ctx.filters, analyzer_tokens=groups
+        ),
     )
 
 
