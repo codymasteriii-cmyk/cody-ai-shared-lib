@@ -1,12 +1,29 @@
 """RAGStore conformance kit and BrokenStore fixture (§4.6, AC-RAG-50).
 
 Provides:
-  - RAGStoreContractTests: pytest mixin with the 24 contract checks.
+  - RAGStoreContractTests: pytest mixin with the numbered contract checks (1 to 31; some have lettered variants).
   - BrokenStore: deliberately non-conforming store that must fail checks.
 
 An app subclasses the mixin and implements `make_store()`. A store that enforces a required scope
 also overrides `make_owner()`: the kit then writes every row for that owner and builds every read
 filter from it (`make_filters`), so the configuration that ships is the one tested (INT-05).
+
+Using it, in an app's own test file:
+
+    class TestMyStore(RAGStoreContractTests):
+        def make_store(self):
+            return MyStore(connection=test_connection())      # a clean store each time
+
+Every `test_check_*` method then runs against that store. A check that needs an optional capability (keyword search, summaries,
+fingerprints...) returns early when the store does not declare it, so a small store is not failed for what it never promised.
+
+What the checks cover, by theme:
+    filters and scope      1, 1b, 1c, 2, 9, 16      filters honoured; another owner invisible; required scope enforced; scoped store
+    ranking and search     3, 6, 7, 8, 10, 11, 13, 14, 22, 25    ordering, zero-vector rejection, filtered recall, CJK, hybrid, snippets
+    writing and deleting   4, 12, 15, 21, 23, 24    idempotent upserts, atomic sections, fingerprints kept as given, deletes
+    whole-text reads       17, 18, 31       scope_stats matches fetch_full_scope; granularity; reading a range
+    spoiler boundary       19, 20           summaries admitted by their end; per-document boundaries
+    text rules (§7.9)      26-30            must_mention, exact, must_not applied; prefer never a filter; ranked searches only
 """
 from __future__ import annotations
 
@@ -39,7 +56,11 @@ DIM = 768
 
 
 class BrokenStore(RAGStore[DefaultNodeMeta]):
-    """Deliberately non-conforming store used to verify that the test kit catches defects."""
+    """Deliberately non-conforming store used to verify that the test kit catches defects.
+
+    A test suite that cannot fail proves nothing. The kit is run against this store and must report failures; if it ever
+    passed, a check would have gone blind.
+    """
 
     def capabilities(self) -> StoreCapabilities:
         return StoreCapabilities(
@@ -69,6 +90,7 @@ class BrokenStore(RAGStore[DefaultNodeMeta]):
 
 
 def _node(node_id: str, text: str, doc_id: str, start: int = 0, seq: int = 0, **meta: Any) -> RAGNode[DefaultNodeMeta]:
+    """A small test passage whose span is exactly its own text, starting at `start`; `meta` becomes its metadata."""
     return RAGNode(
         node_id=node_id,
         text=text,
@@ -97,9 +119,11 @@ class RAGStoreContractTests:
         raise NotImplementedError
 
     def make_owner(self) -> OwnerScope:
+        """The owner every kit write is made for. Override for a store that requires a tenant (the kit then scopes every read too)."""
         return OwnerScope()
 
     def make_filters(self, doc_id: str | None = None, **extra: Any) -> RAGFilterSpec:
+        """Read filters built from the owner's keys (so a required scope is always stated), plus the document and any extras."""
         owner = self.make_owner()
         fields: dict[str, Any] = {}
         if owner.tenant_or_user_id is not None:
@@ -114,15 +138,18 @@ class RAGStoreContractTests:
         return RAGFilterSpec(**fields)
 
     def make_scoped_store(self, store: RAGStore[Any], owner: OwnerScope) -> RAGStore[Any] | None:
+        """A view of `store` bound to `owner` (§5.6). None means "this store has no scoped view", and check 16 is skipped."""
         return None
 
     def full_scope_filters(self) -> RAGFilterSpec | None:
+        """Filters for a multi-section scope the app seeded itself, for a store whose full-scope text does not come from kit writes."""
         return None
 
     # ── helpers ───────────────────────────────────────────────────────────
 
     @staticmethod
     def fingerprint_for(store: RAGStore[Any], node: RAGNode[Any]) -> Fingerprint:
+        """The fingerprint the kit gives a node; check 15 verifies the store keeps exactly this and never replaces it with its own."""
         space = store.embedding_space()
         return Fingerprint(
             content_hash=hashlib.sha256(node.text.encode("utf-8")).hexdigest(),
@@ -154,6 +181,7 @@ class RAGStoreContractTests:
 
     # ── Check 1: Filters honoured ──────────────────────────────────────────────
     def test_check_1_filters_honoured(self):
+        """A search returns only rows inside its document filter, and a zero boundary returns nothing."""
         store = self.make_store()
         vec = [0.1] * DIM
         self.write(store, "doc1", [_node("n1", "Node 1 text", "doc1")], [vec])
@@ -166,6 +194,7 @@ class RAGStoreContractTests:
         assert len(res_bound) == 0
 
     def test_check_1b_local_window_honours_filters_and_offsets(self):
+        """A local window never repeats text where passages overlap."""
         store = self.make_store()
         if not store.capabilities().supports_local_window:
             return
@@ -180,6 +209,7 @@ class RAGStoreContractTests:
         assert window.text == text[window.span.char_start:window.span.char_end], "overlap must not repeat text"
 
     def test_check_1c_rows_of_another_owner_are_invisible(self):
+        """Rows written for one owner are invisible to another (returned empty, or refused)."""
         store = self.make_store()
         owner = self.make_owner()
         if owner.tenant_or_user_id is None:
@@ -194,6 +224,7 @@ class RAGStoreContractTests:
 
     # ── Check 2: Required scope enforced ───────────────────────────────────────
     def test_check_2_required_scope_enforced(self):
+        """A search that omits a required filter key is refused, never run unscoped."""
         store = self.make_store()
         if not store.capabilities().required_filter_keys:
             return
@@ -202,6 +233,7 @@ class RAGStoreContractTests:
 
     # ── Check 3: Ordering descending and ranks 1-based ─────────────────────────
     def test_check_3_ordering_and_ranks(self):
+        """Results are ordered by descending score, with 1-based vector ranks."""
         store = self.make_store()
         nodes = [_node("n1", "Text 1", "d1"), _node("n2", "Text 2", "d1", start=10)]
         self.write(store, "d1", nodes, [[0.9] * DIM, [0.1] * DIM])
@@ -213,6 +245,7 @@ class RAGStoreContractTests:
 
     # ── Check 4: Idempotence, deletes, fingerprints ────────────────────────────
     def test_check_4_upsert_idempotence_and_deletes(self):
+        """Writing the same node twice leaves one row; deleting a document removes it and its fingerprints."""
         store = self.make_store()
         node = _node("n_idemp", "Original text", "d_idemp")
         self.write(store, "d_idemp", [node], [[0.1] * DIM])
@@ -224,18 +257,21 @@ class RAGStoreContractTests:
 
     # ── Check 5: Declared capabilities match working methods ───────────────────
     def test_check_5_capabilities_match_methods(self):
+        """A capability the store declares is backed by a method that works."""
         store = self.make_store()
         if store.capabilities().supports_full_scope_fetch:
             assert isinstance(store.fetch_full_scope(self.make_filters("any_doc")), list)
 
     # ── Check 6: Zero-vector query rejected ────────────────────────────────────
     def test_check_6_zero_vector_query_rejected(self):
+        """A zero query vector is rejected, not searched (it would match everything or nothing)."""
         store = self.make_store()
         with pytest.raises(EmbeddingProviderError):
             store.vector_search([0.0] * DIM, self.make_filters("any_doc"), top_k=5)
 
     # ── Check 7: Filtered recall ───────────────────────────────────────────────
     def test_check_7_filtered_recall(self):
+        """A filter is applied BEFORE the top-k cut: the target document is found even among many distractors."""
         store = self.make_store()
         self.write(store, "target_doc", [_node("target_n", "Target text", "target_doc")], [[0.5] * DIM])
         for i in range(10):
@@ -246,6 +282,7 @@ class RAGStoreContractTests:
 
     # ── Check 8: Native hybrid raw scores ──────────────────────────────────────
     def test_check_8_native_hybrid_raw_scores(self):
+        """Native hybrid search returns fused (rrf) scores, plus raw vector and keyword scores when declared."""
         store = self.make_store()
         if not store.capabilities().supports_native_hybrid_rpc:
             return
@@ -259,6 +296,7 @@ class RAGStoreContractTests:
 
     # ── Check 9: fetch_nodes honours filters ───────────────────────────────────
     def test_check_9_fetch_nodes_honours_filters(self):
+        """fetch_nodes applies the current filters: a node outside them is not returned."""
         store = self.make_store()
         self.write(store, "fn_doc", [_node("fn_1", "fetch content", "fn_doc", active=True)], [[0.1] * DIM])
 
@@ -267,6 +305,7 @@ class RAGStoreContractTests:
 
     # ── Check 10: CJK keyword search finds exact name ──────────────────────────
     def test_check_10_cjk_keyword_search(self):
+        """Keyword search finds a Chinese name inside a longer sentence."""
         store = self.make_store()
         if not store.capabilities().supports_keyword_fts:
             return
@@ -278,6 +317,7 @@ class RAGStoreContractTests:
 
     # ── Check 11: Keyword-only hit survives cosine floor ───────────────────────
     def test_check_11_keyword_hit_survives_cosine_floor(self):
+        """A keyword-only hit is not discarded by the similarity floor (that floor applies to vectors)."""
         store = self.make_store()
         if not store.capabilities().supports_native_hybrid_rpc:
             return
@@ -289,6 +329,7 @@ class RAGStoreContractTests:
 
     # ── Check 12: Atomic section writes ────────────────────────────────────────
     def test_check_12_atomic_section_writes(self):
+        """A reader running during a section write sees none of the section or all of it, never part."""
         store = self.make_store()
         nodes = [_node(f"atom_{i}", f"Text {i}", "atom_doc", start=i * 10) for i in range(5)]
         vectors = [[0.1] * DIM for _ in range(5)]
@@ -302,6 +343,7 @@ class RAGStoreContractTests:
 
     # ── Check 13: CJK phrase precision ─────────────────────────────────────────
     def test_check_13_cjk_phrase_precision(self):
+        """A phrase group does not match part of a longer name ("小明" must not match inside "李小明" as the phrase "李小明")."""
         store = self.make_store()
         if not store.capabilities().uses_analyzer_tokens:
             return
@@ -316,6 +358,7 @@ class RAGStoreContractTests:
 
     # ── Check 14: Snippets arrived unchanged ───────────────────────────────────
     def test_check_14_snippets_arrive_unchanged(self):
+        """A store that returns snippets marks them as match excerpts."""
         store = self.make_store()
         if not store.capabilities().returns_snippets:
             return
@@ -327,6 +370,7 @@ class RAGStoreContractTests:
 
     # ── Check 15: Fingerprints persisted as given ──────────────────────────────
     def test_check_15_fingerprints_persisted_as_given(self):
+        """The store keeps the fingerprint the engine computed; it never computes its own."""
         store = self.make_store()
         if not store.capabilities().supports_fingerprints:
             return
@@ -337,6 +381,7 @@ class RAGStoreContractTests:
 
     # ── Check 16: Scoped store refuses another scope ───────────────────────────
     def test_check_16_scoped_store_refuses_other_scope(self):
+        """A scoped store refuses reads, writes and deletes that name another owner or touch another owner's document."""
         base_owner = self.make_owner()
         owner_a = base_owner.model_copy(update={"tenant_or_user_id": "kit-user-a"})
         owner_b = base_owner.model_copy(update={"tenant_or_user_id": "kit-user-b"})
@@ -383,6 +428,7 @@ class RAGStoreContractTests:
 
     # ── Check 17: scope_stats describes what fetch_full_scope returns ──────────
     def test_check_17_scope_stats_matches_full_scope(self):
+        """scope_stats describes exactly the text fetch_full_scope returns (INT-06), so Tier 0 decisions agree with what is fetched."""
         store = self.make_store()
         caps = store.capabilities()
         if not caps.supports_full_scope_fetch:
@@ -396,6 +442,7 @@ class RAGStoreContractTests:
 
     # ── Check 18: full scope never crosses a section boundary ──────────────────
     def test_check_18_full_scope_granularity(self):
+        """Full-scope nodes come in document order, do not overlap, and never cross a section boundary (INT-07)."""
         store = self.make_store()
         if not store.capabilities().supports_full_scope_fetch:
             return
@@ -440,6 +487,7 @@ class RAGStoreContractTests:
 
     @staticmethod
     def _summary(node_id: str, doc_id: str, start: int, end: int, seq: int = 0) -> RAGNode[Any]:
+        """A section summary node covering [start, end), shaped as the engine builds them."""
         return RAGNode(
             node_id=node_id, text="A summary of the section.", is_summary=True, granularity="parent_summary",
             parent_kind="section", level=1,
@@ -448,6 +496,7 @@ class RAGStoreContractTests:
 
     # ── Check 19: summaries are admitted by their end, ranked searches never return them (K1) ──
     def test_check_19_summary_boundary_and_ranked_search(self):
+        """Ranked searches never return summaries, and a summary is admitted under a boundary only if it ends before it."""
         store = self.make_store()
         caps = store.capabilities()
         if not caps.supports_parent_summaries:
@@ -467,6 +516,7 @@ class RAGStoreContractTests:
 
     # ── Check 20: per-document boundaries ───────────────────────────────────────
     def test_check_20_per_document_boundaries(self):
+        """A per-document boundary applies to its own document only."""
         store = self.make_store()
         if not store.capabilities().supports_sequential_boundary:
             return
@@ -480,6 +530,7 @@ class RAGStoreContractTests:
 
     # ── Check 21: a partial section write keeps the section's other rows (H4) ──
     def test_check_21_partial_write_never_deletes(self):
+        """A write holding only the changed nodes keeps the section's other rows (what sync sends)."""
         store = self.make_store()
         p0, p1 = _node("pw_0", "Kept passage.", "pw_doc", 0), _node("pw_1", "Changed passage.", "pw_doc", 50)
         self.write(store, "pw_doc", [p0, p1], [[0.1] * DIM, [0.1] * DIM])
@@ -490,6 +541,7 @@ class RAGStoreContractTests:
 
     # ── Check 22: ordering by score with distinct scores and a tie (K2) ─────────
     def test_check_22_ordering_with_a_tie(self):
+        """Ordering is by score, and equal scores are ordered the same way every time."""
         store = self.make_store()
         query = [1.0] + [0.0] * (DIM - 1)
         near = [1.0, 0.2] + [0.0] * (DIM - 2)
@@ -506,6 +558,7 @@ class RAGStoreContractTests:
 
     # ── Check 23: deletes and revisions behave as declared (K3, K4) ─────────────
     def test_check_23_deletes_and_revisions(self):
+        """Deletes remove what they name, and revisions and fetch_nodes behave as declared."""
         store = self.make_store()
         caps = store.capabilities()
         nodes = [_node(f"dl_{i}", f"Text {i}", "dl_doc", i * 10, seq=i) for i in range(3)]
@@ -523,6 +576,7 @@ class RAGStoreContractTests:
 
     # ── Check 24: a reader sees a section's passages and summary together (K6) ──
     def test_check_24_atomic_passages_and_summary(self):
+        """A reader never sees a partial set of a section's passages while a section with a summary is written."""
         store = self.make_store()
         if not store.capabilities().supports_parent_summaries:
             return
@@ -547,6 +601,7 @@ class RAGStoreContractTests:
 
     # ── Check 25: "any of these names" and "all of these names" groups (§7.9, A1) ──
     def test_check_25_any_of_name_group(self):
+        """A group of name phrases means AND; an any_of group matches passages naming at least one alternative."""
         store = self.make_store()
         caps = store.capabilities()
         if not (caps.uses_analyzer_tokens and caps.supports_keyword_fts):
@@ -609,15 +664,19 @@ class RAGStoreContractTests:
                 assert "tr_part" not in ids, "an exact-word store does not match part of a longer word"
 
     def test_check_26_must_mention_rule(self):
+        """A must_mention filter rule keeps passages with the phrase and drops those without."""
         self._check_rule_kind("must_mention", "tr_has", "tr_lacks")
 
     def test_check_27_exact_rule(self):
+        """An exact filter rule keeps passages containing the exact phrase."""
         self._check_rule_kind("exact", "tr_has", "tr_lacks")
 
     def test_check_28_must_not_rule(self):
+        """A must_not filter rule drops passages that contain the phrase."""
         self._check_rule_kind("must_not", "tr_lacks", "tr_has")
 
     def test_check_29_prefer_rule_is_never_a_filter(self):
+        """A store never applies a prefer rule: nothing is excluded for it (the engine reorders instead)."""
         from ..models import TextRule
 
         store = self.make_store()
@@ -630,6 +689,7 @@ class RAGStoreContractTests:
             assert {"tr_has", "tr_lacks"} <= ids, "a store never applies a `prefer` rule: nothing is excluded for it"
 
     def test_check_30_rules_apply_to_ranked_searches_only(self):
+        """Text rules do not affect full-scope or summary reads, which are not ranked."""
         from ..models import TextRule
 
         store = self.make_store()
@@ -651,6 +711,7 @@ class RAGStoreContractTests:
 
     # ── Check 31: a scope can be read by character range (OI-4, 1.2.12) ────────
     def test_check_31_offset_range_scope(self):
+        """A range read returns only nodes inside [min, max), and the guard boundary still applies inside the range."""
         store = self.make_store()
         caps = store.capabilities()
         if not (caps.supports_offset_range_scope and caps.supports_full_scope_fetch):

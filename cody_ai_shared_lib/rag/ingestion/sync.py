@@ -1,4 +1,27 @@
-"""Fingerprint-driven document sync (§6.6, AC-RAG-06)."""
+"""Fingerprint-driven document sync (§6.6, AC-RAG-06).
+
+`sync_document` brings a stored document in line with its current text while paying only for what changed. It compares
+what is stored (node id -> fingerprint) with what the current text and profile would produce.
+
+    sync()
+    ├─ get_fingerprints()                 what the store holds for this document
+    ├─ build_section_nodes() + finalize_node()    what the current text would produce, per section
+    ├─ _sections_with_changed_text()      which sections have different text (or lost passages)
+    ├─ per section:
+    │  ├─ _is_stale()                     which passages are new, changed or built under old signatures
+    │  ├─ _stale_summary_ids() + _refresh_summaries()    unchanged section, old summary signature: re-sign, no new summary
+    │  ├─ embed_nodes()                   embed only the stale passages
+    │  ├─ summarize_section()             only when the section's text changed
+    │  └─ upsert_section()                one atomic write per touched section
+    └─ delete_nodes()                     LAST: rows whose text no longer exists
+
+Deleting last matters: if a sync fails halfway, the old rows are still there and still readable, and running sync again
+converges. The order never leaves a document with its content half-removed.
+
+Dummy example: chapter 2 was edited. Its passages p0 and p1 have new content hashes, p2 vanished (the chapter got shorter).
+Sync embeds p0 and p1, re-summarizes the chapter, upserts the section, then deletes p2 and the old summary rows. Chapters 1 and
+3 are skipped: `passages_skipped_unchanged` counts them.
+"""
 from __future__ import annotations
 
 from typing import Any, Generic
@@ -29,7 +52,11 @@ _STATUS_PRIORITY = {"skipped": 0, "provided": 1, "generated": 2, "partial": 3, "
 
 
 class DocumentSynchronizer(Generic[MetaT]):
-    """Brings a stored document in line with its current text, re-embedding only what changed."""
+    """Brings a stored document in line with its current text, re-embedding only what changed.
+
+    Needs a store that declares `supports_fingerprints` and `supports_delete`; without them there is nothing to compare
+    or clean up, and `sync` raises `StoreCapabilityError`.
+    """
 
     def __init__(
         self,
@@ -72,6 +99,7 @@ class DocumentSynchronizer(Generic[MetaT]):
           analyzer upgrade, or embed_summaries switched), they are refreshed from their stored text
           via fetch_nodes, without summarizing again; a store without fetch_nodes regenerates them.
         """
+        # 1. Refuse a store that cannot say what it holds or remove what vanished
         caps = self.store.capabilities()
         if not (caps.supports_fingerprints and caps.supports_delete):
             raise StoreCapabilityError(
@@ -79,6 +107,7 @@ class DocumentSynchronizer(Generic[MetaT]):
                 stage="sync",
             )
 
+        # 2. What is stored now, and what the current text and profile would write
         stored = call_store("get_fingerprints", lambda: self.store.get_fingerprints(doc.doc_id))
         signatures = write_signatures(
             self.embedding_model, self.store.embedding_space(), self.splitter, self.analyzer, caps.uses_analyzer_tokens
@@ -96,6 +125,7 @@ class DocumentSynchronizer(Generic[MetaT]):
 
         changed_sections = self._sections_with_changed_text(doc.doc_id, stored, section_nodes, current_ids)
 
+        # 3. Section by section: embed what is stale, refresh or redo summaries, write once
         upserted = skipped = 0
         summary_status = "skipped"
         regenerated_ids: set[str] = set()
@@ -170,7 +200,7 @@ class DocumentSynchronizer(Generic[MetaT]):
                 section_write = write
                 upserted += call_store("upsert_section", lambda: self.store.upsert_section(section_write))
 
-        # Delete last: a failed sync leaves the old rows readable, and a re-run converges.
+        # 4. Delete last: a failed sync leaves the old rows readable, and a re-run converges.
         section_seqs = {s.section_seq for s in sections}
         to_delete = [
             node_id
@@ -196,7 +226,10 @@ class DocumentSynchronizer(Generic[MetaT]):
 
     @staticmethod
     def _is_stale(node: RAGNode[Any], fingerprint: Fingerprint | None, signatures: WriteSignatures) -> bool:
-        """A passage is stale when its text, its vector signature or its search-token signature differ."""
+        """A passage is stale when its text, its vector signature or its search-token signature differ.
+
+        A passage with no stored fingerprint is new, which counts as stale.
+        """
         return (
             fingerprint is None
             or fingerprint.content_hash != node.content_hash
@@ -234,7 +267,12 @@ class DocumentSynchronizer(Generic[MetaT]):
         usage_tracker: UsageTracker,
         degradation_tracker: DegradationTracker,
     ) -> list[SummaryWrite[MetaT]] | None:
-        """Re-sign stored summaries from their stored text, or None when they must be regenerated."""
+        """Re-sign stored summaries from their stored text, or None when they must be regenerated.
+
+        When only the signature changed (a new embedding model, say) the summary text is still right, so it is fetched,
+        re-embedded and re-signed without another summarizing call. A store that cannot fetch nodes, or that no longer has
+        every summary, returns None and the caller regenerates them.
+        """
         if not caps.supports_fetch_nodes:
             return None
         filters = _owner_filters(doc_id, owner, caps)
@@ -271,6 +309,7 @@ class DocumentSynchronizer(Generic[MetaT]):
         section_nodes: dict[int, list[RAGNode[Any]]],
         current_ids: set[str],
     ) -> set[int]:
+        """Sections whose text differs from what is stored: a changed or new passage, or a passage that no longer exists."""
         changed = {
             seq
             for seq, nodes in section_nodes.items()
@@ -289,6 +328,7 @@ class DocumentSynchronizer(Generic[MetaT]):
         section_seqs: set[int],
         changed_sections: set[int],
     ) -> bool:
+        """True for a summary that must survive deletion: its section still exists and its text did not change."""
         parsed = parse_node_id(doc_id, node_id)
         if parsed is None or not parsed.is_summary:
             return False

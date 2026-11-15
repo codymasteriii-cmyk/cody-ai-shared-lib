@@ -1,4 +1,19 @@
-"""Citation formatters, extraction and verification (§11.1, §11.2, AC-RAG-41)."""
+"""Citation formatters, extraction and verification (§11.1, §11.2, AC-RAG-41).
+
+How a citation gets from the model's text to a verified `RAGCitation`:
+
+    1. the prompt shows each passage with a marker, e.g. <node ref="[2]" ...>        (the formatter's `marker`)
+    2. the model writes "founded in 1999 [2]"
+    3. `CitationExtractor.extract()` finds markers in the answer                      (the formatter's `parse`)
+    4. each marker is looked up in the turn map {marker -> node id}                  (the formatter's `resolve`)
+    5. a marker that resolves to a node the model was really shown, and that the guards allow, is verified;
+       anything else is unverified and, by policy, removed from the text ("filter") or shown as "[?]" ("flag")
+
+The point of step 4: a model can invent "[9]". A marker only counts if it maps to a passage in THIS turn's prompt.
+
+Three formatters: `ref` ("[1]", the default), `offset` ("[c2:1500-1620]", a character range that snaps to its node) and
+`document` ("[doc:novel-7]"). An app picks one with `profile.citations.formatter`.
+"""
 from __future__ import annotations
 
 import re
@@ -10,7 +25,11 @@ from ..render import DefaultRenderer, NodeRenderer
 
 @runtime_checkable
 class CitationFormatter(Protocol):
-    """Decides what citation markers look like and how they map back to nodes (§11.1)."""
+    """Decides what citation markers look like and how they map back to nodes (§11.1).
+
+    `marker` writes one for the prompt; `parse` finds them in the answer; `resolve` maps one back to a node id;
+    `label` is the human name shown for a source; `instructions` is the rule given to the model about how to cite.
+    """
     name: str
 
     def marker(self, node: RAGNode[Any], index: int) -> str:
@@ -30,6 +49,7 @@ class CitationFormatter(Protocol):
 
 
 class _BaseFormatter:
+    """What the three built-in formatters share: finding markers with a regex and looking them up in the turn map."""
     pattern: ClassVar[re.Pattern[str]]
 
     def __init__(self, renderer: NodeRenderer[Any] | None = None):
@@ -61,6 +81,11 @@ class RefCitationFormatter(_BaseFormatter):
     Any bracketed number list is a candidate, wherever it appears, so `主角[1]。` and `city[1].` are
     recognised. Whether a candidate is a citation is decided by the extractor against the turn's
     citation map (§11.2): one glued to an ASCII word (`arr[1]`) that resolves to nothing stays text.
+
+    >>> RefCitationFormatter().parse("A [1] and [2, 3] but [2024]")        # four digits is a year, not a marker
+    [('[1]', 2, 5), ('[2, 3]', 10, 16)]
+    >>> RefCitationFormatter().expand("[2, 3]")
+    ['[2]', '[3]']
     """
     name = "ref"
     pattern = re.compile(r"\[\s*\d{1,3}(?:\s*,\s*\d{1,3})*\s*\]")
@@ -81,6 +106,11 @@ class OffsetCitationFormatter(_BaseFormatter):
         return f"[c{node.span.section_seq}:{node.span.char_start}-{node.span.char_end}]"
 
     def locate(self, marker: str, nodes: Sequence[RAGNode[Any]]) -> tuple[RAGNode[Any], SourceSpan] | None:
+        """Find the node a character range falls in, and narrow the span to the cited range.
+
+        None when no shown node overlaps the range, or when the same range exists in several documents (it cannot be
+        told which was meant, so it is not verified).
+        """
         match = self.pattern.fullmatch(marker)
         if match is None:
             return None
@@ -126,7 +156,10 @@ def _glued_to_ascii_word(text: str, start: int) -> bool:
 
 
 def _markers_outside_code(text: str, formatter: CitationFormatter) -> list[tuple[str, int, int]]:
-    """Parsed markers, leaving anything inside a code block or code span alone."""
+    """Parsed markers, leaving anything inside a code block or code span alone.
+
+    Code often contains "[1]" as an array index; it must never be read as a citation.
+    """
     code = [match.span() for match in _CODE_RE.finditer(text)]
     return [
         (raw, start, end)
@@ -159,6 +192,9 @@ def strip_markers(text: str, formatter: CitationFormatter) -> str:
 
     Without the turn's citation map it cannot tell `arr[1]` from a citation, so it leaves markers glued
     to an ASCII word alone; `done.answer_final` is the canonical clean text.
+
+    >>> strip_markers("Sky is blue [1]. See arr[1] too.", RefCitationFormatter())
+    'Sky is blue. See arr[1] too.'
     """
     return _rebuild(text, [
         (start, end, "") for _, start, end in _markers_outside_code(text, formatter)
@@ -167,7 +203,15 @@ def strip_markers(text: str, formatter: CitationFormatter) -> str:
 
 
 class CitationExtractor(Generic[MetaT]):
-    """Resolves markers against this turn's fenced nodes and applies the unverified policy (§11.2)."""
+    """Resolves markers against this turn's fenced nodes and applies the unverified policy (§11.2).
+
+    >>> nodes = [RAGNode(node_id="n1", text="Founded in 1999."), RAGNode(node_id="n2", text="Moved in 2005.")]
+    >>> clean, cites = CitationExtractor().extract("It was founded in 1999 [1]. A made-up claim [9].", nodes)
+    >>> clean
+    'It was founded in 1999 [1]. A made-up claim.'
+    >>> [(c.marker, c.verified) for c in cites]
+    [('[1]', True), ('[9]', False)]
+    """
 
     def __init__(
         self,
@@ -186,7 +230,12 @@ class CitationExtractor(Generic[MetaT]):
         on_unverified: Literal["filter", "flag"] | None = None,
         turn_map: dict[str, str] | None = None,
     ) -> tuple[str, list[RAGCitation]]:
-        """Return the answer with unverified markers handled, and one citation per distinct marker."""
+        """Return the answer with unverified markers handled, and one citation per distinct marker.
+
+        `nodes` must be the passages that were actually in the prompt (`AssembledPrompt.included_nodes`), and `turn_map` the
+        prompt's marker-to-node map; with neither, markers are numbered by position. `guards` may reject a citation that
+        points at forbidden text. `current_revisions` lets a citation be marked stale.
+        """
         policy = on_unverified or self.on_unverified
         markers_to_nodes = turn_map if turn_map is not None else {
             self.formatter.marker(node, i): node.node_id for i, node in enumerate(nodes, start=1)
@@ -221,6 +270,7 @@ class CitationExtractor(Generic[MetaT]):
         return _rebuild(text, replacements), list(by_marker.values())
 
     def _expand(self, marker: str) -> list[str]:
+        """Split "[1, 2]" into "[1]" and "[2]" when the formatter supports it; other formats stay as one marker."""
         expand = getattr(self.formatter, "expand", None)
         return expand(marker) if expand is not None else [marker]
 
@@ -233,6 +283,11 @@ class CitationExtractor(Generic[MetaT]):
         current_revisions: dict[str, str] | None,
         ordinal: int,
     ) -> RAGCitation:
+        """Build the citation for one marker: resolve it, then check the guards and staleness.
+
+        A marker that resolves to nothing gives an unverified placeholder; one that resolves but is refused by a guard
+        is marked unverified too, so a citation can never point at text the reader may not see.
+        """
         digits = re.fullmatch(r"\[(\d+)\]", marker)
         index = int(digits.group(1)) if digits else ordinal
 

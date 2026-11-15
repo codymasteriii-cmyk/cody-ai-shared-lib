@@ -1,4 +1,8 @@
-"""Retrieval diff helper for comparing two retrieval runs (§14.2)."""
+"""Retrieval diff helper for comparing two retrieval runs (§14.2).
+
+Use it to see what a change did to search quality before shipping it: run the same questions with the old and the new profile
+(or store), and diff each pair. A change that keeps the same top results in the same order has overlap 1.0 and correlation 1.0.
+"""
 from __future__ import annotations
 
 import math
@@ -15,6 +19,14 @@ def diff_retrievals(
 
     Computes Jaccard overlap@k, Spearman rank correlation on shared node IDs,
     exclusively retrieved IDs, and rank deltas.
+
+    >>> from cody_ai_shared_lib.rag.models import RAGNode
+    >>> make = lambda *ids: RAGRetrievalResult(nodes=[RAGNode(node_id=i, text="") for i in ids])
+    >>> d = diff_retrievals(make("a", "b", "c"), make("b", "a", "d"), k=3)
+    >>> d.overlap_at_k, d.only_in_a, d.only_in_b
+    (0.5, ['c'], ['d'])
+    >>> d.rank_deltas, d.rank_correlation
+    ({'a': (1, 2), 'b': (2, 1)}, -1.0)
     """
     ids_a = [n.node_id for n in a.nodes[:k]]
     ids_b = [n.node_id for n in b.nodes[:k]]

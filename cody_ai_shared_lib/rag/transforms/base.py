@@ -1,4 +1,10 @@
-"""Query variants and the QueryTransform contract (§7.8)."""
+"""Query variants and the QueryTransform contract (§7.8).
+
+A question sometimes needs more than one search: "compare A and B" has two subjects, and one search for the whole sentence may
+find only the better-matching one. A transform turns one question into several `QueryVariant`s (the primary one plus extras),
+each searched separately and then fused (`transforms/fusion.py`). The only built-in transform is the secondary-query fan-out; an app
+may add others (a keyword-expansion lexicon, a hypothetical-answer search) by registering them as "transform".
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,7 +16,7 @@ from ..models import QueryIntent, RAGQueryRequest
 
 
 class QueryVariant(BaseModel):
-    """One phrasing of the query to search with (§7.8)."""
+    """One phrasing of the query to search with (§7.8): its text, how much it counts in fusion, and where it came from."""
     text: str
     weight: float = 1.0
     origin: str = "primary"  # "primary" | "secondary" | "lexicon" | "hyde" | app name

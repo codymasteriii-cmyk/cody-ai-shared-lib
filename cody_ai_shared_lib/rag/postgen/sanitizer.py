@@ -1,4 +1,12 @@
-"""Output sanitizer stripping fence leaks, control flags, and unauthorized external links/images (§11.6, AC-RAG-43)."""
+"""Output sanitizer stripping fence leaks, control flags, and unauthorized external links/images (§11.6, AC-RAG-43).
+
+The last step before the answer leaves the engine. A retrieved document or the user's own text could try to make the model
+write a link or an image whose URL carries data out (an exfiltration trick), or the model could echo internal markup.
+The sanitizer removes, in order: images and links on untrusted hosts (the visible text is kept, the URL dropped); reference-style
+link definitions and autolinks on untrusted hosts; our own fence tags and the fence id; and any leftover [[answer_found=...]] flag.
+
+A host is trusted when the profile lists it (`allowed_link_hosts`) or when a source passage's own metadata URL uses it.
+"""
 from __future__ import annotations
 
 import re
@@ -7,12 +15,19 @@ from urllib.parse import urlparse
 
 
 class OutputSanitizer:
-    """Sanitizes generation output to prevent exfiltration, unauthorized links, and tag leaks (§11.6)."""
+    """Sanitizes generation output to prevent exfiltration, unauthorized links, and tag leaks (§11.6).
+
+    >>> OutputSanitizer().sanitize("See [the site](https://evil.example/x) now")
+    'See the site now'
+    >>> OutputSanitizer(allowed_link_hosts=["example.com"]).sanitize("[ok](https://docs.example.com/a)")
+    '[ok](https://docs.example.com/a)'
+    """
 
     def __init__(self, allowed_link_hosts: Sequence[str] | None = None):
         self.allowed_link_hosts = {h.lower() for h in (allowed_link_hosts or []) if h}
 
     def _collect_allowed_hosts(self, nodes: Sequence[Any] | None) -> set[str]:
+        """The configured hosts plus the host of each source passage's own `url` metadata (a news article may link its source)."""
         hosts = set(self.allowed_link_hosts)
         for node in nodes or []:
             meta = getattr(node, "metadata", None)
@@ -35,6 +50,7 @@ class OutputSanitizer:
         allowed_link_hosts: Sequence[str] | None = None,
         fence_id: str | None = None,
     ) -> str:
+        """Return the answer text made safe to show. `nodes` and `fence_id` come from the prompt the answer was written for."""
         if not text:
             return ""
 

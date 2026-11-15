@@ -1,4 +1,14 @@
-"""Quote verification and sentence-level citation coverage (§11.3, §11.4, AC-RAG-42)."""
+"""Quote verification and sentence-level citation coverage (§11.3, §11.4, AC-RAG-42).
+
+Two separate checks on an answer, both without a model call:
+
+  * quotes: when the answer quotes words next to a citation ("he said "we leave at dawn" [3]"), those words must really occur
+    in passage 3, allowing for small differences. A quote that is not in its source is a misquote; the citation is unverified.
+  * coverage: what share of the answer's sentences carry a verified citation. It is reported, not enforced
+    (`min_citation_coverage` is not enforced in this version).
+
+Quote checking is opt-in (`citations.verify_quotes`), because it only helps when the model quotes; KnowledgeBase turns it on.
+"""
 from __future__ import annotations
 
 import difflib
@@ -17,11 +27,20 @@ _MIN_COVERED_SENTENCE_CHARS = 20
 
 
 def _normalize_for_quote(text: str) -> str:
+    """Lower-case and collapse punctuation and spacing, so "Don't  go!" and "don t go" compare equal."""
     return _NORM_WS_RE.sub(" ", text.lower()).strip()
 
 
 def quote_match_ratio(quote: str, source: str) -> float:
-    """Best similarity of the quote against the source window aligned to their longest shared run."""
+    """Best similarity of the quote against the source window aligned to their longest shared run.
+
+    1.0 when the normalized quote occurs verbatim; otherwise the similarity (0 to 1) of the best-aligned stretch of the source.
+
+    >>> quote_match_ratio("founded in 1999", "The company was founded in 1999.")
+    1.0
+    >>> quote_match_ratio("completely unrelated words", "The company was founded in 1999.") < 0.85
+    True
+    """
     if not quote:
         return 0.0
     norm_quote, norm_source = _normalize_for_quote(quote), _normalize_for_quote(source)
@@ -41,7 +60,11 @@ def compute_coverage(
     answer_text: str,
     analyzer: TextAnalyzer,
 ) -> CitationCoverage:
-    """A sentence is cited when a verified marker is in it or in the next sentence (§11.4)."""
+    """A sentence is cited when a verified marker is in it or in the next sentence (§11.4).
+
+    "The next sentence" is allowed because models often put the marker after a sentence's full stop. Headings, very short
+    sentences (under 20 characters) and sentences that end in a colon are not counted: they make no claim to cite.
+    """
     sentences = [answer_text[start:end].strip() for start, end in analyzer.sentences(answer_text)]
     verified = [c for c in citations if c.verified]
     has_marker = [any(c.marker in sentence for c in verified) for sentence in sentences]
@@ -69,7 +92,11 @@ def compute_coverage(
 
 
 class QuoteValidator(Generic[MetaT]):
-    """Checks that every quoted string next to a citation is really in the cited node (§11.3)."""
+    """Checks that every quoted string next to a citation is really in the cited node (§11.3).
+
+    A quote passes when its best match in the source scores at least `min_match_ratio` (default 0.85), which tolerates
+    small differences such as punctuation or a changed word, but not an invented sentence.
+    """
 
     def __init__(
         self,
@@ -86,6 +113,11 @@ class QuoteValidator(Generic[MetaT]):
         nodes: list[RAGNode[MetaT]],
         answer_text: str | None = None,
     ) -> tuple[list[RAGCitation], CitationCoverage]:
+        """Verify each citation's quotes and return the citations with coverage computed on the answer.
+
+        A citation with no quote next to it is left as it was: comparing a source with itself would always pass and
+        prove nothing. A citation whose node was not shown is unverified.
+        """
         node_text = {n.node_id: n.text for n in nodes}
 
         quotes_by_marker: dict[str, list[str]] = {}

@@ -3,6 +3,13 @@
 The engine names the nodes it builds with one format. Stores treat every node id as an opaque key:
 they store it, look rows up and delete by it, and never parse it. Apps that build their own nodes
 (for `prepare_nodes`) may use any id; `parse_node_id` returns None for those.
+
+The format makes a node's place in its document readable, which `sync` relies on to tell a vanished passage from a
+vanished summary:
+
+    novel-7#s2p3          document "novel-7", section 2, passage 3
+    novel-7#s2_sum        the summary of section 2
+    novel-7#s2_u0_sum     the summary of unit 0 of section 2 (long sections are summarized in units)
 """
 from __future__ import annotations
 
@@ -13,18 +20,27 @@ NodeKind = Literal["passage", "section_summary", "unit_summary"]
 
 
 class NodeIdParts(NamedTuple):
-    """The parts of an engine-built node id."""
+    """The parts of an engine-built node id: which section, what kind, and which passage or unit."""
     section_seq: int
     kind: NodeKind
     number: int | None         # passage index or unit_seq; None for the section summary
 
     @property
     def is_summary(self) -> bool:
+        """True for a section summary or a unit summary."""
         return self.kind != "passage"
 
 
 def format_node_id(doc_id: str, section_seq: int, kind: NodeKind, index: int | None = None) -> str:
-    """`{doc}#s{seq}p{i}` for passages, `{doc}#s{seq}_sum` and `{doc}#s{seq}_u{n}_sum` for summaries."""
+    """`{doc}#s{seq}p{i}` for passages, `{doc}#s{seq}_sum` and `{doc}#s{seq}_u{n}_sum` for summaries.
+
+    >>> format_node_id("novel-7", 2, "passage", 3)
+    'novel-7#s2p3'
+    >>> format_node_id("novel-7", 2, "section_summary")
+    'novel-7#s2_sum'
+    >>> format_node_id("novel-7", 2, "unit_summary", 0)
+    'novel-7#s2_u0_sum'
+    """
     if kind == "passage":
         return f"{doc_id}#s{section_seq}p{index}"
     if kind == "unit_summary":
@@ -39,6 +55,11 @@ def parse_node_id(doc_id: str, node_id: str) -> NodeIdParts | None:
     """Parse an engine-built id, or return None for any other id.
 
     `doc_id` is required because a doc id may itself contain `#`.
+
+    >>> parse_node_id("novel-7", "novel-7#s2p3")
+    NodeIdParts(section_seq=2, kind='passage', number=3)
+    >>> parse_node_id("novel-7", "an-app-made-id") is None
+    True
     """
     if not node_id.startswith(doc_id):
         return None

@@ -2,6 +2,14 @@
 
 Checks output start character-by-character and releases text at the first moment it cannot
 be a flag. Never delays the first token when the text has ruled a flag out.
+
+Why: the prompt tells the model to begin its answer with `[[answer_found=yes]]` (or `no` / `partial`). The app must never
+see that control text, but while streaming, the engine cannot know whether the first characters are the flag until enough
+have arrived. This buffer holds back only the characters that could still turn out to be the flag, and releases them
+the moment they cannot, so the first word of a normal answer appears immediately.
+
+    "[[answer_found=yes]] The festival began..."   the flag is removed and remembered; the answer text is released
+    "The festival began..."                        "T" is not "[", so everything is released at once, no flag
 """
 from __future__ import annotations
 
@@ -17,7 +25,22 @@ VALID_VALUES = frozenset(["yes", "no", "partial"])
 
 
 class FlagStreamBuffer:
-    """State machine buffering stream start for [[answer_found=...]] flag."""
+    """State machine buffering stream start for [[answer_found=...]] flag.
+
+    States: leading_ws (skip spaces) -> matching_prefix (is this "[[answer_found="?) -> reading_value (read up to "]]")
+    -> discard_ws_after (drop spaces after the flag) -> done (pass everything through). A mismatch at any point releases what
+    was held and goes straight to done. After `feed()`/`finalize()`, `answer_found` holds "yes", "no", "partial" or None.
+
+    >>> buffer = FlagStreamBuffer()
+    >>> buffer.feed("[[answer_found=")
+    []
+    >>> buffer.feed("no]]  Not found.")
+    ['Not found.']
+    >>> buffer.answer_found
+    'no'
+    >>> FlagStreamBuffer().feed("Hello")          # not a flag: released at once
+    ['Hello']
+    """
 
     def __init__(self) -> None:
         self.state: Literal["leading_ws", "matching_prefix", "reading_value", "discard_ws_after", "done"] = "leading_ws"
@@ -27,7 +50,10 @@ class FlagStreamBuffer:
         self.prefix_index: int = 0
 
     def feed(self, chunk: str) -> list[str]:
-        """Feed a new chunk of streamed text. Return deltas to emit."""
+        """Feed a new chunk of streamed text. Return deltas to emit.
+
+        The rule numbers in the comments below are the rules of spec §10.5.
+        """
         if not chunk:
             return []
         if self.state == "done":
@@ -101,7 +127,11 @@ class FlagStreamBuffer:
         return deltas
 
     def finalize(self) -> list[str]:
-        """Called at end of stream. Releases any held text as a last delta."""
+        """Called at end of stream. Releases any held text as a last delta.
+
+        A stream that ends while still looking like a flag (e.g. an answer that is exactly "[[ans") is shown as written,
+        and no flag is recorded: better a visible oddity than a swallowed answer.
+        """
         if self.state == "done":
             return []
 

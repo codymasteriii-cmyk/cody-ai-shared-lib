@@ -1,6 +1,9 @@
 """Server-Sent Events (SSE) formatter (§10.9, AC-RAG-54).
 
 Pure string formatting helper with no web framework dependencies.
+
+An app that serves `stream_query` over HTTP turns each `RAGStreamEvent` into the text a browser's EventSource understands, and
+yields it from its own response. The library does not depend on any web framework; this is only the wire format.
 """
 from __future__ import annotations
 
@@ -16,6 +19,9 @@ def format_event(event: Any, data: Any = None) -> str:
       - format_event("delta", {"text": "hello"})
       - format_event(RAGStreamEvent(event="delta", data={"text": "hello"}))
       - format_event({"event": "delta", "data": {"text": "hello"}})
+
+    >>> format_event("delta", {"text": "hi"}).splitlines()
+    ['event: delta', 'data: {"text": "hi"}', '']
     """
     event_name: str
     event_data: Any

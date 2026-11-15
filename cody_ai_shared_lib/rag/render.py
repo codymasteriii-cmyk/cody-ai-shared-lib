@@ -2,6 +2,18 @@
 
 Provides customized views of a node for embedding, reranking, prompt assembly,
 and citations without altering node storage.
+
+The renderer is how an app teaches the library about its own data without the library knowing the schema. The same node
+can be presented differently to each consumer:
+
+    embed_text      what the embedding model reads      e.g. the title prefixed to the body, for better vectors
+    rerank_text     what the reranker reads
+    prompt_text     what the answering model reads      e.g. "Published 2026-03-02, Reuters: ..."
+    citation_label  the name shown for a source         e.g. the article headline
+    timestamp / features / flags   dates and numbers for recency and fusion stages
+
+An app extends `DefaultRenderer` and overrides only what it needs. The engine checks a custom renderer at startup and refuses one
+that left a method as an empty protocol stub, because that method would silently return None.
 """
 from __future__ import annotations
 
@@ -18,6 +30,9 @@ class NodeRenderer(Protocol[MetaT]):
     Extend `DefaultRenderer` and override only what you need. Do not subclass this protocol: the
     method bodies below are empty stubs, so any method you leave out would return None. The engine
     refuses such a renderer at startup (`renderer_problems`, §3.4, AC-RAG-111).
+
+    Dummy example of a news renderer: `prompt_text` returns f"{published_date} {source}: {node.text}" and `timestamp` returns the
+    article's date; every other method is inherited from `DefaultRenderer`.
     """
 
     def embed_text(self, node: RAGNode[MetaT]) -> str:
@@ -75,7 +90,11 @@ def inherited_protocol_stubs(obj: Any, protocol: type, names: tuple[str, ...]) -
 
 
 def renderer_problems(renderer: Any) -> list[str]:
-    """Startup problems for an app-supplied renderer (§3.4, AC-RAG-111)."""
+    """Startup problems for an app-supplied renderer (§3.4, AC-RAG-111).
+
+    >>> renderer_problems(DefaultRenderer())
+    []
+    """
     stubs = inherited_protocol_stubs(renderer, NodeRenderer, RENDERER_METHODS)
     if not stubs:
         return []
@@ -87,7 +106,11 @@ def renderer_problems(renderer: Any) -> list[str]:
 
 
 def metadata_value(meta: Any, field: str) -> Any:
-    """A metadata field from a dict, an attribute or `extra`. Only None counts as missing, never False, 0 or ""."""
+    """A metadata field from a dict, an attribute or `extra`. Only None counts as missing, never False, 0 or "".
+
+    >>> metadata_value({"active": False}, "active")
+    False
+    """
     if isinstance(meta, dict):
         return meta.get(field)
     value = getattr(meta, field, None)
@@ -97,11 +120,17 @@ def metadata_value(meta: Any, field: str) -> Any:
     return value
 
 
-_metadata_value = metadata_value
+_metadata_value = metadata_value       # the older private name, kept so existing imports keep working
 
 
 def parse_timestamp(value: Any) -> datetime | None:
-    """A datetime from a datetime, a date (midnight) or an ISO 8601 string (a trailing "Z" is UTC); else None."""
+    """A datetime from a datetime, a date (midnight) or an ISO 8601 string (a trailing "Z" is UTC); else None.
+
+    >>> parse_timestamp("2026-01-02T03:04:05Z").isoformat()
+    '2026-01-02T03:04:05+00:00'
+    >>> parse_timestamp("not a date") is None
+    True
+    """
     if isinstance(value, datetime):
         return value
     if isinstance(value, date):
@@ -118,7 +147,11 @@ def parse_timestamp(value: Any) -> datetime | None:
 
 
 class DefaultRenderer(Generic[MetaT]):
-    """Standard fallback renderer using default node attributes."""
+    """Standard fallback renderer using default node attributes.
+
+    Text methods return the node's own text; the label is the section title or the document id; `timestamp` and `features`
+    look for common metadata names (created_at, published_at, confidence...) so simple apps need no renderer at all.
+    """
 
     def embed_text(self, node: RAGNode[MetaT]) -> str:
         return node.text

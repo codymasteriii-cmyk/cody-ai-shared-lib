@@ -1,4 +1,9 @@
-"""Generation strategy port and the single-call `stuff` strategy (§10.6, AC-RAG-39)."""
+"""Generation strategy port and the single-call `stuff` strategy (§10.6, AC-RAG-39).
+
+A generation strategy turns an assembled prompt into model text. The only built-in one, `stuff`, puts the whole prompt
+in one call ("stuffs" it) and lets the gateway handle models, fallbacks, budgets and usage. A different strategy (say, one
+that answers in two steps) would implement the same two methods and be registered under "generator".
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -14,7 +19,7 @@ from ..usage import BudgetGuard, UsageTracker
 
 @dataclass
 class GenerationContext:
-    """Per-request collaborators for one generation call."""
+    """Per-request collaborators for one generation call: where to record usage and degradations, the budget guard, the stage name."""
     usage_tracker: UsageTracker
     degradation_tracker: DegradationTracker
     budget_guard: BudgetGuard | None = None
@@ -23,6 +28,7 @@ class GenerationContext:
 
 @runtime_checkable
 class GenerationStrategy(Protocol):
+    """The contract for generation: `generate` returns the whole text, `stream` yields it in chunks."""
     name: str
     version: str
 
@@ -43,6 +49,7 @@ class StuffStrategy:
         self.profile = profile
 
     def _call_args(self, prompt: AssembledPrompt[Any], ctx: GenerationContext) -> dict[str, Any]:
+        """The arguments of one gateway call. `generate` and `stream` share them, so they cannot drift apart."""
         return {
             "system_prompt": prompt.system_prompt,
             "user_message": prompt.user_message,

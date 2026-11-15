@@ -7,6 +7,21 @@ Implements every capability in pure Python with thread safety:
   - Summary units and levels;
   - Offset addressable windows and sequential boundaries;
   - Fingerprints, revisions, atomic section commits, and JSONL fixture round-tripping.
+
+What this file is for: the reference answer to "what should a store do?". It is the store the library's own tests and
+evaluations run against, and the one an app author reads to learn the exact behaviour of every `RAGStore` method: how filters
+narrow, how the spoiler boundary cuts, how fingerprints are kept, how a section is written all-or-nothing. It is NOT for
+production: it scans every node on every search and holds everything in memory.
+
+Two classes:
+    InMemoryRAGStore         the store itself; every capability on, thread-safe (one reentrant lock)
+    ScopedInMemoryRAGStore   a view bound to one owner, the reference form of the §5.6 scoped-store pattern: it refuses any
+                             read or write that names another tenant, and always applies its own tenant to reads
+
+Dummy example: ingest two passages of one document with `upsert_section`, then `vector_search` returns them ranked by
+cosine similarity, `keyword_search` ranks them by BM25 over the analyzer's tokens, and `hybrid_search` fuses the two with RRF.
+A search never returns a summary (summaries are read with `fetch_parent_summaries`), and every returned node is a copy, so a
+caller cannot change what is stored.
 """
 from __future__ import annotations
 
@@ -49,7 +64,19 @@ _Entry = tuple[RAGNode[MetaT], "list[float] | None", "Fingerprint | None"]
 
 
 class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
-    """Pure-Python in-memory implementation of RAGStore for tests and eval."""
+    """Pure-Python in-memory implementation of RAGStore for tests and eval.
+
+    >>> store = InMemoryRAGStore()
+    >>> node = RAGNode(node_id="d#s0p0", text="Li Wei went to Beijing.", span=SourceSpan(doc_id="d", char_end=23))
+    >>> store.upsert_section_nodes("d", 0, [node], [[1.0, 0.0]])
+    1
+    >>> [n.node_id for n in store.keyword_search("Beijing", RAGFilterSpec(), top_k=5)]
+    ['d#s0p0']
+    >>> store.vector_search([1.0, 0.0], RAGFilterSpec(), top_k=5)[0].score_kind
+    'cosine'
+    >>> store.scope_stats(RAGFilterSpec()).node_count
+    1
+    """
 
     def __init__(
         self,
@@ -89,7 +116,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         self.analyzer = analyzer or CjkAwareAnalyzer()
         self._lock = threading.RLock()
 
-        # Storage collections:
+        # Storage collections (all guarded by `self._lock`):
         # node_id -> RAGNode[MetaT]
         self._nodes: dict[str, RAGNode[MetaT]] = {}
         # (doc_id, section_seq) -> list[node_id]
@@ -105,9 +132,11 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         self._revision_counter = 1
 
     def capabilities(self) -> StoreCapabilities:
+        """Everything on by default, so the in-memory store can serve every strategy; pass `capabilities` to test a weaker store."""
         return self._capabilities
 
     def embedding_space(self) -> EmbeddingSpace:
+        """The vector space this store holds; the engine refuses to search it with another embedding model."""
         return self._embedding_space
 
     # ── Filter Validation and Enforcement ──────────────────────────────────────
@@ -117,11 +146,18 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         validate_scope(filters, self._capabilities)
 
     def _is_required(self, key: str) -> bool:
+        """True when the store's capabilities make this filter key mandatory (`tenant_id` is the alias of `tenant_or_user_id`)."""
         required = self._capabilities.required_filter_keys
         return key in required or (key == "tenant_or_user_id" and "tenant_id" in required)
 
     def _passes_filters(self, node: RAGNode[MetaT], filters: RAGFilterSpec) -> bool:
-        """Return True if node matches all criteria in filters."""
+        """Return True if node matches all criteria in filters.
+
+        The rules, in order: documents; tenant (the node's own metadata, else the owner it was written for; a row with no
+        owner NEVER matches a required scope: fail closed); domain; categories; the sequential boundary; the minimum offset;
+        the date range; custom keys. A field the node does not have is not a mismatch, except tenant and domain under a
+        required scope.
+        """
         # doc_ids filter
         if filters.doc_ids is not None and node.span.doc_id not in filters.doc_ids:
             return False
@@ -229,6 +265,11 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
 
     @staticmethod
     def _cosine_similarity(v1: list[float], v2: list[float]) -> float:
+        """Cosine similarity, clamped to [-1, 1]; 0.0 for an empty, zero or mismatched-length vector.
+
+        >>> InMemoryRAGStore._cosine_similarity([1.0, 0.0], [1.0, 0.0]), InMemoryRAGStore._cosine_similarity([1.0, 0.0], [0.0, 1.0])
+        (1.0, 0.0)
+        """
         if not v1 or not v2 or len(v1) != len(v2):
             return 0.0
         dot = sum(a * b for a, b in zip(v1, v2))
@@ -245,6 +286,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         return satisfies(node.text, rules) if rules else True
 
     def _node_tokens(self, node: RAGNode[MetaT]) -> list[str]:
+        """The node's stored search tokens, or its text tokenized now when none were stored."""
         return node.search_tokens if node.search_tokens is not None else self.analyzer.tokenize(node.text)
 
     @staticmethod
@@ -259,7 +301,10 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
 
     @staticmethod
     def _bm25_scores(query_terms: list[str], documents: list[list[str]]) -> list[float]:
-        """Okapi BM25 over the candidate documents (k1=1.2, b=0.75)."""
+        """Okapi BM25 over the candidate documents (k1=1.2, b=0.75).
+
+        Scores are relative to the candidate set (the idf is computed over it), which is enough for ranking within one search.
+        """
         if not documents:
             return []
         k1, b = 1.2, 0.75
@@ -288,6 +333,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         filters: RAGFilterSpec,
         top_k: int,
     ) -> list[RAGNode[MetaT]]:
+        """Exact cosine search over every stored passage (a linear scan). Summaries are never returned by a ranked search."""
         # Conformance kit check 6: zero vector query must be rejected
         if is_zero_vector(query_vector):
             raise EmbeddingProviderError("Zero-vector query rejected by vector_search")
@@ -325,6 +371,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         top_k: int,
         analyzer_tokens: list[TokenGroup] | None = None,
     ) -> list[RAGNode[MetaT]]:
+        """BM25 keyword search. A node must satisfy EVERY token group (a quoted phrase, a required name), then is ranked by BM25."""
         self._validate_filters(filters)
 
         groups = analyzer_tokens or [
@@ -371,6 +418,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         w_fts: float = 1.0,
         analyzer_tokens: list[TokenGroup] | None = None,
     ) -> list[RAGNode[MetaT]]:
+        """Both searches, fused with Reciprocal Rank Fusion: score = w_vec/(rrf_k+vector rank) + w_fts/(rrf_k+keyword rank)."""
         self._validate_filters(filters)
 
         # Run vector search and keyword search internally
@@ -413,6 +461,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         filters: RAGFilterSpec,
         level: int | None = None,
     ) -> list[RAGNode[MetaT]]:
+        """Summary nodes in document order, after the same filters as everything else (so the spoiler boundary hides a summary that ends past it)."""
         self._validate_filters(filters)
         with self._lock:
             seen_ids: set[str] = set()
@@ -447,6 +496,10 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         radius_chars: int,
         filters: RAGFilterSpec,
     ) -> list[RAGNode[MetaT]]:
+        """One synthetic node holding the contiguous text around `center_offset`, never past the guard boundary.
+
+        Passages overlap, so overlapping stretches are written once; a gap in the indexed text ends the window.
+        """
         self._validate_filters(filters)
         with self._lock:
             doc_nodes = [
@@ -521,6 +574,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         return stitched
 
     def scope_stats(self, filters: RAGFilterSpec) -> ScopeStats:
+        """Size and revision of exactly the text `fetch_full_scope` would return (INT-06), so Tier 0 decisions agree with what is fetched."""
         self._validate_filters(filters)
         with self._lock:
             matched_nodes = self._full_scope(filters)
@@ -544,11 +598,13 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             )
 
     def fetch_full_scope(self, filters: RAGFilterSpec) -> list[RAGNode[MetaT]]:
+        """Every visible passage in document order, with overlaps trimmed (Tier 0 and the list readers use this)."""
         self._validate_filters(filters)
         with self._lock:
             return self._full_scope(filters)
 
     def fetch_nodes(self, node_ids: list[str], filters: RAGFilterSpec) -> list[RAGNode[MetaT]]:
+        """The named nodes that still pass the CURRENT filters: a passage hidden by a moved boundary is simply not returned."""
         self._validate_filters(filters)
         with self._lock:
             results: list[RAGNode[MetaT]] = []
@@ -651,9 +707,11 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             return len(written_ids)
 
     def _hash_text(self, text: str) -> str:
+        """SHA-256 of the normalized text: the default content hash for a node written without one."""
         return hashlib.sha256(self.analyzer.normalize(text).encode("utf-8")).hexdigest()
 
     def _fingerprint(self, node: RAGNode[MetaT]) -> Fingerprint:
+        """The fingerprint of a node written through the legacy path, which carries none: computed here from the store's own space."""
         space = self._embedding_space
         uses_tokens = self._capabilities.uses_analyzer_tokens
         return Fingerprint(
@@ -664,10 +722,12 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         )
 
     def get_fingerprints(self, doc_id: str) -> dict[str, Fingerprint]:
+        """node id -> fingerprint for one document, for `sync_document` and `needs_reindex`."""
         with self._lock:
             return dict(self._fingerprints.get(doc_id, {}))
 
     def delete_nodes(self, node_ids: list[str]) -> int:
+        """Delete by id (passages and section summaries); returns how many existed. Unknown ids are ignored."""
         with self._lock:
             deleted = 0
             for nid in node_ids:
@@ -690,6 +750,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             return deleted
 
     def delete_document(self, doc_id: str) -> int:
+        """Delete every row of a document, its fingerprints and its owner record; counts the same way as `delete_nodes`."""
         with self._lock:
             to_delete = [nid for nid, n in self._nodes.items() if n.span.doc_id == doc_id]
             for nid in to_delete:
@@ -707,6 +768,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             return len(to_delete) + len(sec_keys)       # same counting as delete_nodes
 
     def delete_sections(self, doc_id: str, from_seq: int) -> int:
+        """Delete section `from_seq` and every later one (a document that got shorter)."""
         with self._lock:
             to_delete_nodes: list[str] = []
             for (d_id, seq), nids in list(self._section_nodes.items()):
@@ -722,6 +784,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             return self.delete_nodes(to_delete_nodes)
 
     def current_revisions(self, node_ids: list[str]) -> dict[str, str]:
+        """node id -> its current revision, for the stale-citation check. A node with none stored counts as "v1"."""
         with self._lock:
             return {
                 nid: self._nodes[nid].revision or "v1"
@@ -833,6 +896,14 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
 class ScopedInMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
     """A view of an InMemoryRAGStore bound to one owner: the §5.6 scoped-store pattern, in reference form.
 
+    >>> store = InMemoryRAGStore()
+    >>> scoped = store.scoped(OwnerScope(tenant_or_user_id="u1"))
+    >>> try:
+    ...     scoped.vector_search([1.0, 0.0], RAGFilterSpec(tenant_or_user_id="u2"), top_k=5)
+    ... except ScopeViolationError as exc:
+    ...     print(exc.key)
+    tenant_or_user_id
+
     Every read must name the bound scope (a filter that names another value raises ScopeViolationError),
     and the bound values are always applied, so a read never sees another owner's rows. Writes must
     carry the bound owner. Lifecycle calls on a document written for another owner are refused.
@@ -846,9 +917,11 @@ class ScopedInMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
     # ── scope checks ──────────────────────────────────────────────────────
 
     def _bound(self) -> dict[str, Any]:
+        """The owner's scope as {key: value}: the values this view will always apply and never allow to be overridden."""
         return self.owner.as_scope()
 
     def _scoped_filters(self, filters: RAGFilterSpec) -> RAGFilterSpec:
+        """The filters with the bound scope forced in; a filter that names a DIFFERENT value raises instead of being overridden."""
         update: dict[str, Any] = {}
         custom = dict(filters.custom)
         for key, bound in self._bound().items():
@@ -864,17 +937,21 @@ class ScopedInMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         return filters.model_copy(update=update)
 
     def _check_owner(self, owner: OwnerScope) -> None:
+        """Refuse an owner that differs from the bound one (used for writes and for rows read by id)."""
         for key, bound in self._bound().items():
             stated = owner.value(key)
             if stated != bound:
                 raise ScopeViolationError(f"Store is scoped to {key}={bound!r}, not {stated!r}", key=key)
 
     def _check_doc(self, doc_id: str) -> None:
+        """Refuse any operation on a document that was written for another owner; an unknown document is allowed."""
         owner = self.inner.doc_owner(doc_id)
         if owner is not None:
             self._check_owner(owner)
 
     # ── delegated port ────────────────────────────────────────────────────
+    # Every read forces the bound scope into the filters first; every write and delete checks the owner first. The
+    # inner store does the real work.
 
     def capabilities(self) -> StoreCapabilities:
         return self.inner.capabilities()

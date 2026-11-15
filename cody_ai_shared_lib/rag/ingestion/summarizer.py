@@ -6,6 +6,17 @@ Implements:
   - RAG-ING-8: Derived text must not look ahead; unit summaries summarize only their own span.
   - DG-14: Summarizer failure raises RAGStageError unless fallbacks["summarizer"] == "skip",
     which records DG-14, logs ERROR, and returns summary_status="failed".
+
+Why summaries exist: an overview question ("what is this book about?") cannot be answered from the few best passages. A short
+summary of each section gives the model the shape of the whole work. Long sections are summarized in units first, so no single
+call has to read an oversized text, and RAG-ING-8 keeps each unit summary to its own span, so a summary never reveals what
+comes later (which would defeat the spoiler guard).
+
+Decision order in `summarize_section` (the first that applies ends it):
+    1. the app already supplied a summary          -> use it ("provided"), no model call
+    2. summaries disabled, text too short, or no model bound   -> "skipped"
+    3. otherwise: summarize (in units when long), tolerate failures only if the profile says "skip"
+Status values: "generated", "provided", "skipped", "partial" (some units failed), "failed".
 """
 from __future__ import annotations
 
@@ -37,14 +48,18 @@ SUMMARY_SYSTEM_PROMPT = (
 
 @dataclass
 class SummarizerResult(Generic[MetaT]):
-    """Result of section summarization."""
+    """Result of section summarization: the section summary, any unit summaries, and a status saying how it went."""
     section_summary: RAGNode[MetaT] | None = None
     unit_summaries: list[RAGNode[MetaT]] = field(default_factory=list)
     summary_status: Literal["generated", "provided", "skipped", "partial", "failed"] = "skipped"
 
 
 class SectionSummarizer(Generic[MetaT]):
-    """Generates hierarchical section summaries and unit summaries."""
+    """Generates hierarchical section summaries and unit summaries.
+
+    Two levels: a unit summary (level 0) covers about `summary_unit_chars` of text; a section summary (level 1) covers the
+    section. A section up to four units long is summarized directly from its text; a longer one is summarized from its unit summaries.
+    """
 
     def __init__(
         self,
@@ -79,7 +94,11 @@ class SectionSummarizer(Generic[MetaT]):
         stage: str = "summarizer",
         budget_guard: BudgetGuard | None = None,
     ) -> SummarizerResult[MetaT]:
-        """Summarize a section, generating section summary and summary units."""
+        """Summarize a section, generating section summary and summary units.
+
+        Every model call is fenced (`<source-ID>`) and told the text is data, so text inside a document cannot give the
+        summarizer instructions. A failure raises unless `fallback_action="skip"`, which records DG-14 and carries on.
+        """
         # 1. Check existing summary (usable even if LLM summarizer is disabled)
         if existing_summary:
             sec_node = node_class_for(metadata)(
@@ -113,6 +132,7 @@ class SectionSummarizer(Generic[MetaT]):
         if not self.summary_models:
             return SummarizerResult(summary_status="skipped")
 
+        # Long text is cut into units of about `summary_unit_chars`, each summarized on its own
         units = self._slice_summary_units(text) if len(text) > self.summary_unit_chars else []
         # A section longer than this is summarized from its unit summaries, not in one oversized call
         from_units = bool(units) and len(text) > self.summary_unit_chars * MAX_DIRECT_UNITS
@@ -146,6 +166,7 @@ class SectionSummarizer(Generic[MetaT]):
             )
 
         def run_units() -> None:
+            """Summarize each unit in turn; a failed unit is skipped under DG-14 and counted, so the status can say "partial"."""
             nonlocal unit_failures
             for u_idx, (u_start, u_end) in enumerate(units):
                 try:
@@ -176,6 +197,7 @@ class SectionSummarizer(Generic[MetaT]):
                     )
                 )
 
+        # A very long section is summarized from its unit summaries; a shorter one from its own text
         if from_units:
             run_units()
             section_input = "\n".join(unit.text for unit in unit_summaries)
@@ -228,7 +250,10 @@ class SectionSummarizer(Generic[MetaT]):
         )
 
     def _slice_summary_units(self, text: str) -> list[tuple[int, int]]:
-        """Slice text into consecutive sentence-aligned units of ~summary_unit_chars."""
+        """Slice text into consecutive sentence-aligned units of ~summary_unit_chars.
+
+        Units never overlap and never split a sentence, so each unit summary covers exactly its own span.
+        """
         sents = self.analyzer.sentences(text)
         if not sents:
             return [(0, len(text))]

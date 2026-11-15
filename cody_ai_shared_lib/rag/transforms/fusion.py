@@ -1,4 +1,12 @@
-"""Merging several ranked lists of nodes (§7.7, §7.8, AC-RAG-19)."""
+"""Merging several ranked lists of nodes (§7.7, §7.8, AC-RAG-19).
+
+Two ways to merge lists, for two needs:
+    fair_interleave   take turns, so no list is crowded out: each of n lists keeps about top_k / n slots
+    fuse_variants     weigh the lists with reciprocal-rank fusion, then keep the fair mix, ordered by fused score
+
+Fairness matters because a plain "best scores first" merge lets the stronger list win every slot. In a comparison, the second
+subject's passages would be pushed out entirely.
+"""
 from __future__ import annotations
 
 import math
@@ -8,7 +16,15 @@ from ..models import MetaT, RAGNode
 
 
 def fair_interleave(variant_results: list[list[RAGNode[MetaT]]], top_k: int) -> list[RAGNode[MetaT]]:
-    """Merge lists in turn, so each keeps at least ceil(top_k / n) slots when it has candidates."""
+    """Merge lists in turn, so each keeps at least ceil(top_k / n) slots when it has candidates.
+
+    A node appearing in several lists is taken once. Slots a short list cannot fill go to the others.
+
+    >>> from cody_ai_shared_lib.rag.models import RAGNode
+    >>> make = lambda *ids: [RAGNode(node_id=i, text="") for i in ids]
+    >>> [n.node_id for n in fair_interleave([make("a1", "a2", "a3"), make("b1")], top_k=3)]
+    ['a1', 'b1', 'a2']
+    """
     if not variant_results:
         return []
     quota = math.ceil(top_k / len(variant_results))
@@ -46,7 +62,11 @@ def fuse_variants(
     top_k: int,
     rrf_k: int = 60,
 ) -> list[RAGNode[MetaT]]:
-    """Weighted RRF across variants, then fair_interleave, ranked by the fused score (§7.8)."""
+    """Weighted RRF across variants, then fair_interleave, ranked by the fused score (§7.8).
+
+    A node's fused score is the sum over the lists of weight / (rrf_k + rank), so a node found by several variants beats one
+    found by a single variant. The result carries `score_kind="rrf"`.
+    """
     fused: dict[str, float] = {}
     for results, weight in zip(variant_results, weights):
         for rank, node in enumerate(results, start=1):

@@ -1,4 +1,15 @@
-"""BatchEmbedder: embeds nodes through ModelGateway with a zero-vector guard (§6.4, RAG-ING-4)."""
+"""BatchEmbedder: embeds nodes through ModelGateway with a zero-vector guard (§6.4, RAG-ING-4).
+
+Two ways to embed, for two needs:
+
+    embed_each / embed_each_with_reasons   judge every node on its own: return the good ones and list the failures
+                                           (prepare_nodes uses this: an app wants the good rows even if one node failed)
+    embed_nodes                            all or nothing: any failure raises before anything is written
+                                           (ingest_document and sync use this: a half-written section must not exist)
+
+A provider can return an empty or all-zero vector for text it could not embed. Such a vector would match everything or
+nothing, so it is treated as a failed node, never stored.
+"""
 from __future__ import annotations
 
 from typing import Generic
@@ -13,7 +24,11 @@ from ..vectors import is_zero_vector
 
 
 class BatchEmbedder(Generic[MetaT]):
-    """Embeds nodes in batches. A zero or missing vector is a failure and is never returned."""
+    """Embeds nodes in batches. A zero or missing vector is a failure and is never returned.
+
+    Nodes are embedded from the renderer's `embed_text` (not the raw text), so an app controls what is embedded, e.g. a
+    title prefixed to each passage. Batches are sized to stay within provider limits (`batch_size`).
+    """
 
     def __init__(
         self,
@@ -49,7 +64,11 @@ class BatchEmbedder(Generic[MetaT]):
         stage: str = "ingest_embedding",
         budget_guard: BudgetGuard | None = None,
     ) -> tuple[list[tuple[RAGNode[MetaT], list[float]]], list[tuple[RAGNode[MetaT], str]]]:
-        """Like embed_each, with the reason each failed node failed (§6.4.1)."""
+        """Like embed_each, with the reason each failed node failed (§6.4.1).
+
+        Vectors come back in input order, so a node's vector is found by position. If a whole batch call fails the gateway
+        raises (`EmbeddingProviderError`); only a returned-but-unusable vector is a per-node failure here.
+        """
         vectors: list[list[float]] = []
         texts = [self.renderer.embed_text(node) for node in nodes]
         for start in range(0, len(texts), self.batch_size):

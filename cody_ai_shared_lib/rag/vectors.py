@@ -5,5 +5,9 @@ from typing import Sequence
 
 
 def is_zero_vector(vector: Sequence[float] | None) -> bool:
-    """True for a missing, empty or all-zero vector, which is how a failed embedding is marked."""
+    """True for a missing, empty or all-zero vector, which is how a failed embedding is marked.
+
+    >>> is_zero_vector([0.0, 0.0]), is_zero_vector(None), is_zero_vector([0.0, 0.1])
+    (True, True, False)
+    """
     return not vector or all(component == 0.0 for component in vector)

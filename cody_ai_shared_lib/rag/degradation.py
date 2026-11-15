@@ -1,7 +1,15 @@
 """Agreed degradations table and tracking (§13.3, AC-RAG-55).
 
-Closed list of agreed graceful degradation rows DG-01 to DG-14.
+Closed list of agreed graceful degradation rows DG-01 to DG-15.
 Any failure outside this list or an agreed fallback that itself fails raises an error.
+
+A degradation is a planned way of doing slightly less rather than failing: the reranker timed out, so results keep the search
+order; a model is rate-limited, so the next model answers. Each row names the stage, the fallback and how loudly to log it. The list
+is closed on purpose: a failure that is not on it is an error, so no silent fallback can creep in. Every degradation that fires is
+recorded on the request (`RAGResponse.degradations`), so the app can tell a perfect answer from a degraded one.
+
+"default" says whether a row is on by itself ("on") or must be enabled in the profile's `fallbacks` ("opt-in"); any row can be set
+to "raise" to turn the fallback back into an error (KnowledgeBase does this for all of them).
 """
 from __future__ import annotations
 
@@ -125,7 +133,16 @@ AGREED_DEGRADATIONS: dict[str, dict[str, Any]] = {
 
 
 class DegradationTracker:
-    """Collects and logs degradations that occur during request execution."""
+    """Collects and logs degradations that occur during request execution.
+
+    One per request. Components call `record()` when they fall back; observers hear about it through `on_record`; the engine puts
+    the list on the response and the trace.
+
+    >>> tracker = DegradationTracker()
+    >>> _ = tracker.record("DG-06", "rerank", "timeout", "kept the search order")
+    >>> [d.id for d in tracker.degradations]
+    ['DG-06']
+    """
 
     def __init__(self, fallbacks: dict[str, str] | None = None):
         self._fallbacks = dict(fallbacks or {})
@@ -148,6 +165,11 @@ class DegradationTracker:
         attempts: int = 1,
         notify: bool = True,
     ) -> Degradation:
+        """Record one degradation: store it, log it at the level the table gives, and tell observers (unless `notify` is False).
+
+        `reason` says what went wrong and `impact` what the user may notice; both are shortened so a provider error that echoes a
+        prompt cannot leak into logs or browsers (§13.8). `fallback_used` defaults to the table's fallback for the row.
+        """
         spec = AGREED_DEGRADATIONS.get(dg_id, {})
         log_level = spec.get("log_level", logging.WARNING)
 
@@ -172,7 +194,19 @@ class DegradationTracker:
         return deg
 
     def skip_for_deadline(self, deadline: Any, stage: str, budget_seconds: float) -> bool:
-        """True when an optional stage must be skipped for lack of time (DG-10, §13.4)."""
+        """True when an optional stage must be skipped for lack of time (DG-10, §13.4).
+
+        Records the degradation itself, so the caller only has to skip. With `fallbacks["deadline"] == "raise"` it raises instead.
+
+        >>> from datetime import datetime
+        >>> from cody_ai_shared_lib.rag.runtime import Deadline, FrozenClock
+        >>> deadline = Deadline(2.0, clock=FrozenClock(datetime(2026, 1, 1)))
+        >>> tracker = DegradationTracker()
+        >>> tracker.skip_for_deadline(deadline, "rerank", budget_seconds=4.0)
+        True
+        >>> tracker.degradations[0].id
+        'DG-10'
+        """
         if deadline.fits(budget_seconds):
             return False
         if self._fallbacks.get("deadline") == "raise":

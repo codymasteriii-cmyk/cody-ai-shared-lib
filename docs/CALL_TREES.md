@@ -298,3 +298,55 @@ validate()                           the same checks, returned as a ValidationRe
 ```
 
 A bad profile or an incapable store raises `ProfileConfigError` or `StoreCapabilityError` here, before any request is served.
+
+---
+
+## 15. Syncing a changed document (ingestion/sync.py)
+
+```
+sync()                               DocumentSynchronizer; compares what is stored with what the text would produce
+├─ get_fingerprints()                node id -> how each stored row was made
+├─ build_section_nodes()             the passages the current text gives, per section (offsets are document-wide)
+│  └─ finalize_node()                content hash, token estimate, search tokens
+├─ _sections_with_changed_text()     sections whose text differs, or that lost a passage
+├─ per section
+│  ├─ _is_stale()                    new or changed passage, or one built under an old model or analyzer
+│  ├─ _stale_summary_ids()           an unchanged section whose summary has an old signature
+│  │  └─ _refresh_summaries()        re-embed and re-sign the stored summary text; no new summarizing call
+│  ├─ embed_nodes()                  embed only the stale passages (all or nothing)
+│  ├─ summarize_section()            only when the section's text changed
+│  └─ upsert_section()               one atomic write for the section
+└─ delete_nodes()                    last: rows whose text no longer exists
+```
+
+---
+
+## 16. Checking an answer: citations, quotes, links (postgen/)
+
+```
+finish()                             answering.py, after the model call
+├─ extract()                         CitationExtractor
+│  ├─ parse()                        find markers such as [2] outside code spans
+│  ├─ resolve()                      look each marker up in this turn's marker map
+│  └─ verify_citation()              each guard may refuse a citation that points at forbidden text
+├─ verify()                          QuoteValidator: quoted words must occur in the cited passage
+│  └─ quote_match_ratio()            best-aligned similarity of a quote against its source
+├─ compute_coverage()                share of the answer's sentences that carry a verified citation
+└─ sanitize()                        OutputSanitizer: drop untrusted links and images, fence tags, the fence id, stray flags
+```
+
+While streaming, `feed()` on `FlagStreamBuffer` removes the leading `[[answer_found=...]]` flag from the text before the client sees it.
+
+---
+
+## 17. Testing a store: the conformance kit (testing/contract.py)
+
+```
+class TestMyStore(RAGStoreContractTests)       the app's own test file
+├─ make_store()                      the only required hook: a clean store
+└─ every test_check_*                inherited; each one returns early when the store does not declare the capability
+   ├─ write()                        writes nodes the way the engine does: one section, fingerprints, owner
+   └─ make_filters()                 read filters built from the owner, so a required scope is always stated
+```
+
+`BrokenStore` has known defects and must fail the kit; if it ever passed, a check would have gone blind. `InMemoryRAGStore` is the reference store that passes all of it.

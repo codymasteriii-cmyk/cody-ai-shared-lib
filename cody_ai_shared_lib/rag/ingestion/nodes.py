@@ -1,4 +1,14 @@
-"""Node construction and fingerprints shared by ingestion and sync (§6.6, RAG-ING-1)."""
+"""Node construction and fingerprints shared by ingestion and sync (§6.6, RAG-ING-1).
+
+The idea that drives sync: every stored row carries a fingerprint saying how it was made.
+
+    content_hash          a hash of the text that is embedded; changes when the text changes
+    embedding_signature   "model|dims|task_type|splitter_version"; changes when the model, size or splitting changes
+    fts_signature         "analyzer|version"; changes when keyword tokens would change
+
+Comparing a stored fingerprint with the one the current profile would produce says exactly what is stale, without
+re-reading or re-embedding anything. `write_signatures` computes the current ones once per call.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -24,7 +34,11 @@ def build_section_nodes(
     revision: str | None = None,
     granularity: str = "passage",
 ) -> list[RAGNode[MetaT]]:
-    """Split a section into passage nodes carrying global character offsets and the document revision."""
+    """Split a section into passage nodes carrying global character offsets and the document revision.
+
+    A splitter's offsets are relative to the section; this adds the section's start so every passage's span is document-wide.
+    Node ids are built here and are stable for the same text, so re-running gives the same ids.
+    """
     nodes: list[RAGNode[MetaT]] = []
     for idx, chunk in enumerate(splitter.split(section.text, base_offset=section.char_start)):
         nodes.append(
@@ -54,7 +68,11 @@ def finalize_node(
     analyzer: TextAnalyzer,
     uses_analyzer_tokens: bool,
 ) -> None:
-    """Fill the fields the store persists with each node (§4.4, §6.6)."""
+    """Fill the fields the store persists with each node (§4.4, §6.6): content hash, token estimate, search tokens.
+
+    The hash is of the text that gets EMBEDDED (`renderer.embed_text`), normalized, so a change to what is embedded
+    is detected and a cosmetic change in spacing or width is not.
+    """
     node.content_hash = hashlib.sha256(
         analyzer.normalize(renderer.embed_text(node)).encode("utf-8")
     ).hexdigest()
@@ -64,13 +82,23 @@ def finalize_node(
 
 
 def embedding_signature(model: str, space: EmbeddingSpace, splitter: TextSplitter) -> str:
-    """The one formula for `model|dims|task_type|splitter_version` (§4.4, §6.6)."""
+    """The one formula for `model|dims|task_type|splitter_version` (§4.4, §6.6).
+
+    >>> from cody_ai_shared_lib.rag.ingestion.splitter import SentenceSplitter
+    >>> embedding_signature("embed-1", EmbeddingSpace(model="embed-1", dims=768), SentenceSplitter())
+    'embed-1|768|RETRIEVAL_DOCUMENT|1.0.0'
+    """
     splitter_version = space.splitter_version or getattr(splitter, "version", "1.0.0")
     return f"{model}|{space.dims}|{space.task_type_documents}|{splitter_version}"
 
 
 def fts_signature(analyzer: TextAnalyzer, uses_analyzer_tokens: bool) -> str | None:
-    """The one formula for `analyzer_name|analyzer_version` (§4.4)."""
+    """The one formula for `analyzer_name|analyzer_version` (§4.4). None for a store that does not search tokens.
+
+    >>> from cody_ai_shared_lib.rag.text.analyzer import CjkAwareAnalyzer
+    >>> fts_signature(CjkAwareAnalyzer(), True), fts_signature(CjkAwareAnalyzer(), False)
+    ('cjk_aware|1.0.0', None)
+    """
     return f"{analyzer.name}|{analyzer.version}" if uses_analyzer_tokens else None
 
 
@@ -81,6 +109,12 @@ def embedding_is_stale(
 
     A row with a signature is stale when the signature differs. A row stored without a vector is
     stale only when it is a summary and the profile now embeds summaries.
+
+    >>> row = Fingerprint(content_hash="h", embedding_signature="embed-1|768|RETRIEVAL_DOCUMENT|1.0.0")
+    >>> embedding_is_stale("d", "d#s0p0", row, "embed-2|768|RETRIEVAL_DOCUMENT|1.0.0", True)
+    True
+    >>> embedding_is_stale("d", "d#s0p0", row, "embed-1|768|RETRIEVAL_DOCUMENT|1.0.0", True)
+    False
     """
     if fingerprint.embedding_signature is not None:
         return fingerprint.embedding_signature != expected
@@ -100,7 +134,11 @@ def write_signatures(
 
 @dataclass(frozen=True)
 class WriteSignatures:
-    """The signatures the engine stamps on every node it writes (§6.6). Computed once per call."""
+    """The signatures the engine stamps on every node it writes (§6.6). Computed once per call.
+
+    Computed once so every row of one write carries identical signatures, and so a mid-write change of a setting cannot
+    produce a document whose rows disagree about how they were made.
+    """
     embedding: str
     fts: str | None
 
@@ -122,11 +160,13 @@ class PreparedSummaries(Generic[MetaT]):
 
     @property
     def node_ids(self) -> list[str]:
+        """The ids of every summary here; sync uses them to avoid deleting rows it just rewrote."""
         items = ([self.section_summary] if self.section_summary else []) + self.unit_summaries
         return [item.node.node_id for item in items]
 
 
 def _unit_seq(doc_id: str, node: RAGNode[MetaT], position: int) -> int:
+    """A unit summary's index, taken from its id so a skipped unit leaves a gap rather than renumbering the rest."""
     parsed = parse_node_id(doc_id, node.node_id)
     return parsed.number if parsed is not None and parsed.kind == "unit_summary" and parsed.number is not None else position
 
