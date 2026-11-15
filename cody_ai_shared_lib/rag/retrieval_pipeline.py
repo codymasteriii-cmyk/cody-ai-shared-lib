@@ -449,7 +449,7 @@ class RetrievalPipeline(Generic[MetaT]):
         )
         budget = self.profile.runtime.stage_budgets.get("relaxation", 0.0)
         for step in self.relaxation_steps:
-            if len(nodes) >= self.profile.retrieval.min_results_before_relax:
+            if _ranked_count(nodes) >= self.profile.retrieval.min_results_before_relax:
                 break
             run.deadline.raise_if_cancelled(f"relaxation:{step.label}")
             if run.degradations.skip_for_deadline(run.deadline, f"relaxation:{step.label}", budget):
@@ -459,7 +459,7 @@ class RetrievalPipeline(Generic[MetaT]):
                 continue
             relaxed_ctx = ctx.model_copy(update={"filters": relaxed.filters, "intent": relaxed.intent})
             relaxed_nodes = self._execute(relaxed_ctx, strategy, stages, guards, run)
-            if len(relaxed_nodes) > len(nodes):
+            if _ranked_count(relaxed_nodes) > _ranked_count(nodes):
                 nodes, ctx, state = relaxed_nodes, relaxed_ctx, relaxed
                 applied.append(step.label)
         return nodes, ctx, applied
@@ -494,6 +494,11 @@ def apply_guards(
             record_effect(guard.name, len(result) - len(kept), truncated)
         result = kept
     return result
+
+
+def _ranked_count(nodes: list[RAGNode[MetaT]]) -> int:
+    """Passages competing on relevance; summaries, windows and Tier 0 text are context layers (§7.6)."""
+    return sum(1 for node in nodes if is_ranked(node))
 
 
 def _utc(value: datetime | None) -> datetime | None:
