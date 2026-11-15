@@ -7,7 +7,7 @@ from ..errors import StoreCapabilityError
 from ..models import MetaT, RAGNode
 from ..vectors import is_zero_vector
 from .context import RetrievalContext, RetrievalStrategy
-from .shared import embed_query, keyword_fallback, with_local_window
+from .shared import embed_query, keyword_fallback, ranked_store_call, with_local_window
 
 
 class DenseVectorStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
@@ -24,5 +24,7 @@ class DenseVectorStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
         if is_zero_vector(query_vector):
             return keyword_fallback(ctx, top_k)
 
-        results = ctx.store.vector_search(query_vector=query_vector, top_k=top_k, filters=ctx.filters)
+        results = ranked_store_call(
+            ctx, top_k, lambda filters, _groups, k: ctx.store.vector_search(query_vector=query_vector, top_k=k, filters=filters)
+        )
         return with_local_window(ctx, results)

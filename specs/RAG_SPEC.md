@@ -2,7 +2,7 @@
 
 | | |
 | :--- | :--- |
-| **Document Version** | 1.2.10-draft |
+| **Document Version** | 1.2.11-draft |
 | **Status** | Draft, design agreed. Sibling feedback (AUD-01..26, NF-01..40, KB-01..23) was consolidated into C-01..C-39 and folded in; owner decisions Q-01..Q-08, the failure model and the pushbacks (Appendix C) are settled, and all three app agents (AudioReading, NewsIntelligence, KnowledgeBase) agreed through 1.1.8. Version 1.1.14 changes parts of that agreed contract after the Phase 1–3 review (Appendix B). Version 1.2.0 adds the changes agreed with AudioReading after its first integration (INT-01..INT-09); they are additive. This file records the outcome and its reasoning; the exchange itself was removed after agreement and remains in git history (commit `37d76fd`). This file is the only record of the design and its reasoning; the round's working files were removed on 2026-11-08. |
 | **Package Namespace** | `cody_ai_shared_lib.rag` (`cody-ai-shared-lib >= 0.8.0`) |
 | **Target Runtime** | Python 3.13+ (1.2.0: the owner's floor for all projects; the models use PEP 696 `TypeVar` defaults), synchronous core (matching the rest of `cody_ai_shared_lib`) with a bounded thread pool for independent calls |
@@ -464,6 +464,7 @@ class RAGFilterSpec(BaseModel):
     min_similarity: float | None = None                  # raw cosine floor (§3.5)
     custom: dict[str, Any] = Field(default_factory=dict)
     empty_scope: bool = False                            # 1.2.0: set by the engine on a hard conflict (§5.5)
+    text_rules: list[TextRule] = []                      # 1.2.11 (§7.9): a store receives only `filter` rules, on ranked searches only
 ```
 - **`custom` contract.** A store declares `StoreCapabilities.supported_custom_filters: dict[str, type]` (e.g. `{"favorites_only": bool, "categories_any": list[str]}`). The engine **MUST** reject unknown keys or values of the wrong type with `UnsupportedFilterError` before calling the store.
 - **`date_field`.** Names the timestamp a range applies to. A store declares `supported_date_fields` and a `time_basis` note (e.g. `"created_at = ingestion time; publication date not stored"`). A store may have only an ingestion timestamp; `time_basis` says so, and the assembler MAY state the note in the prompt.
@@ -651,6 +652,8 @@ class StoreCapabilities(BaseModel):
     supported_date_fields: frozenset[str] = frozenset()
     time_basis: str | None = None
     max_top_k: int = 200
+    text_rule_kinds: frozenset[str] = frozenset()        # 1.2.11 (§7.9): kinds the store applies itself on ranked searches; empty: the engine checks
+    word_matching: Literal["exact", "stemmed"] = "exact"   # 1.2.11: how the store matches words in a text rule
 ```
 
 ### 4.2 Retrieval methods
@@ -856,6 +859,11 @@ The kit writes the way the engine does: through `upsert_section` with a `Section
 23. **Deletes and revisions.** `delete_nodes`, `delete_sections`, `current_revisions` and `fetch_nodes` behave as declared.
 24. **Atomic passages and summary.** While a section with passages and a summary is written, a reader never sees part of the passages.
 25. **Name groups (1.2.8).** For a store with `uses_analyzer_tokens`: two name phrase groups are joined with AND, and one `any_of` group matches a passage naming any alternative and no other.
+26. **`must_mention` rule (1.2.11).** A `filter` rule keeps the passages that mention the phrase and drops the others, on every ranked search; a store declaring `word_matching="exact"` also does not match part of a longer word.
+27. **`exact` rule (1.2.11).** The same for `exact`.
+28. **`must_not` rule (1.2.11).** A `filter` rule drops passages that mention the phrase and keeps the others.
+29. **`prefer` is never a filter (1.2.11).** A store given a `prefer` rule excludes nothing for it.
+30. **Ranked searches only (1.2.11).** `fetch_full_scope` and `fetch_parent_summaries` ignore text rules.
 
 Checks 17 and 18 seed engine-shaped data: the splitter's overlapping passages (1.2.0).
 
@@ -999,7 +1007,7 @@ See §10.3 and D-07.
 - **Hard:** guards, required scope keys and everything the caller puts in `request.filters`. Hard constraints are never relaxed, removed or widened by any engine component.
 - **Soft:** constraints the engine derives itself:
   - the intent's time window (§7.6);
-  - `entity_mode="require"` terms (redesigned in §7.9, not built: rules with a `filter` or `prefer` strength);
+  - `entity_mode="require"` terms, which are text rules with a `filter` or `prefer` strength since 1.2.11 (§7.9);
   - profile thresholds.
   The relaxation ladder (§7.6) may only touch soft constraints.
 - **Combination.** Effective filters = intersection of all hard patches, then intersected with soft constraints:
@@ -1062,7 +1070,7 @@ class TextAnalyzer(Protocol):
         alternatives: list[list[str]] = []   # used by "any_of": each is a phrase
         origin: Literal["free_text", "exact_term", "entity"]
     ```
-    `exact_terms` and `entity_terms` with `entity_mode="require"` become `"phrase"` groups (since 1.2.8, with several names, only those in the search's own text are required, and when none is, one `"any_of"` group; §7.9. The rest of the §7.9 redesign, rules reaching stores without analyzer tokens, is not built) (李小明 becomes `李小 <-> 小明`, which a passage containing only 小明 does not match). The remaining free text is one `"any"` group. Groups are joined with AND.
+    `exact_terms` and `entity_terms` with `entity_mode="require"` become `"phrase"` groups (since 1.2.8, with several names, only those in the search's own text are required, and when none is, one `"any_of"` group; §7.9. Since 1.2.11 the same names and exact terms also travel as text rules to every store, token store or not) (李小明 becomes `李小 <-> 小明`, which a passage containing only 小明 does not match). The remaining free text is one `"any"` group. Groups are joined with AND.
   - **Token safety.** Analyzer tokens contain only letters, digits and CJK characters (no tsquery operators or quotes). The lib ships `rag.text.build_tsquery(groups) -> str`; the adapter passes its result as a query parameter and never concatenates it into SQL text.
   - **Version changes.** If the analyzer changes, `fts_signature` no longer matches, and `needs_reindex` reports the FTS column as stale separately from the embeddings (§6.6).
   - **PGroonga** is an alternative for a store whose Supabase plan offers it: the store then leaves `uses_analyzer_tokens` off and searches raw text. AudioReading decides between the two on measured results in P2 (§12.3).
@@ -1276,6 +1284,7 @@ class QueryIntent(BaseModel, Generic[ExtT]):
     entity_mode: Literal["require", "ignore"] = "ignore"
     exact_terms: list[str] = Field(default_factory=list)        # quoted strings, identifiers
     negation: bool = False
+    rules: list[TextRule] = []              # 1.2.11 (§7.9): from an app router or the LLM router (`must_not`)
 
     suggested_top_k: int | None = None      # clamped [1, 30] for query(); ignored by retrieve()
     beyond_boundary_risk: float = 0.0       # [0, 1], informational only (never blocks)
@@ -1380,7 +1389,7 @@ class IntentRouter(Protocol):
   - It runs only when results are empty or below `min_results`.
   - Each applied step is recorded in `relaxations`.
   - It touches **only soft constraints**; hard filters and guards are unreachable to it (D-04).
-  - `drop_required_entities` sets `entity_mode` to `"ignore"`. It only matters for stores using analyzer tokens (§6.1); other stores receive no entity groups. `exact_terms` are never relaxed. (§7.9 records the redesign: rules reach every store, and only `droppable` ones are dropped.)
+  - `drop_required_entities` drops the text rules marked `droppable` (§7.9) and, when no name rule is left, sets `entity_mode` to `"ignore"` so token groups follow. It has nothing to do when no rule is droppable. `exact_terms` and non-droppable rules are never relaxed. (Built 1.2.11; before, it only set `entity_mode` and mattered only to token stores.)
   - **Counting (built 1.2.9, OI-3).** The "too few results" test (`min_results_before_relax`) counts ranked passages only. Summaries, local windows and Tier 0 text are context layers and never count. (Before 1.2.9 it counted every node, so with those layers it rarely fired; in AudioReading, never.) A relaxed run replaces the first only when it has more ranked passages.
   - A step that does not fit the remaining deadline is skipped (DG-10).
 
@@ -1456,9 +1465,9 @@ class TransformContext:
   - Only ranked nodes are fused. `ordered` layers (§3.3) are the same for every variant and are kept once.
 - Tiers 1, 2 and 3 all use the helper.
 
-### 7.9 Text rules: "must mention", exact phrases, "must not" **[designed 1.2.6; the several-names rule built 1.2.8; the rest not built]**
+### 7.9 Text rules: "must mention", exact phrases, "must not" **[designed 1.2.6; built 1.2.8 and 1.2.11]**
 
-> **Status.** Agreed with all three apps and the owner on 2026-11-14 (feature-boundaries round). This section is the design record. **Built in 1.2.8: only the rule for several names, on the token path** ("Several names" below). Everything else here (the rule record, delivery to stores without analyzer tokens, `prefer`, the post-check, `must_not`) is **not built**; the owner schedules it (§18, OI-2). Until then §5.5, §6.1 and §7.6 describe the code as it is for those parts.
+> **Status.** Agreed with all three apps and the owner on 2026-11-14 (feature-boundaries round). **Built:** the rule for several names on the token path (1.2.8), and the rest of this section (1.2.11). The paragraphs below are the agreed design; each part that is built carries a "*Built as*" note, and §7.9's last block, "Built as (1.2.11)", lists where the code differs from or adds to the design. Open: OI-4 (lists, question shapes) and OI-5 (clarification) are not built.
 
 **The problem today.**
 - The router finds names (`entity_terms`, `entity_mode="require"`) and exact phrases (`exact_terms`), but they reach the store only as analyzer token groups (§6.1). A store with `uses_analyzer_tokens=False` (News, KB) never receives them, and nothing else enforces them. "What to require" travels inside "how words are cut".
@@ -1490,6 +1499,7 @@ class TransformContext:
 | Names the router guessed, no alternatives | `prefer`, `droppable`, `group=auto` | Profile setting. News sets `filter` and non-droppable: an exact mention is wanted, and "no articles mention X" is the better answer. Audio and KB keep `prefer` until they supply aliases. |
 | Exact phrases and codes the router extracted (`exact_terms`) | `filter`, non-droppable | Profile setting. A code has no short form. |
 | Rules set by an app or the caller | `filter`, non-droppable, the `group` they state | None needed |
+| Exclusions the router read from the question (`must_not`, 1.2.11) | `prefer`, `droppable`: demotes, never removes ("unlike Apple, Meta..." mentions Apple in passing) | Profile `text_rules.must_not="filter"`. The engine keeps a router `must_not` only if its text occurs in the question; otherwise it is dropped and a DG-05 note recorded. |
 
 > **Rationale for `prefer` as the default:** a name the router guessed is one surface form, and real text uses others. AudioReading found 11 of 23 name-bearing passages for one character used only a short form; KB entries paraphrase ("BM25" / "Okapi BM25"). A default that removes evidence on upgrade would silently degrade an app in production. Filtering is a strong choice an app makes knowingly, as News did.
 
@@ -1500,7 +1510,7 @@ class TransformContext:
 4. After widening, the narrow search's passages stay ahead and the widened ones are appended (deduplicated). Keyword ranking does not reward matching more *different* names, so mixing them would let one-name passages overtake passages naming all of them.
 5. A single name never widens.
 
-*Built as (1.2.8):* the engine does the widening around the store call, in `strategies/shared.py` `search_widening_names`, so every store that takes token groups gets it with no change of its own. It applies to `keyword_only`, `keyword_first`, the keyword leg of `hybrid_rrf` (both the native call and the engine-fused path) and the keyword fallback. "Effective `top_k`" is the context's `target_limit()` (the request override, else the router's clamped `suggested_top_k`, else the profile value). Widening makes a second store call, so a thin search costs two calls. When one name is in the search text and the others are not, that search requires the one name and does not widen (a comparison's search for one subject). `exact_terms` groups are unchanged. Where no name occurs in the text, a single "any of all the names" group is used and there is nothing further to widen. For a store that declares `supports_native_hybrid_rpc`, the count is of the fused rows, which the vector leg fills, so widening rarely fires; no current app uses native hybrid with analyzer tokens. A store that reads token groups itself, rather than passing `build_tsquery` output to SQL, must handle the `any_of` mode.
+*Built as (1.2.8, extended 1.2.11):* the engine does the widening around the store call, in `strategies/shared.py` `ranked_store_call` (1.2.8 named it `search_widening_names`), so every store gets it with no change of its own, token store or not (1.2.11). It applies to `keyword_only`, `keyword_first`, the keyword leg of `hybrid_rrf` (both the native call and the engine-fused path) and the keyword fallback. "Effective `top_k`" is the context's `target_limit()` (the request override, else the router's clamped `suggested_top_k`, else the profile value). Widening makes a second store call, so a thin search costs two calls. When one name is in the search text and the others are not, that search requires the one name and does not widen (a comparison's search for one subject). `exact_terms` groups are unchanged. Where no name occurs in the text, a single "any of all the names" group is used and there is nothing further to widen. **Since 1.2.11 the count is taken after the engine's own check** (below): a store that does not apply a rule returns plenty of unfiltered rows, so counting before the check would never widen. The check, and so the widening, runs per store call, which keeps fan-out fair: each variant fills its slots from its own checked rows. For a store that declares `supports_native_hybrid_rpc`, the count is of the fused rows, which the vector leg fills, so widening rarely fires; no current app uses native hybrid with analyzer tokens. A store that reads token groups itself, rather than passing `build_tsquery` output to SQL, must handle the `any_of` mode.
 
 > **Rationale:** AudioReading measured plain "at least one of the names" and found two failures: a longer name crowded a shorter one out of its own search (a search for one subject returned no passage naming it), and a name present in 95% of passages diluted a relationship question (passages naming both fell from 8 to 2). Requiring the names in each search's own text, and widening only when thin, was best in every case measured.
 
@@ -1511,9 +1521,22 @@ class TransformContext:
 - **Default text check (engine side), by script.** Text without word boundaries (CJK): substring. Alphabetic text: whole word, case-insensitive; the match must not touch a letter or digit on either side ("AI" does not match "said", "GPT-6" does not match "GPT-60"), and a name with a hyphen or digits ("GPT-4o", "k-NN", "BM25") is one unit.
 - **Router `none` adds no rules.** The passthrough router passes the question unchanged and sets no names or exact terms, so a store receives raw text (KB's `websearch_to_tsquery` syntax is untouched) and no model is called.
 
-**Relaxation.** `drop_required_entities` drops only `droppable` rules and records it. The "too few results" test that starts relaxation counts only ranked passages (OI-3, built 1.2.9).
+**Built as (1.2.11).**
+- **Record.** `TextRule` (`text`, `kind`, `alternatives`, `group`, `strength`, `droppable`, `origin`), `QueryIntent.rules`, `RAGFilterSpec.text_rules`. `entity_terms`, `entity_mode` and `exact_terms` stay as they are (AudioReading reads them); the engine derives rules from them (`text/rules.py` `derive_rules`). Rules from `request.filters.text_rules` and an app router's `intent.rules` are used as set (`filter`, non-droppable by default). Combining filters merges rules by (kind, text): the same rule twice keeps the stricter strength, `droppable` only if both are, alternatives are unioned.
+- **Where rules travel.** On ranked searches only (`vector_search`, `keyword_search`, `hybrid_search`). The filters the engine shares with `fetch_parent_summaries`, `fetch_local_window`, `fetch_full_scope`, `scope_stats` and `fetch_nodes` carry no rules, so a store cannot filter a summary, a window or Tier 0 text by mistake and the Tier 0 size decision is unchanged. `applied_filters` on the result shows all the request's rules.
+- **A store receives only `filter` rules.** A `prefer` rule never reaches a store, so a store that applies `text_rule_kinds` in SQL cannot exclude for one. The kit pins both (checks 29, 30).
+- **`group=auto` is resolved per search** before a store sees it: the names found in the search's own text become `all` rules, with none found one `any` set, and a widened call sends them as `any`. A store therefore sees only `all` and `any`: every `all` rule holds, and at least one `any` rule holds. An `any` set is applied wholly by the store or wholly by the engine.
+- **The engine's check.** For a `filter` rule whose kind the store does not declare in `text_rule_kinds`, the engine asks for about 4 times the candidates (capped by `max_top_k`), checks the rows of that call itself on `renderer.prompt_text(node)` (the text the model reads and cites; a store applying a rule in SQL sees its stored text), keeps ranked passages that satisfy the rules, and trims to the requested count. Summaries, windows and Tier 0 text are never checked. The rules it checked are listed in `RAGTrace.text_rules_checked`.
+- **Text check.** `text/rules.py` `mentions` and `holds`: CJK forms by substring; alphabetic forms as whole words, case-insensitive, NFKC-normalized, not touching a letter or digit on either side (a Latin form next to CJK text still counts as a word). A form with a hyphen or digits is one unit. `alternatives` satisfy the rule; `must_not` inverts it.
+- **`prefer`.** An engine-owned stage, `text_rule_boost`, runs whenever `prefer` rules exist (whatever `post_stages` lists), after rerank and before the final cut, and is recorded in the trace. It is rank-based, so it works for every score kind: a passage that satisfies a `prefer` rule moves up as if its rank were divided by `profile.text_rules.prefer_boost` (default 2.0; 1.0 turns it off), and a passage that mentions a `prefer` `must_not` phrase moves down by the same factor. Nothing is removed. **The default 2.0 is untuned**: a starting point taken from one book's measurement (AudioReading: passages naming the subject sat at ranks 10 to 20 on the meaning leg), not a measured optimum. At 2.0 a passage at rank 16 competes as rank 8; at 1.25 only a passage just below the cut moved in. **The boost can only promote what the search fetched**, so while a boost is active (`prefer` rules exist and `prefer_boost` is not 1.0) the context fetches the same wider pool a reranker gets, `retrieval.rerank_candidates` or 3 times the target, capped by `max_top_k`, instead of the target plus one (`RetrievalContext.candidate_limit`, `boost_active`). The cost is more rows per search. **For AudioReading (no reranker) this means the default name rules (`prefer`) now fetch about 3 times as many candidates and nudge name-bearing passages up on every question with required names**; setting `prefer_boost` to 1.0 restores the old pool and order. Audio is asked to compare 1.25, 2.0 and 3.0 with its `chat_eval` entity trace after upgrading.
+- **Profile.** `profile.text_rules`: `names` (`prefer` | `filter`, default `prefer`), `names_droppable` (default: droppable exactly when `names` is `prefer`), `must_not` (`prefer` | `filter`), `prefer_boost`. News sets `names="filter"`.
+- **Router.** The LLM router's JSON gains an optional `must_not` list; the heuristic and `none` routers emit none. `clamp_intent` keeps `rules` set by an app or caller.
+- **Cost for AudioReading.** Router `exact_terms` are `filter` rules and Audio's store declares no `text_rule_kinds`, so a question that contains a code or a quoted phrase now runs the engine check with the 4x over-fetch on both legs. Audio said its questions contain none.
+- **Not built.** A result cache keyed on filters: `profile.cache.enable_result_cache` exists but nothing reads it, so there is no cache key to extend. A future key must include `text_rules` (they are part of the filters' dump).
 
-**Conformance kit.** One check per `kind`, testing what the rule means under the store's declared word matching, so a stemming store is not failed for matching word endings.
+**Relaxation.** `drop_required_entities` drops only `droppable` rules and records it (built 1.2.11). The "too few results" test that starts relaxation counts only ranked passages (OI-3, built 1.2.9).
+
+**Conformance kit.** One check per `kind`, testing what the rule means under the store's declared word matching, so a stemming store is not failed for matching word endings. *Built 1.2.11:* checks 26 to 30 (below). A store with an empty `text_rule_kinds` skips them.
 
 **Agreed boundaries from the same round (recorded, not built).**
 - **Counting and ranking questions** ("how many articles about X") stay app-owned. The engine does not learn about counting. (NewsIntelligence has no analytics service today; such questions take its normal chat path, and any number is an estimate.)
@@ -2046,6 +2069,7 @@ class EngineProfile(BaseModel):
     version: str
     models: ModelBindings
     router: "RouterConfig"           # router name, enable_jev, enable_temporal_extraction, jev_timeout
+    text_rules: "TextRulesConfig"   # 1.2.11 (§7.9): names (prefer|filter), names_droppable, must_not (prefer|filter), prefer_boost (default 2.0)
     retrieval: "RetrievalConfig"     # default strategy, adaptive_rules, top_k, full_context_max_tokens,
                                      # local_window_radius_chars, always_include_summaries, rrf_k,
                                      # fusion_weights, retrieve_max_results, relaxation, rerank_candidates
@@ -2243,6 +2267,7 @@ class RAGTrace(BaseModel):
     degradations: list[Degradation]
     usage_total: UsageTotal
     scope_revision: str | None
+    text_rules_checked: list[str] = []      # 1.2.11: rules the engine checked itself, "kind:text" (§7.9)
     clock_now: datetime
     # verbose only:
     snapshots: list["StageSnapshot"] | None = None   # per stage: node_id, granularity, all raw scores/ranks, kept/dropped + reason
@@ -2687,6 +2712,11 @@ These changes are made across `cody_ai_shared_lib`, not inside the RAG package. 
 | **AC-RAG-115** | Several names | §7.9, §6.1 | A search requires only the names found in its own text; with none, one `any_of` group; with two or more required names and fewer rows than the effective `top_k` from that one store call, the search widens to "any of those names", narrow rows first, deduplicated; a single name never widens; `exact_terms` are unchanged. `build_tsquery` renders `any_of` with `|` and parentheses only. Kit check 25 passes for the reference store. |
 | **AC-RAG-116** | Relaxation count | §7.6 | A result of two ranked passages plus a local window, under `min_results_before_relax=3`, starts relaxation. Three ranked passages do not. A relaxed run replaces the first only with more ranked passages. |
 | **AC-RAG-117** | Surface changes | §10.8, §3.8, §12.1 | The `citations` event carries `citation_coverage` (the ratio) and `citation_coverage_detail` (the full object). `RAGCitation.quote` is `None` unless the answer quoted something next to the marker, and then is that quote. `fingerprint()` is equal for the same `allowed_link_hosts` in another order or with repeats; the field itself is not rewritten. |
+| **AC-RAG-118** | Text rules: record and delivery | §7.9, §3.6 | A `filter` rule (app, caller, or from `exact_terms`) holds on every ranked passage returned by a store that does not apply it, which the engine checks and over-fetches for (about 4x, capped by `max_top_k`) and records in `text_rules_checked`; a store that declares the kind is not over-fetched. Rules never reach `fetch_full_scope`, summaries or windows. Router `none` adds no rules. Merging keeps the stricter strength. |
+| **AC-RAG-119** | Text rules: strength | §7.9 | A store is sent only `filter` rules. `prefer` never excludes: matching passages move up by `prefer_boost` (a rank-based move, default 2.0, 1.0 = off), over a wider candidate pool while the boost is active and a `prefer` `must_not` demotes. Default names are `prefer`; `text_rules.names="filter"` makes them a filter. |
+| **AC-RAG-120** | Text rules: several names, any store | §7.9 | For a store without analyzer tokens, `group=auto` names that never share a passage do not return nothing: the narrow call is checked, counted after the check, then widened to "any of those names", narrow rows first. |
+| **AC-RAG-121** | Text rules: relaxation and router | §7.6, §7.9 | `drop_required_entities` drops only `droppable` rules and has nothing to do otherwise. The LLM router's `must_not` is kept only if its text is in the question, defaults to `prefer`, and `clamp_intent` keeps app-set rules. |
+| **AC-RAG-122** | Text check | §7.9 | CJK forms match by substring; alphabetic forms as whole words ("AI" is not in "said", "GPT-6" is not in "GPT-60", "GPT-4o" is one unit); `alternatives` satisfy a rule. Kit checks 26 to 30 pass for the reference store and fail a store that ignores a declared kind, applies `prefer`, or filters full scope. |
 
 ### 16.2 Delivery phases (Q-04)
 Delivery follows production need: first what both production apps share, then AudioReading (which has no RAG today), then the NewsIntelligence migration, then KnowledgeBase (still in development, so the easiest to adapt) and everything else. Each step ends with every existing `cody-ai-shared-lib` test and every new `tests/rag/` test passing.
@@ -2842,7 +2872,7 @@ Each entry: the decision, the alternative rejected, and why. Sections refer here
 | **Q-08** | Feed search through the engine | §8.10, §12.4, D-21 | **Decided:** in scope as ranked retrieval; search-product features stay in the app |
 | **Failure model** | Agreed with the owner, 2026-11-07 | §13.3, §13.8, D-09 | **Decided:** closed list of agreed degradations; everything else raises |
 | **OI-1** | Per-engine granularity registry | §3.3 | **Recorded, not prioritized (owner, 2026-11-11):** granularities live in one process-wide table; per-engine tables when one process needs different traits for the same name |
-| **OI-2** | Text rules (rule record, delivery to every store, several names, script-aware check) | §7.9, §5.5, §6.1, §7.6 | **Designed, agreed with all apps (2026-11-14). Step 1 built in 1.2.8 (the rule for several names on the token path, AudioReading's A1); the rest is not built.** News asks for it before writing its adapter (one RPC migration instead of two); KB before P4; Audio needs the several-names rule first |
+| **OI-2** | Text rules (rule record, delivery to every store, several names, script-aware check) | §7.9, §5.5, §6.1, §7.6 | **Built:** several names on the token path 1.2.8; the rest 1.2.11 (record, `filter` and `prefer`, engine check with over-fetch, A1 for every store, `droppable` relaxation, router `must_not`, kit checks 26-30). Not built: a result cache key, OI-4, OI-5 |
 | **OI-3** | Relaxation counts summaries and windows | §7.6 | **Built 1.2.9:** counts ranked passages only |
 | **OI-4** | Lists and new question shapes | §7.9 | **Later:** a "complete list" mark with find-then-read-whole for chunked documents; batch-then-merge across documents; timeline and "what changed" shapes. Waits for an app that needs them |
 | **OI-5** | Asking the user to clarify | §7.9 | **Later:** engine notices and suggests, app decides and asks; options only from the visible scope. All apps would use "answer anyway" |
@@ -2926,6 +2956,7 @@ Each entry: the decision, the alternative rejected, and why. Sections refer here
 | **1.2.8-draft** | 2026-11-14 | cody-ai-shared-lib agent | **Built: several required names on the token path (§7.9 "Several names", OI-2 step 1, AudioReading's A1).** Each search requires the names in its own text, `any_of` when none occurs, widening to "any of those names" when one store call returns fewer rows than the effective `top_k`, narrow rows first. New `TokenGroup` mode `any_of` (and `alternatives`), `widen_name_groups`, kit check 25, AC-RAG-115. The in-memory store handles `any_of`. Rest of §7.9 unchanged and still not built. |
 | **1.2.9-draft** | 2026-11-14 | cody-ai-shared-lib agent | **Built: OI-3.** The relaxation trigger (`min_results_before_relax`) counts ranked passages only, not summaries or local windows. **The accept test changed too, beyond what OI-3 named:** a relaxed run replaces the first only when it has more ranked passages (before, more nodes of any kind). AC-RAG-116. Behaviour change: an app that sets a relaxation ladder and shows a window or summaries will now see relaxation fire where it did not before (§7.6). |
 | **1.2.10-draft** | 2026-11-14 | cody-ai-shared-lib agent | **Built: OI-6, three surface changes.** (1) `citations` stream event gains `citation_coverage_detail`; `citation_coverage` stays. (2) `RAGCitation.quote` is `None` unless the answer quoted something (was the first 200 chars of the node). (3) `profile.fingerprint()` sorts and de-duplicates `allowed_link_hosts`, also inside `variants`. No field AudioReading reads was renamed or removed (§10.8). AC-RAG-117. **Behaviour changes:** a stored `profile_fingerprint` changes once for a profile whose hosts were unsorted or repeated (it is stored, not read, §7.7); a UI that showed `quote` as an excerpt now gets `None`. |
+| **1.2.11-draft** | 2026-11-14 | cody-ai-shared-lib agent | **Built: the rest of §7.9 (OI-2).** `TextRule`, `QueryIntent.rules`, `RAGFilterSpec.text_rules`, `profile.text_rules`, `StoreCapabilities.text_rule_kinds` and `word_matching`, `RAGTrace.text_rules_checked`. The engine derives rules from names and exact terms with the agreed defaults, sends a store only `filter` rules on ranked searches, checks (and over-fetches for) kinds a store does not apply, resolves several names per search and widens after the check (AudioReading's A1 for every store), boosts `prefer` passages with an engine-owned stage, drops only `droppable` rules in relaxation, and takes `must_not` from the LLM router (default `prefer`, kept only if in the question). Kit checks 26 to 30; AC-RAG-118 to 122. **Behaviour changes:** a question with `exact_terms` runs the engine check for a store without `text_rule_kinds` (AudioReading: over-fetch 4x; its questions rarely have codes); default name rules now fetch about 3 times the candidates and nudge matching passages up (`prefer_boost` 2.0, untuned; 1.0 restores the old pool and order). Not built: a result cache key (no cache exists), OI-4, OI-5. |
 
 ## Appendix C. Requests kept in the apps (pushbacks)
 

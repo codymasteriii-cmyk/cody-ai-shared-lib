@@ -131,3 +131,48 @@ def test_broken_store_fails_checks():
     # BrokenStore fails check 1 & 2: does NOT raise MissingRequiredScopeError
     res2 = broken.vector_search([0.1] * 768, RAGFilterSpec(), top_k=5)
     assert len(res2) > 0
+
+
+class _AppliesPreferStore(InMemoryRAGStore):
+    """Defect: excludes for a `prefer` rule, as a store that treats every rule as a filter would."""
+
+    def vector_search(self, query_vector, filters, top_k):
+        from cody_ai_shared_lib.rag.text.rules import satisfies
+
+        rows = super().vector_search(query_vector, filters, top_k)
+        return [r for r in rows if satisfies(r.text, list(filters.text_rules))]
+
+
+class _FiltersFullScopeStore(InMemoryRAGStore):
+    """Defect: applies rules to the Tier 0 text too."""
+
+    def fetch_full_scope(self, filters):
+        from cody_ai_shared_lib.rag.text.rules import satisfies
+
+        return [n for n in super().fetch_full_scope(filters) if satisfies(n.text, list(filters.text_rules))]
+
+
+def test_kit_catches_a_store_that_applies_prefer_rules():
+    kit = type("K", (RAGStoreContractTests,), {"make_store": lambda self: _AppliesPreferStore()})()
+    with pytest.raises(AssertionError, match="prefer"):
+        kit.test_check_29_prefer_rule_is_never_a_filter()
+
+
+def test_kit_catches_a_store_that_filters_full_scope():
+    kit = type("K", (RAGStoreContractTests,), {"make_store": lambda self: _FiltersFullScopeStore()})()
+    with pytest.raises(AssertionError, match="ignores text rules"):
+        kit.test_check_30_rules_apply_to_ranked_searches_only()
+
+
+class _IgnoresRulesStore(InMemoryRAGStore):
+    """Defect: declares the kinds but applies none."""
+
+    def _rules_ok(self, node, filters):
+        return True
+
+
+@pytest.mark.parametrize("check", ["test_check_26_must_mention_rule", "test_check_27_exact_rule", "test_check_28_must_not_rule"])
+def test_kit_catches_a_store_that_declares_a_kind_but_ignores_it(check: str):
+    kit = type("K", (RAGStoreContractTests,), {"make_store": lambda self: _IgnoresRulesStore()})()
+    with pytest.raises(AssertionError, match="filter rule"):
+        getattr(kit, check)()

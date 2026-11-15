@@ -6,7 +6,7 @@ The library contains no SQL, table name, or database client (D-01).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Generic, Protocol, TypeVar, get_origin, runtime_checkable
+from typing import Literal, Any, Callable, Generic, Protocol, TypeVar, get_origin, runtime_checkable
 from pydantic import BaseModel, Field
 
 from .errors import (
@@ -74,6 +74,10 @@ class StoreCapabilities(BaseModel):
     supported_date_fields: frozenset[str] = frozenset()
     time_basis: str | None = None
     max_top_k: int = 200
+    # Text rules (§7.9): the kinds this store applies itself on ranked searches, and how it matches words.
+    # Empty: the engine checks the rows (and over-fetches). A store never applies a `prefer` rule.
+    text_rule_kinds: frozenset[str] = frozenset()
+    word_matching: Literal["exact", "stemmed"] = "exact"
 
 
 class Fingerprint(BaseModel):

@@ -41,6 +41,7 @@ from .ports import (
     validate_scope,
 )
 from .text.analyzer import CjkAwareAnalyzer, TokenGroup, estimate_tokens
+from .text.rules import satisfies
 from .vectors import is_zero_vector
 
 # One node to write: the node, its vector (None for an unembedded summary) and its fingerprint (None: compute)
@@ -73,6 +74,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             supports_delete=True,
             supports_revisions=True,
             supports_embedding_return=True,
+            text_rule_kinds=frozenset({"must_mention", "exact", "must_not"}),
             required_filter_keys=frozenset(),
             supported_custom_filters={"favorites_only": bool, "active": bool, "language": str},
             supported_date_fields=frozenset(["created_at", "updated_at"]),
@@ -235,6 +237,12 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
             return 0.0
         return max(-1.0, min(1.0, dot / (norm1 * norm2)))
 
+    def _rules_ok(self, node: RAGNode[MetaT], filters: RAGFilterSpec) -> bool:
+        """Text rules apply on ranked searches only, and only `filter` rules of a kind this store declares (§7.9)."""
+        kinds = self._capabilities.text_rule_kinds
+        rules = [r for r in filters.text_rules if r.strength == "filter" and r.kind in kinds]
+        return satisfies(node.text, rules) if rules else True
+
     def _node_tokens(self, node: RAGNode[MetaT]) -> list[str]:
         return node.search_tokens if node.search_tokens is not None else self.analyzer.tokenize(node.text)
 
@@ -288,7 +296,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         with self._lock:
             candidates: list[tuple[float, RAGNode[MetaT]]] = []
             for node in self._nodes.values():
-                if node.is_summary or not self._passes_filters(node, filters):
+                if node.is_summary or not self._passes_filters(node, filters) or not self._rules_ok(node, filters):
                     continue                     # ranked searches never return summaries (§4.2)
                 if is_zero_vector(node.embedding):
                     continue
@@ -326,7 +334,7 @@ class InMemoryRAGStore(RAGStore[MetaT], Generic[MetaT]):
         with self._lock:
             matched = []
             for node in self._nodes.values():
-                if node.is_summary or not self._passes_filters(node, filters):
+                if node.is_summary or not self._passes_filters(node, filters) or not self._rules_ok(node, filters):
                     continue                     # ranked searches never return summaries (§4.2)
                 tokens = self._node_tokens(node)
                 if all(self._matches_group(tokens, group) for group in groups if group.tokens):

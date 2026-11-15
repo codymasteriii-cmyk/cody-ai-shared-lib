@@ -6,7 +6,7 @@ from typing import Any, ClassVar, Generic, Literal
 from pydantic import BaseModel, Field
 
 from ..degradation import DegradationTracker
-from ..models import MetaT, QueryIntent, RAGFilterSpec, RAGNode, RAGQueryRequest
+from ..models import MetaT, QueryIntent, RAGFilterSpec, RAGNode, RAGQueryRequest, TextRule
 from ..profile import EngineProfile
 from ..runtime import Deadline
 from ..transforms.base import QueryVariant
@@ -41,6 +41,8 @@ class RetrievalContext(BaseModel, Generic[MetaT]):
     reranked: bool = False
     truncated: bool = False
     scope_revision: str | None = None
+    rules: list[TextRule] = Field(default_factory=list)      # text rules for this request (§7.9); never in `filters`
+    rule_checks: list[str] = Field(default_factory=list)     # rules the engine checked itself
 
     def target_limit(self) -> int:
         """Compute effective target candidate count based on mode (§7.1, §8.10)."""
@@ -57,15 +59,21 @@ class RetrievalContext(BaseModel, Generic[MetaT]):
         )
 
 
+    def boost_active(self) -> bool:
+        """True when a `prefer` rule will boost passages, which can only promote what the search fetched (§7.9)."""
+        factor = self.profile.text_rules.prefer_boost
+        return factor not in (0, 1.0) and any(rule.strength == "prefer" for rule in self.rules)
+
     def candidate_limit(self) -> int:
-        """How many ranked candidates to fetch: one extra to detect truncation, or a reranker's pool (§9.3)."""
+        """How many ranked candidates to fetch: one extra to detect truncation, or a wider pool for a reranker (§9.3)
+        or for a `prefer` boost (§7.9), which has nothing to promote without one."""
         floor = self.target_limit() + 1
         store_max = self.store.capabilities().max_top_k
         if floor > store_max:
             # The store cannot return enough rows to tell whether more exist: report it as truncated
             self.truncated = True
             return store_max
-        if not self.rerank_active:
+        if not self.rerank_active and not self.boost_active():
             return floor
         pool = self.profile.retrieval.rerank_candidates or self.target_limit() * 3
         return max(floor, min(pool, store_max))

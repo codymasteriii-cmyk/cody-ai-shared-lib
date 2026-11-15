@@ -17,7 +17,8 @@ from ..context.fence import ContextFencer
 from ..degradation import DegradationTracker
 from ..errors import NEVER_DEGRADABLE, GenerationError, IntentParseError, safe_message
 from ..gateway import ModelGateway
-from ..models import QueryIntent
+from ..models import QueryIntent, TextRule
+from ..text.rules import mentions
 from ..usage import BudgetGuard, UsageTracker
 from .temporal import TemporalResolver
 
@@ -39,8 +40,10 @@ Analyze the user's question and any conversation history. Return a JSON object w
   "entity_mode": "require" | "ignore",
   "exact_terms": ["<quoted or exact code phrases>", ...],
   "negation": false,
+  "must_not": ["<a name or phrase the user explicitly excludes, exactly as written in the question>", ...],
   "suggested_top_k": 8
 }
+Fill "must_not" only for phrases the user explicitly asks to exclude ("not about X", "without X"); copy them as written.
 Use "require" only when the answer must come from passages that name the entity exactly; otherwise use "ignore".
 "search_query" covers the main part of the question. When the question has another part that needs different
 passages (a second subject to compare, or a second question such as "who is X and what is his job"), add one
@@ -140,6 +143,14 @@ def clamp_intent(
             tracker.record("DG-05", "intent", f"Invalid entity_mode '{entity_mode}' clamped to 'ignore'", "Value clamped")
         entity_mode = "ignore"
 
+    rules: list[TextRule] = []
+    for item in list(raw.get("rules") or [])[:16]:          # rules an app router or caller already set (§7.9)
+        try:
+            rules.append(TextRule.model_validate(item))
+        except Exception:
+            if tracker:
+                tracker.record("DG-05", "intent", "Invalid text rule dropped", "Rule dropped")
+
     router_source = str(raw.get("router_source") or "llm")
     ext_val = raw.get("ext")
     extension = {} if ext_val is None or (isinstance(ext_val, dict) and not ext_val) else {"ext": ext_val}
@@ -165,11 +176,27 @@ def clamp_intent(
         entity_mode=entity_mode,
         exact_terms=exact_list,
         negation=bool(raw.get("negation", False)),
+        rules=rules,
         suggested_top_k=top_k,
         beyond_boundary_risk=risk,
         router_source=router_source,
         **extension,
     )
+
+
+def _must_not_rules(raw: dict[str, Any], question: str, tracker: DegradationTracker | None) -> list[TextRule]:
+    """Exclusions the model read from the question (§7.9). One that is not in the question's own words is a guess: dropped."""
+    rules: list[TextRule] = []
+    for item in list(raw.get("must_not") or [])[:8]:
+        text = str(item).strip()
+        if not text:
+            continue
+        rule = TextRule(text=text, kind="must_not", strength="prefer", droppable=True, origin="router")
+        if mentions(question, rule):
+            rules.append(rule)
+        elif tracker:
+            tracker.record("DG-05", "intent", f"must_not '{text[:40]}' is not in the question", "Rule dropped")
+    return rules
 
 
 def extract_json_block(text: str) -> dict[str, Any] | None:
@@ -274,6 +301,7 @@ class LLMIntentRouter:
                         intent = clamp_intent(parsed, degradation_tracker, self.intent_schema)
                         if not intent.search_query:
                             intent.search_query = query
+                        intent.rules = [*intent.rules, *_must_not_rules(parsed, query, degradation_tracker)]
                         return intent
 
                     # JSON parse failure: record DG-04 and retry

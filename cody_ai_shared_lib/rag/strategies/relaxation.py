@@ -6,7 +6,7 @@ from typing import Any, Protocol
 
 from datetime import datetime
 
-from ..models import QueryIntent, RAGFilterSpec, as_utc
+from ..models import QueryIntent, RAGFilterSpec, TextRule, as_utc
 from ..registry import split_component_name
 
 
@@ -18,6 +18,7 @@ class RelaxationState:
     soft_date_window: bool
     hard_min_similarity: float | None
     hard_date_range: tuple[datetime | None, datetime | None] | None = None   # the caller's range: never exceeded
+    rules: tuple[TextRule, ...] = ()        # the request's text rules; only `droppable` ones may be dropped (§7.9)
 
 
 class RelaxationStep(Protocol):
@@ -32,9 +33,16 @@ class DropRequiredEntities:
     label = "drop_required_entities"
 
     def apply(self, state: RelaxationState) -> RelaxationState | None:
-        if state.intent.entity_mode != "require" or not state.intent.entity_terms:
+        """Drop the rules marked droppable. Non-droppable rules and `exact_terms` are never relaxed (§7.9)."""
+        dropped = [rule for rule in state.rules if rule.droppable]
+        if not dropped:
             return None
-        return replace(state, intent=state.intent.model_copy(update={"entity_mode": "ignore"}))
+        kept = tuple(rule for rule in state.rules if not rule.droppable)
+        names_left = any(rule.group == "auto" for rule in kept)
+        intent = state.intent
+        if state.intent.entity_mode == "require" and not names_left:
+            intent = intent.model_copy(update={"entity_mode": "ignore"})      # token groups follow the rules
+        return replace(state, intent=intent, rules=kept)
 
 
 class WidenTimeWindow:

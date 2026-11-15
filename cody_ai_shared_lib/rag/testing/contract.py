@@ -570,3 +570,81 @@ class RAGStoreContractTests:
         any_of = TokenGroup(tokens=["alice", "bob"], mode="any_of", origin="entity", alternatives=[["alice"], ["bob"]])
         either = store.keyword_search("alice bob", filters, top_k=10, analyzer_tokens=[any_of])
         assert {hit.node_id for hit in either} == {"nm_a", "nm_b", "nm_ab"}, "an any_of group matches any alternative"
+
+    # ── Checks 26-30: text rules (§7.9, 1.2.11) ────────────────────────────────
+    def _rule_seed(self, store: RAGStore[Any]) -> RAGFilterSpec:
+        """Three passages: one names Acme, one does not, one only has a longer word that starts with it."""
+        nodes = [
+            _node("tr_has", "Acme announced a new deal today", "tr_doc", 0),
+            _node("tr_lacks", "The weather stayed mild all week", "tr_doc", 100),
+            _node("tr_part", "Acmeville opened a new store", "tr_doc", 200),
+        ]
+        self.write(store, "tr_doc", nodes, [[0.1] * DIM for _ in nodes])
+        return self.make_filters("tr_doc")
+
+    def _ranked_ids(self, store: RAGStore[Any], filters: RAGFilterSpec) -> list[set[str]]:
+        """Result ids of every ranked search the store supports, under the same filters."""
+        caps = store.capabilities()
+        found: list[set[str]] = []
+        found.append({h.node_id for h in store.vector_search([0.1] * DIM, filters, top_k=10)})
+        if caps.supports_keyword_fts:
+            found.append({h.node_id for h in store.keyword_search("Acme announced weather", filters, top_k=10)})
+        return found
+
+    def _check_rule_kind(self, kind: str, must_see: str, must_not_see: str) -> None:
+        from ..models import TextRule
+
+        store = self.make_store()
+        if kind not in store.capabilities().text_rule_kinds:
+            return
+        filters = self._rule_seed(store).model_copy(
+            update={"text_rules": [TextRule(text="Acme", kind=kind, strength="filter")]}  # type: ignore[arg-type]
+        )
+        for ids in self._ranked_ids(store, filters):
+            assert must_not_see not in ids, f"a `{kind}` filter rule must hold on every ranked search"
+        # a store that matches word endings (stemming) may admit more; it must still keep the passage that satisfies the rule
+        assert must_see in self._ranked_ids(store, filters)[0], f"a `{kind}` filter rule keeps the passages that satisfy it"
+        if kind != "must_not" and store.capabilities().word_matching == "exact":
+            for ids in self._ranked_ids(store, filters):
+                assert "tr_part" not in ids, "an exact-word store does not match part of a longer word"
+
+    def test_check_26_must_mention_rule(self):
+        self._check_rule_kind("must_mention", "tr_has", "tr_lacks")
+
+    def test_check_27_exact_rule(self):
+        self._check_rule_kind("exact", "tr_has", "tr_lacks")
+
+    def test_check_28_must_not_rule(self):
+        self._check_rule_kind("must_not", "tr_lacks", "tr_has")
+
+    def test_check_29_prefer_rule_is_never_a_filter(self):
+        from ..models import TextRule
+
+        store = self.make_store()
+        if not store.capabilities().text_rule_kinds:
+            return
+        filters = self._rule_seed(store).model_copy(
+            update={"text_rules": [TextRule(text="Acme", kind="must_mention", strength="prefer")]}
+        )
+        for ids in self._ranked_ids(store, filters):
+            assert {"tr_has", "tr_lacks"} <= ids, "a store never applies a `prefer` rule: nothing is excluded for it"
+
+    def test_check_30_rules_apply_to_ranked_searches_only(self):
+        from ..models import TextRule
+
+        store = self.make_store()
+        if not store.capabilities().text_rule_kinds:
+            return
+        caps = store.capabilities()
+        rule = TextRule(text="zzz-no-such-phrase", kind="must_mention", strength="filter")
+        if caps.supports_full_scope_fetch:
+            filters, _ = self._two_section_scope(store)
+            with_rule = store.fetch_full_scope(filters.model_copy(update={"text_rules": [rule]}))
+            assert len(with_rule) == len(store.fetch_full_scope(filters)), "fetch_full_scope ignores text rules"
+        if caps.supports_parent_summaries:
+            self.write_with_summary(
+                store, "tr_sum", [_node("tr_s0", "Section text.", "tr_sum", 0, 0)], self._summary("tr_sum#s0_sum", "tr_sum", 0, 100, 0), 0
+            )
+            base = self.make_filters("tr_sum")
+            kept = store.fetch_parent_summaries(base.model_copy(update={"text_rules": [rule]}))
+            assert len(kept) == len(store.fetch_parent_summaries(base)), "fetch_parent_summaries ignores text rules"

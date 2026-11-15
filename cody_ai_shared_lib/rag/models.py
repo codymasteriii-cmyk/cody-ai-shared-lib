@@ -103,6 +103,39 @@ def node_class_for(metadata: BaseModel) -> type[RAGNode[Any]]:
 
 # ── Filters (§3.6) ─────────────────────────────────────────────────────────────
 
+class TextRule(BaseModel):
+    """One plain-text rule: a phrase a passage must mention, an exact phrase or code, or one it must not (§7.9).
+
+    `filter` rules constrain every returned ranked passage; `prefer` rules only rank matching passages higher
+    and never remove one. A store is only ever sent `filter` rules, and only on ranked searches.
+    """
+    text: str
+    kind: Literal["must_mention", "exact", "must_not"] = "must_mention"
+    alternatives: list[str] = Field(default_factory=list)       # other surface forms; any one satisfies the rule
+    group: Literal["auto", "all", "any"] = "all"                # several rules: auto (names the router guessed), all, any
+    strength: Literal["filter", "prefer"] = "filter"
+    droppable: bool = False                                     # may relaxation drop it (§7.6)
+    origin: Literal["router", "app", "caller"] = "caller"
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.kind, " ".join(self.text.casefold().split()))
+
+
+def merge_text_rules(current: list[TextRule], incoming: list[TextRule]) -> list[TextRule]:
+    """Union by (kind, text). The same rule twice keeps the stricter strength; droppable only if both are."""
+    merged: dict[tuple[str, str], TextRule] = {rule.key: rule.model_copy(deep=True) for rule in current}
+    for rule in incoming:
+        have = merged.get(rule.key)
+        if have is None:
+            merged[rule.key] = rule.model_copy(deep=True)
+            continue
+        have.strength = "filter" if "filter" in (have.strength, rule.strength) else "prefer"
+        have.droppable = have.droppable and rule.droppable
+        have.alternatives = list(dict.fromkeys([*have.alternatives, *rule.alternatives]))
+    return list(merged.values())
+
+
 class RAGFilterSpec(BaseModel):
     """Store-level query filter specifications built from query request, guards, and intent."""
     model_config = {"extra": "forbid"}  # a misspelled filter must fail, not silently widen the search
@@ -118,6 +151,9 @@ class RAGFilterSpec(BaseModel):
     date_field: str | None = None
     min_similarity: float | None = None
     custom: dict[str, Any] = Field(default_factory=dict)
+    # Text rules (§7.9). A caller may set them here; the engine takes them out of the filters it passes to
+    # non-ranked store calls, and sends a store only `filter` rules on ranked searches.
+    text_rules: list[TextRule] = Field(default_factory=list)
     # Set by the engine when hard constraints conflict (§5.5). The engine then answers "not found"
     # without calling the store. Distinct from a caller leaving a required key out, which is an error.
     empty_scope: bool = False
@@ -173,6 +209,8 @@ class RAGFilterSpec(BaseModel):
             self.min_similarity = value if self.min_similarity is None else max(self.min_similarity, value)
         elif key == "date_range_utc":
             self._narrow_date_range(value)
+        elif key == "text_rules":
+            self.text_rules = merge_text_rules(self.text_rules, [TextRule.model_validate(v) for v in value])
         elif key == "custom":
             for custom_key, custom_value in value.items():
                 self._narrow_custom(custom_key, custom_value)
@@ -332,6 +370,8 @@ class QueryIntent(BaseModel, Generic[ExtT]):
     entity_mode: Literal["require", "ignore"] = "ignore"
     exact_terms: list[str] = Field(default_factory=list)
     negation: bool = False
+    # Rules from an app router or the LLM router (§7.9); names and exact terms above are turned into rules too
+    rules: list[TextRule] = Field(default_factory=list)
 
     suggested_top_k: int | None = None
     beyond_boundary_risk: float = 0.0

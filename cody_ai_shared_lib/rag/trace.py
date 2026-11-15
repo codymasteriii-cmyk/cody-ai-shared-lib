@@ -71,6 +71,7 @@ class RAGTrace(BaseModel):
     degradations: list[Degradation] = Field(default_factory=list)
     usage_total: UsageTotal | None = None
     scope_revision: str | None = None
+    text_rules_checked: list[str] = Field(default_factory=list)   # rules the engine checked itself (§7.9)
     clock_now: datetime | None = None
     level: Literal["light", "verbose"] = "light"
     total_latency_ms: float = 0.0
@@ -176,6 +177,7 @@ class TraceCollector:
         self.tier_decision_reason = ""
         self.scope_revision: str | None = None
         self.rule: int | None = None
+        self.text_rules_checked: list[str] = []
 
     def elapsed_ms(self) -> float:
         return (self.clock.monotonic() - self.started) * 1000.0
@@ -239,6 +241,7 @@ class TraceCollector:
             degradations=degradations,
             usage_total=usage_total,
             scope_revision=self.scope_revision,
+            text_rules_checked=list(self.text_rules_checked),
             clock_now=self.clock.now_utc(),
             level=self.level,
             total_latency_ms=self.elapsed_ms(),

@@ -24,6 +24,15 @@ class ModelBindings(BaseModel):
     judge: list[str] | None = None
 
 
+class TextRulesConfig(BaseModel):
+    """Defaults for the text rules the engine derives (§7.9)."""
+    model_config = {"frozen": True, "extra": "forbid"}
+    names: Literal["prefer", "filter"] = "prefer"       # names the router guessed
+    names_droppable: bool | None = None                  # None: droppable exactly when `names` is "prefer"
+    must_not: Literal["prefer", "filter"] = "prefer"    # exclusions the router read from the question
+    prefer_boost: float = 2.0                            # a passage satisfying a `prefer` rule ranks as if its rank were divided by this; 1.0 turns it off (untuned)
+
+
 class RouterConfig(BaseModel):
     model_config = {"frozen": True, "extra": "forbid"}
     name: str = "auto"
@@ -191,6 +200,7 @@ class EngineProfile(BaseModel):
     version: str = "1.0.0"
     models: ModelBindings
     router: RouterConfig = Field(default_factory=RouterConfig)
+    text_rules: TextRulesConfig = Field(default_factory=TextRulesConfig)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     transforms: list[str] = Field(default_factory=lambda: ["secondary_fanout"])
     post_stages: list[str] = Field(default_factory=list)

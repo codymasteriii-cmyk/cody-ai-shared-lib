@@ -4,8 +4,10 @@ from __future__ import annotations
 from typing import Callable
 
 from ..errors import EmbeddingProviderError
-from ..models import MetaT, RAGNode
+from ..granularity import is_ranked
+from ..models import MetaT, RAGFilterSpec, RAGNode, TextRule
 from ..text.analyzer import TokenGroup, tokenize_query_groups, widen_name_groups
+from ..text.rules import resolve_group, satisfies
 from .context import RetrievalContext
 
 
@@ -26,23 +28,66 @@ def query_token_groups(ctx: RetrievalContext[MetaT]) -> list[TokenGroup] | None:
     )
 
 
-def search_widening_names(
-    ctx: RetrievalContext[MetaT],
-    call: Callable[[list[TokenGroup] | None], list[RAGNode[MetaT]]],
-) -> list[RAGNode[MetaT]]:
-    """Run one keyword-bearing store call; widen "all these names" to "any of them" when it returns too few (§7.9).
+OVERFETCH = 4          # an engine-checked search asks the store for about this many times the candidates (§7.9)
 
-    "Too few" is fewer rows than the request's effective top_k, counted on this one call's rows. The narrow rows
-    stay first and the widened ones are appended without duplicates. A search with fewer than two required names
-    never widens.
+
+def _rule_sets(rules: list[TextRule], applied_kinds: frozenset[str]) -> tuple[list[TextRule], list[TextRule]]:
+    """Split rules into those the store applies and those the engine checks.
+
+    An `any` set is kept whole on one side, because "at least one of" cannot be split between two checkers.
+    """
+    any_rules = [r for r in rules if r.group == "any"]
+    any_in_store = all(r.kind in applied_kinds for r in any_rules)
+    in_store = [r for r in rules if r.kind in applied_kinds and (r.group != "any" or any_in_store)]
+    return in_store, [r for r in rules if r not in in_store]
+
+
+def _checked_call(
+    ctx: RetrievalContext[MetaT],
+    top_k: int,
+    rules: list[TextRule],
+    groups: list[TokenGroup] | None,
+    call: Callable[[RAGFilterSpec, list[TokenGroup] | None, int], list[RAGNode[MetaT]]],
+) -> list[RAGNode[MetaT]]:
+    """One store call under `rules`: the store applies what it declares, the engine checks the rest."""
+    caps = ctx.store.capabilities()
+    in_store, by_engine = _rule_sets(rules, caps.text_rule_kinds)
+    filters = ctx.filters.model_copy(update={"text_rules": in_store})
+    if not by_engine:
+        return call(filters, groups, top_k)
+    rows = call(filters, groups, min(max(top_k, top_k * OVERFETCH), caps.max_top_k))
+    kept = [
+        node for node in rows
+        if not is_ranked(node) or satisfies(ctx.renderer.prompt_text(node), by_engine)
+    ]
+    for rule in by_engine:
+        note = f"{rule.kind}:{rule.text}"
+        if note not in ctx.rule_checks:
+            ctx.rule_checks.append(note)
+    return kept[:top_k]
+
+
+def ranked_store_call(
+    ctx: RetrievalContext[MetaT],
+    top_k: int,
+    call: Callable[[RAGFilterSpec, list[TokenGroup] | None, int], list[RAGNode[MetaT]]],
+) -> list[RAGNode[MetaT]]:
+    """Run one ranked search (vector, keyword or hybrid) with the request's text rules (§7.9).
+
+    The search requires the names found in its own text; if the rows left after the store and the engine have
+    applied the rules number fewer than the effective `top_k`, it widens to "any of those names". Narrow rows stay
+    first and widened ones are appended without duplicates. Only `filter` rules reach the store; `prefer` rules
+    never do. A token store also gets the names as token groups (§6.1).
     """
     groups = query_token_groups(ctx)
-    rows = call(groups)
-    wide = widen_name_groups(groups) if groups else None
-    if wide is None or len(rows) >= ctx.target_limit():
+    narrow, wide = resolve_group([r for r in ctx.rules if r.strength == "filter"], query_text(ctx))
+    wide_groups = widen_name_groups(groups) if groups else None
+    rows = _checked_call(ctx, top_k, narrow, groups, call)
+    if (wide is None and wide_groups is None) or len(rows) >= ctx.target_limit():
         return rows
+    more = _checked_call(ctx, top_k, wide if wide is not None else narrow, wide_groups or groups, call)
     seen = {node.node_id for node in rows}
-    return [*rows, *(node for node in call(wide) if node.node_id not in seen)]
+    return [*rows, *(node for node in more if node.node_id not in seen)]
 
 
 def embed_query(ctx: RetrievalContext[MetaT]) -> list[float]:
@@ -81,10 +126,11 @@ def keyword_fallback(ctx: RetrievalContext[MetaT], top_k: int) -> list[RAGNode[M
         fallback_used="keyword_search",
         impact="Fell back to keyword-only retrieval",
     )
-    return search_widening_names(
+    return ranked_store_call(
         ctx,
-        lambda groups: ctx.store.keyword_search(
-            query_text=query_text(ctx), top_k=top_k, filters=ctx.filters, analyzer_tokens=groups
+        top_k,
+        lambda filters, groups, k: ctx.store.keyword_search(
+            query_text=query_text(ctx), top_k=k, filters=filters, analyzer_tokens=groups
         ),
     )
 

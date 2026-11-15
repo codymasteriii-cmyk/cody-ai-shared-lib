@@ -11,7 +11,7 @@ from ..errors import StoreCapabilityError
 from ..models import MetaT, RAGNode
 from ..vectors import is_zero_vector
 from .context import RetrievalContext, RetrievalStrategy
-from .shared import embed_query, keyword_fallback, query_text, search_widening_names, with_local_window
+from .shared import embed_query, keyword_fallback, query_text, ranked_store_call, with_local_window
 
 
 class HybridRRFStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
@@ -51,13 +51,14 @@ class HybridRRFStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
 
         if caps.supports_native_hybrid_rpc:
             w_vec, w_fts = self._fusion_weights(ctx)
-            results = search_widening_names(
+            results = ranked_store_call(
                 ctx,
-                lambda groups: ctx.store.hybrid_search(
+                top_k,
+                lambda filters, groups, k: ctx.store.hybrid_search(
                     query_text=query_text(ctx),
                     query_vector=query_vector,
-                    top_k=top_k,
-                    filters=ctx.filters,
+                    top_k=k,
+                    filters=filters,
                     rrf_k=ctx.profile.retrieval.rrf_k,
                     w_vec=w_vec,
                     w_fts=w_fts,
@@ -76,13 +77,16 @@ class HybridRRFStrategy(RetrievalStrategy[MetaT], Generic[MetaT]):
     ) -> list[RAGNode[MetaT]]:
         """Path B: run both legs, in parallel when a pool is available, then apply RRF."""
         def vector_leg() -> list[RAGNode[MetaT]]:
-            return ctx.store.vector_search(query_vector, top_k=top_k * 2, filters=ctx.filters)
+            return ranked_store_call(
+                ctx, top_k * 2, lambda filters, _groups, k: ctx.store.vector_search(query_vector, top_k=k, filters=filters)
+            )
 
         def keyword_leg() -> list[RAGNode[MetaT]]:
-            return search_widening_names(
+            return ranked_store_call(
                 ctx,
-                lambda groups: ctx.store.keyword_search(
-                    query_text(ctx), top_k=top_k * 2, filters=ctx.filters, analyzer_tokens=groups
+                top_k * 2,
+                lambda filters, groups, k: ctx.store.keyword_search(
+                    query_text(ctx), top_k=k, filters=filters, analyzer_tokens=groups
                 ),
             )
 

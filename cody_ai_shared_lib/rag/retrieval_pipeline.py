@@ -15,6 +15,8 @@ from .registry import ComponentDeps, split_component_name
 from .runtime import RequestRun
 from .strategies.adaptive import AdaptiveRetrievalStrategy
 from .strategies.context import RetrievalContext, RetrievalStrategy
+from .postretrieval.rule_boost import TextRuleBoost
+from .text.rules import derive_rules
 from .strategies.relaxation import RelaxationState, build_relaxation
 from .transforms import QueryVariant, TransformContext, fair_interleave, fuse_variants
 
@@ -85,6 +87,8 @@ class RetrievalPipeline(Generic[MetaT]):
         window = self.soft_date_window(request, intent)
         if window is not None:
             filters.date_range_utc = window
+        # Text rules travel on ranked searches only (§7.9): out of the filters every other store call shares
+        filters.text_rules = []
         return filters
 
     @staticmethod
@@ -169,7 +173,7 @@ class RetrievalPipeline(Generic[MetaT]):
         ctx.variants = self._variants(request, intent, run)
         run.deadline.raise_if_cancelled("retrieval")
         strategy = self._resolve_strategy(request)
-        stages = self._stages_for(request)
+        stages = self._with_rule_boost(self._stages_for(request), ctx)
         ctx.rerank_active = any(stage.name == "rerank" for stage in stages)
 
         nodes = self._execute(ctx, strategy, stages, guards, run)
@@ -182,6 +186,7 @@ class RetrievalPipeline(Generic[MetaT]):
         run.trace.tier_decision_reason = ctx.last_tier_reason
         run.trace.scope_revision = ctx.scope_revision
         run.trace.rule = ctx.last_rule or None
+        run.trace.text_rules_checked = list(ctx.rule_checks)
         run.trace.components[strategy.name] = strategy.version
 
         result = RAGRetrievalResult[MetaT](
@@ -189,7 +194,7 @@ class RetrievalPipeline(Generic[MetaT]):
             intent=intent,
             strategy_used=ctx.last_strategy_used or strategy.name,
             tier_decision_reason=ctx.last_tier_reason,
-            applied_filters=ctx.filters,
+            applied_filters=ctx.filters.model_copy(update={"text_rules": ctx.rules}),
             relaxations=relaxations,
             reranked=ctx.reranked,
             truncated=ctx.truncated,
@@ -226,6 +231,7 @@ class RetrievalPipeline(Generic[MetaT]):
         return RetrievalContext[MetaT](
             request=request,
             intent=intent,
+            rules=derive_rules(intent, request.filters.text_rules, self.profile.text_rules),
             variants=[],
             filters=filters,
             store=self.store,
@@ -284,6 +290,13 @@ class RetrievalPipeline(Generic[MetaT]):
             insert_at = next((i for i, s in enumerate(self.stages) if s.name == "top_k"), len(self.stages))
             return [*self.stages[:insert_at], stage, *self.stages[insert_at:]]
         return self.stages
+
+    def _with_rule_boost(self, stages: list[Any], ctx: RetrievalContext[MetaT]) -> list[Any]:
+        """Add the `prefer` boost when the request has such rules: after rerank, before the cut (§7.9)."""
+        if not any(rule.strength == "prefer" for rule in ctx.rules):
+            return stages
+        insert_at = next((i for i, s in enumerate(stages) if s.name == "top_k"), len(stages))
+        return [*stages[:insert_at], TextRuleBoost(), *stages[insert_at:]]
 
     def _execute(
         self,
@@ -425,7 +438,7 @@ class RetrievalPipeline(Generic[MetaT]):
             return fresh
         ordered = [node for node in fresh if not is_ranked(node)]
         ranked_fresh = [node for node in fresh if is_ranked(node)]
-        limit = ctx.candidate_limit() if ctx.rerank_active else ctx.target_limit()
+        limit = ctx.candidate_limit() if (ctx.rerank_active or ctx.boost_active()) else ctx.target_limit()
         merged = fair_interleave([ranked_prior, ranked_fresh], limit)
         distinct = {node.node_id for node in [*ranked_prior, *ranked_fresh]}
         ctx.truncated = ctx.truncated or len(distinct) > len(merged)
@@ -445,7 +458,8 @@ class RetrievalPipeline(Generic[MetaT]):
         """Walk the opt-in ladder while results are too few; hard limits stay out of reach (§7.6)."""
         applied: list[str] = []
         state = RelaxationState(
-            ctx.filters, ctx.intent, soft_date, request.filters.min_similarity, request.filters.date_range_utc
+            ctx.filters, ctx.intent, soft_date, request.filters.min_similarity, request.filters.date_range_utc,
+            rules=tuple(ctx.rules),
         )
         budget = self.profile.runtime.stage_budgets.get("relaxation", 0.0)
         for step in self.relaxation_steps:
@@ -457,7 +471,9 @@ class RetrievalPipeline(Generic[MetaT]):
             relaxed = step.apply(state)
             if relaxed is None:
                 continue
-            relaxed_ctx = ctx.model_copy(update={"filters": relaxed.filters, "intent": relaxed.intent})
+            relaxed_ctx = ctx.model_copy(
+                update={"filters": relaxed.filters, "intent": relaxed.intent, "rules": list(relaxed.rules)}
+            )
             relaxed_nodes = self._execute(relaxed_ctx, strategy, stages, guards, run)
             if _ranked_count(relaxed_nodes) > _ranked_count(nodes):
                 nodes, ctx, state = relaxed_nodes, relaxed_ctx, relaxed
